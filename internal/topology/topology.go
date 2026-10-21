@@ -91,21 +91,33 @@ func (g *Graph) Addr(id api.NodeID) string {
 	return n.hb.Addr
 }
 
-// EdgeInfo 返回 from→to 这条出边的协议（"quic"/"tcp"），
-// 不存在或陈旧返回空串。
-func (g *Graph) EdgeInfo(from, to api.NodeID) string {
+// EdgeDetail 是 from→to 这条出边的细节：拨号协议与实际拨通地址
+//（打洞成功的边是公网映射）。不存在或陈旧时 ok=false。
+func (g *Graph) EdgeDetail(from, to api.NodeID) (proto, addr string, ok bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	n, ok := g.nodes[from]
+	n, found := g.nodes[from]
+	if !found || g.now().Sub(n.seen) >= HeartbeatTimeout {
+		return "", "", false
+	}
+	for _, e := range n.hb.Edges {
+		if e.To == to {
+			return e.Proto, e.Addr, true
+		}
+	}
+	return "", "", false
+}
+
+// Public 返回节点上报过的公网 NAT 映射（M6 打洞用），无则空。
+// TODO(M6)：由 controller 的 UDP 回声口维护，存入心跳之外的表。
+func (g *Graph) Public(id api.NodeID) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n, ok := g.nodes[id]
 	if !ok || g.now().Sub(n.seen) >= HeartbeatTimeout {
 		return ""
 	}
-	for _, e := range n.hb.Edges {
-		if e.To == to && e.Proto != "" {
-			return e.Proto
-		}
-	}
-	return ""
+	return n.hb.Public
 }
 
 type edge struct {

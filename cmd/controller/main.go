@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 
 	"fileferry/internal/api"
 	"fileferry/internal/ca"
+	"fileferry/internal/nat"
 	"fileferry/internal/topology"
 )
 
@@ -44,9 +46,18 @@ type controller struct {
 	db      *sql.DB
 
 	mu      sync.Mutex
-	tokens  map[string]bool                // 已核销的一次性令牌
+	tokens  map[string]bool                   // 已核销的一次性令牌
 	pending map[api.NodeID][]api.TransferGrant // 源节点待执行任务
 	nextID  int64
+
+	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
+	punchTried   map[[2]api.NodeID]time.Time
+	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
+}
+
+type pubEntry struct {
+	addr string
+	seen time.Time
 }
 
 func main() {
@@ -79,15 +90,45 @@ func main() {
 	// TODO(M1)：任务表 schema 与持久化
 
 	c := &controller{
-		cfg:     cfg,
-		ca:      rootCA,
-		signer:  signer,
-		signPub: signPub,
-		graph:   topology.New(),
-		db:      db,
-		tokens:  map[string]bool{},
-		pending: map[api.NodeID][]api.TransferGrant{},
+		cfg:        cfg,
+		ca:         rootCA,
+		signer:     signer,
+		signPub:    signPub,
+		graph:      topology.New(),
+		db:         db,
+		tokens:     map[string]bool{},
+		pending:    map[api.NodeID][]api.TransferGrant{},
+		publics:      map[api.NodeID]pubEntry{},
+		punchTried:   map[[2]api.NodeID]time.Time{},
+		pendingPunch: map[api.NodeID][]api.PunchDirective{},
 	}
+
+	// M6 打洞回声口：UDP 端口 = 控制端口 + 1。agent 从数据面 socket
+	// 发签名 WHOAMI，controller 记录观测到的公网映射（媒人的账本）。
+	// 回环地址不登记——controller 同机的 agent 走 loopback，别家
+	// 拿这个地址会打到自己身上形成假边。
+	echoPort := 9444
+	if _, port, err := net.SplitHostPort(cfg.Listen); err == nil {
+		if p, err := strconv.Atoi(port); err == nil {
+			echoPort = p + 1
+		}
+	}
+	echo, err := nat.NewEchoServer(echoPort, rootCA.Pool(), func(nodeID, public string) {
+		host, _, err := net.SplitHostPort(public)
+		if err != nil || net.ParseIP(host) == nil || net.ParseIP(host).IsLoopback() {
+			return
+		}
+		c.mu.Lock()
+		c.publics[api.NodeID(nodeID)] = pubEntry{addr: public, seen: time.Now()}
+		c.mu.Unlock()
+		log.Printf("WHOAMI：%s -> %s", nodeID, public)
+	})
+	if err != nil {
+		log.Fatal("UDP 回声口启动失败：", err)
+	}
+	defer echo.Close()
+	go func() { log.Fatal(echo.Serve()) }()
+	log.Printf("打洞回声口 UDP :%d", echoPort)
 
 	// 管理员证书：仅首次启动生成到 data-dir。拷到你自己的机器保管
 	// 后，建议从服务器上删除——持有它的人就是操作者。
@@ -248,12 +289,80 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
 		return
 	}
+	// 公网映射以 controller 回声口的观测为准，agent 上报值仅作参考
+	c.mu.Lock()
+	if pe, ok := c.publics[hb.NodeID]; ok && time.Since(pe.seen) < 90*time.Second {
+		hb.Public = pe.addr
+	}
+	c.mu.Unlock()
 	c.graph.Apply(hb)
 	c.mu.Lock()
 	jobs := c.pending[hb.NodeID]
 	delete(c.pending, hb.NodeID)
 	c.mu.Unlock()
-	json.NewEncoder(w).Encode(api.HeartbeatResponse{Jobs: jobs, Peers: c.graph.Peers()})
+	directives := c.pickPunches(&hb)
+	c.mu.Lock()
+	// 另一端排队中的指令（对端发牌时给本端登记的）一并下发，
+	// 保证打洞双方同时行动
+	if queued := c.pendingPunch[hb.NodeID]; len(queued) > 0 {
+		log.Printf("下发排队指令给 %s x%d", hb.NodeID, len(queued))
+		directives = append(directives, queued...)
+	}
+	delete(c.pendingPunch, hb.NodeID)
+	c.mu.Unlock()
+	json.NewEncoder(w).Encode(api.HeartbeatResponse{
+		Jobs:    jobs,
+		Peers:   c.graph.Peers(),
+		Punches: directives,
+	})
+}
+
+// pickPunches 挑选打洞配对：双方都有新鲜公网映射、互相都没有直连边、
+// 且该配对距上次尝试超过冷却时间。**指令同时排队给两端**——打洞
+// 必须双方同时对发，只通知一端必然失败（之前踩过的坑）。
+func (c *controller) pickPunches(hb *api.Heartbeat) []api.PunchDirective {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	myPub, ok := c.publics[hb.NodeID]
+	if !ok {
+		return nil // 自己还没有公网映射，等 WHOAMI 保活
+	}
+	// 现有边集合（双向任一存在即认为已连通）
+	connected := map[api.NodeID]bool{hb.NodeID: true}
+	for _, e := range hb.Edges {
+		connected[e.To] = true
+	}
+	var out []api.PunchDirective
+	for id, pe := range c.publics {
+		if connected[id] || time.Since(pe.seen) >= 90*time.Second {
+			continue
+		}
+		key := [2]api.NodeID{hb.NodeID, id}
+		if key[0] > key[1] {
+			key[0], key[1] = key[1], key[0]
+		}
+		if t, ok := c.punchTried[key]; ok && time.Since(t) < 90*time.Second {
+			continue
+		}
+		c.punchTried[key] = time.Now()
+		var private string
+		if a := c.graph.Addr(id); a != "" {
+			private = a
+		}
+		out = append(out, api.PunchDirective{Peer: id, Addr: pe.addr, Private: private})
+		// 给对端排队互惠指令（含本端公网映射与广播地址）
+		var myPrivate string
+		if a := c.graph.Addr(hb.NodeID); a != "" {
+			myPrivate = a
+		}
+		c.pendingPunch[id] = append(c.pendingPunch[id], api.PunchDirective{
+			Peer:    hb.NodeID,
+			Addr:    myPub.addr,
+			Private: myPrivate,
+		})
+		log.Printf("发牌：%s ↔ %s（%s / %s）", hb.NodeID, id, pe.addr, myPub.addr)
+	}
+	return out
 }
 
 // handleTransfer：仅 admin。选链 + 签发 grant 并投递到源节点任务队列。
@@ -271,20 +380,22 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
 		return
 	}
-	// 组装完整逐跳路径：每跳带数据面地址与拨号协议（协议来自
-	// 前驱节点探测该边的结果，QUIC 优先，不通则 TCP）
+	// 组装完整逐跳路径：每跳的地址与协议取自**前驱节点探测该边成功
+	// 的实际值**（打洞边=公网映射，直连边=广播地址；谁探测的谁去拨）
 	hops := make([]api.Hop, 0, len(path))
 	for i, id := range path {
 		hop := api.Hop{NodeID: id}
 		if i > 0 {
-			hop.Addr = c.graph.Addr(id)
-			if hop.Addr == "" {
-				http.Error(w, fmt.Sprintf("%s offline", id), http.StatusUnprocessableEntity)
-				return
-			}
-			hop.Proto = c.graph.EdgeInfo(path[i-1], id)
-			if hop.Proto == "" {
+			if proto, addr, ok := c.graph.EdgeDetail(path[i-1], id); ok && addr != "" {
+				hop.Addr = addr
+				hop.Proto = proto
+			} else {
+				hop.Addr = c.graph.Addr(id)
 				hop.Proto = "quic"
+			}
+			if hop.Addr == "" {
+				http.Error(w, fmt.Sprintf("%s 无可用地址", id), http.StatusUnprocessableEntity)
+				return
 			}
 		}
 		hops = append(hops, hop)

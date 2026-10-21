@@ -57,6 +57,30 @@ func quicConf() *quic.Config {
 	}
 }
 
+// sharedTransport：M6 打洞要求"监听、探测、拨号、WHOAMI"共用同一
+// 个 UDP socket，NAT 映射才一致。Transport 按连接 ID 在一个 socket
+// 上多路分解全部 QUIC 连接（监听 + 各次拨号），agent 启动时注入
+//（Conn 是带嗅探的外壳，截流 WHOAMI 回复）；nil 时退回独立 socket。
+var sharedTransport *quic.Transport
+
+// SetTransport 注入共享 Transport（监听与拨号同 socket）。
+func SetTransport(t *quic.Transport) { sharedTransport = t }
+
+// SendOpeners 从指定 UDP socket 向 target 周期发送开洞包。
+// 包内容无意义（对端 QUIC 视为垃圾丢弃），意义仅在"本 socket 向
+// target 发过包"这条 NAT 放行记录。dur 结束后停止。
+func SendOpeners(udp net.PacketConn, target string, dur time.Duration) {
+	addr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return
+	}
+	deadline := time.Now().Add(dur)
+	for time.Now().Before(deadline) {
+		udp.WriteTo([]byte("FFOPEN\n"), addr)
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // DialStream 按协议拨到 addr 并打开一条流。返回的 closer 关闭底层
 // 连接（QUIC conn / TCP conn），流本身的写侧由调用者按需半关闭。
 func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (Stream, func(), error) {
@@ -81,6 +105,18 @@ func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (S
 		udpAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return nil, nil, err
+		}
+		if sharedTransport != nil {
+			conn, err := sharedTransport.Dial(ctx, udpAddr, tlsConf, quicConf())
+			if err != nil {
+				return nil, nil, err
+			}
+			stream, err := conn.OpenStreamSync(ctx)
+			if err != nil {
+				conn.CloseWithError(0, "")
+				return nil, nil, err
+			}
+			return stream, func() { conn.CloseWithError(0, "") }, nil
 		}
 		udp, err := net.ListenUDP("udp", nil)
 		if err != nil {

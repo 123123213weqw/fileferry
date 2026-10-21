@@ -1,7 +1,9 @@
 // ff-agent：每台服务器一个。职责：enrollment（首次）、心跳上报
-// （负载 + 可达性边）、对端探测、数据面监听与传输执行。
-// agent 只保持对 controller 的出站连接，任务与节点列表都由心跳
-// 响应捎带——天然穿越 NAT，无需任何入站端口（数据面监听除外）。
+// （负载 + 可达性边）、对端探测、WHOAMI 公网映射保活（M6）、
+// 打洞执行（M6）、数据面监听与传输执行。
+// 监听、探测、拨号共用同一个 UDP socket（quic.Transport），NAT
+// 映射才一致——这是打洞成立的前提。agent 只保持对 controller 的
+// 出站连接，任务/节点表/打洞指令都由心跳响应捎带，天然穿越 NAT。
 package main
 
 import (
@@ -28,6 +30,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"fileferry/internal/api"
+	"fileferry/internal/nat"
 	"fileferry/internal/transfer"
 )
 
@@ -42,20 +45,49 @@ type Config struct {
 }
 
 var (
-	cfg       Config
-	nodeID    string
-	hostname  string
-	tlsConf   *tls.Config
-	hbClient  *api.Client
-	signPub   ed25519.PublicKey // grant 验签公钥
+	cfg      Config
+	nodeID   string
+	hostname string
+	tlsConf  *tls.Config
+	nodeCert tls.Certificate // WHOAMI 签名用
+	hbClient *api.Client
+	signPub  ed25519.PublicKey // grant 验签公钥
+	udpConn  *sniffConn        // 数据面共享 socket（监听+拨号+打洞+WHOAMI）
 
 	mu      sync.Mutex
-	peers   []api.PeerInfo   // 最近一次心跳响应下发的在线节点
-	edges   []api.EdgeReport // 最近一轮探测的可达边
-	running map[string]bool  // 去重：正在执行的 grant ID
+	peers    []api.PeerInfo   // 最近一次心跳响应下发的在线节点
+	edges    []api.EdgeReport // 最近一轮探测的可达边
+	punched  map[string]string // 打洞成功的对端 -> 公网映射地址
+	myPublic string            // controller 回声口告知的本机公网映射
+	running  map[string]bool   // 去重：正在执行的 grant ID
 
 	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
 )
+
+// sniffConn 在数据面 UDP socket 外截流 WHOAMI 回复，其余包交给 QUIC。
+type sniffConn struct {
+	*net.UDPConn
+	whoamiCh chan []byte
+}
+
+func (c *sniffConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := c.UDPConn.ReadFromUDP(p)
+		if err != nil {
+			return n, addr, err
+		}
+		if n >= 6 && string(p[:6]) == "FFWHO1" {
+			b := make([]byte, n)
+			copy(b, p[:n])
+			select {
+			case c.whoamiCh <- b:
+			default:
+			}
+			continue // 不交给 QUIC
+		}
+		return n, addr, err
+	}
+}
 
 func main() {
 	cfgPath := flag.String("config", "configs/agent.example.yaml", "agent 配置文件")
@@ -81,6 +113,7 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
+	nodeCert = *cert
 	tlsConf = &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		RootCAs:      rootPool,
@@ -91,14 +124,15 @@ func run(cfgPath string) error {
 	}
 	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}}
 	running = map[string]bool{}
+	punched = map[string]string{}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
 
-	// 2. 心跳 + 探测循环
+	// 2. 心跳 / 探测 / WHOAMI 保活
 	go heartbeatLoop()
 	go probeLoop()
+	go whoamiLoop()
 
-	// 3. 数据面：QUIC 监听（UDP）+ TCP 回退监听（端口约定 +1）。
-	// 服务端强制校验客户端证书（此前仅靠 grant 验签兜底）。
+	// 3. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）
 	serverTLS := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		ClientCAs:    rootPool,
@@ -109,14 +143,20 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	udp, err := net.ListenUDP("udp", addr)
+	rawUDP, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return err
 	}
-	if err := udp.SetReadBuffer(4 << 20); err == nil {
-		_ = udp.SetWriteBuffer(4 << 20)
+	if err := rawUDP.SetReadBuffer(4 << 20); err == nil {
+		_ = rawUDP.SetWriteBuffer(4 << 20)
 	}
-	ln, err := quic.Listen(udp, serverTLS, &quic.Config{
+	// 嗅探外壳 + Transport：外壳截流 WHOAMI 回复，Transport 在同一
+	// socket 上多路分解全部 QUIC 连接（监听 + 拨号）——监听/拨号/
+	// WHOAMI 真正共用一个 socket，NAT 映射才对得上号
+	udpConn = &sniffConn{UDPConn: rawUDP, whoamiCh: make(chan []byte, 4)}
+	tr := &quic.Transport{Conn: udpConn}
+	transfer.SetTransport(tr)
+	ln, err := tr.Listen(serverTLS, &quic.Config{
 		MaxIdleTimeout:                  30 * time.Second,
 		InitialStreamReceiveWindow:      8 << 20,
 		MaxStreamReceiveWindow:          16 << 20,
@@ -127,6 +167,7 @@ func run(cfgPath string) error {
 		return err
 	}
 	defer ln.Close()
+	defer rawUDP.Close()
 	tcpLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", cfg.DataPort+1), serverTLS)
 	if err != nil {
 		log.Printf("TCP 回退监听失败（仅 QUIC 可用）：%v", err)
@@ -192,7 +233,7 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 	// 该连接只被一次性 token 保护。TODO(M1)：config 里支持证书指纹
 	// 固定（trust-on-first-use），消除这一窗口。
 	cl := &api.Client{Base: cfg.Controller, HC: &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}},
 	}}
 	resp, err := cl.Enroll(api.EnrollRequest{
@@ -285,6 +326,7 @@ func heartbeatLoop() {
 			NodeID:   nodeID,
 			Hostname: hostname,
 			Addr:     advertisedAddr(),
+			Public:   myPublic,
 			Edges:    edges,
 			TS:       time.Now(),
 			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
@@ -300,13 +342,17 @@ func heartbeatLoop() {
 		peers = resp.Peers
 		mu.Unlock()
 		if changed {
-			select { // 非阻塞触发：节点表变了，马上探测
+			select {
 			case probeNow <- struct{}{}:
 			default:
 			}
 		}
 		for i := range resp.Jobs {
 			go runJob(resp.Jobs[i])
+		}
+		for _, d := range resp.Punches {
+			log.Printf("收到打洞指令：对端 %s（%s）", d.Peer, d.Addr)
+			go tryPunch(d)
 		}
 	}
 }
@@ -328,7 +374,122 @@ func samePeerSet(a, b []api.PeerInfo) bool {
 	return true
 }
 
-// runJob 执行一次传输：源端验签 -> QUIC 发送 -> 回报结果。
+// whoamiLoop 从**数据面 socket**（经嗅探外壳）向 controller 回声口
+// 周期发签名 WHOAMI——必须从这个 socket 发，NAT 映射才是数据面的
+// 映射；回复由嗅探外壳截流回来。保持映射鲜活并得知自己的公网地址。
+func whoamiLoop() {
+	echoAddr, err := controllerEchoAddr()
+	if err != nil {
+		log.Println("WHOAMI 不启动：", err)
+		return
+	}
+	t := time.NewTicker(25 * time.Second)
+	defer t.Stop()
+	send := func() {
+		pkt, err := nat.Build(nodeID, nodeCert, time.Now())
+		if err != nil {
+			return
+		}
+		raddr, err := net.ResolveUDPAddr("udp", echoAddr)
+		if err != nil {
+			return
+		}
+		if _, err := udpConn.WriteTo(pkt, raddr); err != nil {
+			log.Println("WHOAMI 发送失败：", err)
+			return
+		}
+		select {
+		case reply := <-udpConn.whoamiCh:
+			if pub, ok := nat.ParseEchoReply(reply); ok {
+				mu.Lock()
+				myPublic = pub // 观测到的 ip:port 原样使用——端口就是
+				// 数据面 socket 的 NAT 映射端口
+				mu.Unlock()
+			}
+		case <-time.After(3 * time.Second):
+			log.Println("WHOAMI 超时未收到回声（", echoAddr, "）")
+		}
+	}
+	send()
+	for range t.C {
+		send()
+	}
+}
+
+// controllerEchoAddr 回声口地址 = controller 主机 + (控制端口+1)。
+func controllerEchoAddr() (string, error) {
+	u, err := url.Parse(cfg.Controller)
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("controller 地址解析失败")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	p, err := strconvAtoi(port)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(u.Hostname(), fmt.Sprintf("%d", p+1)), nil
+}
+
+func strconvAtoi(s string) (int, error) {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("bad port %q", s)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
+}
+
+func hostOf(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return hostport
+}
+
+// tryPunch 执行一次打洞：向对方公网映射持续发开洞包（本 socket 的
+// NAT 放行记录），同时从同一 socket 反复 QUIC 探测——握手包本身
+// 就是打洞包。成功则把该地址登记为探测目标，由常规探测维持这条边。
+func tryPunch(d api.PunchDirective) {
+	mu.Lock()
+	if _, ok := punched[d.Peer]; ok {
+		mu.Unlock()
+		return // 已有直连，无需再打
+	}
+	mu.Unlock()
+
+	go transfer.SendOpeners(udpConn, d.Addr, 8*time.Second)
+	targets := []string{d.Addr}
+	if d.Private != "" && d.Private != d.Addr {
+		targets = append(targets, d.Private)
+	}
+	for i := 0; i < 10; i++ {
+		for _, tgt := range targets {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			rtt, _, err := transfer.Probe(ctx, tgt, tlsConf)
+			cancel()
+			if err == nil {
+				mu.Lock()
+				punched[d.Peer] = tgt
+				mu.Unlock()
+				log.Printf("打洞成功：%s（%s，rtt %s）", d.Peer, tgt, rtt.Round(time.Millisecond))
+				select { // 立即探测一轮，让新边尽快上图
+				case probeNow <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+		time.Sleep(600 * time.Millisecond)
+	}
+	log.Printf("打洞失败：%s（NAT 类型不支持或防火墙拦截，走中继兜底）", d.Peer)
+}
+
+// runJob 执行一次传输：源端验签 -> 多流并行发送 -> 回报结果。
 func runJob(g api.TransferGrant) {
 	mu.Lock()
 	if running[g.ID] {
@@ -386,17 +547,29 @@ func runJob(g api.TransferGrant) {
 	log.Printf("任务 %s 完成：%s -> %s%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, via, time.Since(start).Round(time.Millisecond))
 }
 
-// probeLoop 探测所有在线对端，成功边回填到心跳。触发时机：节点表
-// 变化（立即）或每 30 秒兜底一轮。探测并行执行，单轮预算约 2 秒。
-// TODO(M3)：UDP 失败时 TCP 回退探测；失败对端指数退避。
+// probeLoop 探测所有目标：广播地址（节点表）+ 打洞公网映射。
+// 对打洞地址的探测本身就是 NAT 保活。触发：目标变化或 30 秒兜底。
 func probeLoop() {
 	runRound := func() {
+		type target struct {
+			id   api.NodeID
+			addr string
+		}
 		mu.Lock()
-		targets := make([]api.PeerInfo, 0, len(peers))
+		byID := make(map[api.NodeID]string, len(peers)+len(punched))
+		for id, addr := range punched {
+			byID[id] = addr // 打洞地址优先（已知可通）
+		}
 		for _, p := range peers {
 			if p.ID != nodeID {
-				targets = append(targets, p)
+				if _, ok := byID[p.ID]; !ok {
+					byID[p.ID] = p.Addr
+				}
 			}
+		}
+		targets := make([]target, 0, len(byID))
+		for id, addr := range byID {
+			targets = append(targets, target{id, addr})
 		}
 		mu.Unlock()
 		var (
@@ -404,21 +577,21 @@ func probeLoop() {
 			muEdges sync.Mutex
 			found   []api.EdgeReport
 		)
-		for _, p := range targets {
+		for _, tg := range targets {
 			wg.Add(1)
-			go func(p api.PeerInfo) {
+			go func(tg target) {
 				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 				defer cancel()
-				rtt, proto, err := transfer.Probe(ctx, p.Addr, tlsConf)
+				rtt, proto, err := transfer.Probe(ctx, tg.addr, tlsConf)
 				if err != nil {
-					log.Printf("探测 %s(%s) 失败：%v", p.ID, p.Addr, err)
+					log.Printf("探测 %s(%s) 失败：%v", tg.id, tg.addr, err)
 					return
 				}
 				muEdges.Lock()
-				found = append(found, api.EdgeReport{To: p.ID, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto})
+				found = append(found, api.EdgeReport{To: tg.id, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto, Addr: tg.addr})
 				muEdges.Unlock()
-			}(p)
+			}(tg)
 		}
 		wg.Wait()
 		mu.Lock()
@@ -442,7 +615,7 @@ func probeLoop() {
 func localIPTowardsController() string {
 	if u, err := url.Parse(cfg.Controller); err == nil {
 		if host := u.Hostname(); host != "" {
-			if c, err := net.DialTimeout("tcp", net.JoinHostPort(host, u.Port()), 2*time.Second); err == nil {
+			if c, err := net.DialTimeout("tcp", net.JoinHostPort(host, portOfController()), 2*time.Second); err == nil {
 				defer c.Close()
 				if addr, ok := c.LocalAddr().(*net.TCPAddr); ok {
 					return addr.IP.String()
@@ -451,6 +624,13 @@ func localIPTowardsController() string {
 		}
 	}
 	return localIP()
+}
+
+func portOfController() string {
+	if u, err := url.Parse(cfg.Controller); err == nil && u.Port() != "" {
+		return u.Port()
+	}
+	return "443"
 }
 
 func localIP() string {

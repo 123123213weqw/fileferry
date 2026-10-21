@@ -17,20 +17,26 @@ import (
 type NodeID = string
 
 // EdgeReport 是一次探测的结果：本节点到 To 方向主动可达。
-// RTT 单位毫秒，Proto 为 "quic" 或 "tcp"（M3 探测循环产出，
-// TCP 是 UDP 被防火墙拦截时的回退通道）。
+// RTT 单位毫秒，Proto 为 "quic" 或 "tcp"（TCP 是 UDP 被防火墙
+// 拦截时的回退通道）。Addr 是实际拨通的地址——打洞成功的边是
+// 对端的公网 NAT 映射，直连边是对端广播的地址，controller 构建
+// 传输路径时以此为准（谁探测的谁去拨）。
 type EdgeReport struct {
 	To    NodeID  `json:"to"`
 	RTTms float64 `json:"rtt_ms"`
 	Proto string  `json:"proto"`
+	Addr  string  `json:"addr"`
 }
 
 // Heartbeat 是 agent 每 5 秒上报的实时负载与可达性快照，
-// 是拓扑图和负载调度的唯一数据源。
+// 是拓扑图和负载调度的唯一数据源。Public 是本节点经 controller
+// UDP 回声口得知的自身公网 NAT 映射（agent 不自行声称，controller
+// 回填校验），供打洞配对用。
 type Heartbeat struct {
 	NodeID        NodeID       `json:"node_id"`
 	Hostname      string       `json:"hostname"`
 	Addr          string       `json:"addr"` // 数据面地址 host:port（QUIC）
+	Public        string       `json:"public,omitempty"`
 	CPUPct        float64      `json:"cpu_pct"`
 	MemPct        float64      `json:"mem_pct"`
 	DiskFreeBytes uint64       `json:"disk_free_bytes"`
@@ -49,11 +55,23 @@ type PeerInfo struct {
 	Addr string `json:"addr"` // 数据面地址 host:port（QUIC）
 }
 
-// HeartbeatResponse 是心跳的响应：下发给该节点的待执行任务与
-// 全网在线节点列表（agent 只需出站连接 controller，天然过 NAT）。
+// PunchDirective 是 controller 随心跳下发的打洞指令：对端 Peer 的
+// 公网 NAT 映射（Addr，来自 controller 的 UDP 回声口）与私网地址
+// （Private，同网段时直接可通）。双方同时向对方发包即可在两个
+// NAT 上留下放行记录。指令经 mTLS 心跳信道到达，无需额外签名。
+type PunchDirective struct {
+	Peer     NodeID `json:"peer"`
+	Addr     string `json:"addr"`     // 对端公网映射 host:port
+	Private  string `json:"private"`  // 对端广播地址 host:port
+}
+
+// HeartbeatResponse 是心跳的响应：下发给该节点的待执行任务、
+// 全网在线节点表（agent 只需出站连接 controller，天然过 NAT）、
+// 以及打洞指令。
 type HeartbeatResponse struct {
-	Jobs   []TransferGrant `json:"jobs"`
-	Peers  []PeerInfo      `json:"peers"`
+	Jobs    []TransferGrant   `json:"jobs"`
+	Peers   []PeerInfo        `json:"peers"`
+	Punches []PunchDirective  `json:"punches"`
 }
 
 // EnrollRequest / EnrollResponse：一次性 token 换取本节点证书与根证书。

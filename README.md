@@ -82,6 +82,12 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 - [ ] M3 复杂网络（核心已落地）：✅ TCP 回退（探测 QUIC 失败自动
       降级，端口约定 +1） ✅ 中继链数据面（grant 逐跳路径 + 验签 +
       双向管道 + 防开放代理） ⬜ 断链换路续传
+- [x] M6 NAT 打洞（机制完成，成败取决于对端 NAT 类型）：
+      ✅ controller UDP 回声口（验证书链+签名+防重放）✅ 公网映射账本
+      ✅ 双端同时发牌（心跳信道携带）✅ 共享 socket（嗅探外壳+Transport，
+      监听/拨号/WHOAMI 同源）✅ 对发开洞 + 前缀探测自动建边
+      真实环境验证：跨两个校园 NAT 的对等打洞被对称型 NAT 拒绝
+      （双方同时行动、地址正确、失败被正确识别并回落中继）
 - [ ] M4 精准负载：⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
 - [ ] M5 收尾：⬜ ffctl 管理令牌 ⬜ systemd 单元 ⬜ 部署打包
       ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
