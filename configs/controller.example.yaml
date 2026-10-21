@@ -1,0 +1,5 @@
+# ff-controller 的全部配置
+listen: :8443
+data-dir: /var/lib/ffctl   # CA 根密钥、签名私钥、SQLite；仅 controller 可读
+enroll-tokens:             # 一次性入网令牌，每节点一枚，用一枚废一枚
+  - ff_enroll_replace-me
