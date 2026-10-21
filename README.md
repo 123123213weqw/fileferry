@@ -3,6 +3,22 @@
 面向复杂网络的小型按需文件传输系统：十多台服务器，内网↔内网、
 内网↔外网，自动跳板路由 + 负载感知调度，全程无两两共享密钥。
 
+> **English** — fileferry is a lightweight, self-hosted, on-demand
+> file transfer system for small fleets of servers in complex networks
+> (intranet↔intranet, intranet↔internet). Nodes auto-discover each
+> other, probe reachability, and transfers are routed over a
+> load-aware directed graph with automatic multi-hop relaying —
+> no pairwise shared keys, no external services. Single static Go
+> binary per node (~8MB), mTLS with a built-in CA, admin-only
+> transfer authorization, QUIC with TCP fallback, parallel
+> multi-stream transfers, chunked SHA-256 verification and atomic
+> writes. Similar in spirit to Syncthing (mesh) or croc (relay),
+> but on-demand, permissioned, and load-routed.
+>
+> **Keywords**: file transfer · file distribution · p2p · peer-to-peer ·
+> mesh network · relay · mTLS · QUIC · self-hosted · zero trust ·
+> Go · golang
+
 ## 架构
 
 - **ff-controller**（1 台，双网卡机器）：内嵌 CA（ed25519 根证书）、
