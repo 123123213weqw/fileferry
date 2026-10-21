@@ -7,13 +7,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -23,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -303,9 +307,10 @@ func loadSignPub() error {
 	return nil
 }
 
-// verifyGrant 在数据面本地验签：签名有效、发给我、未过期。
+// verifyGrant 在数据面本地验签：签名有效、未过期。身份匹配由各
+// 路径自查：接收端查 Dst==selfID，中继查在路径上，交换台查参与方。
 func verifyGrant(g *api.TransferGrant) bool {
-	return g.Verify(signPub) && g.Dst == nodeID && time.Now().Before(g.ExpiresAt)
+	return g.Verify(signPub) && time.Now().Before(g.ExpiresAt)
 }
 
 // advertisedAddr 返回对外广播的数据面地址：优先显式配置，
@@ -489,8 +494,16 @@ func tryPunch(d api.PunchDirective) {
 	log.Printf("打洞失败：%s（NAT 类型不支持或防火墙拦截，走中继兜底）", d.Peer)
 }
 
-// runJob 执行一次传输：源端验签 -> 多流并行发送 -> 回报结果。
+// runJob 执行一次任务。角色由 grant 与自身身份的关系决定：
+// 交换台模式下目的端也要出站接入（derp 式，NAT 不构成障碍）。
 func runJob(g api.TransferGrant) {
+	if g.Dst == nodeID && g.Mode == "switch" {
+		runSwitchRecv(g)
+		return
+	}
+	if g.Src != nodeID {
+		return
+	}
 	mu.Lock()
 	if running[g.ID] {
 		mu.Unlock()
@@ -510,12 +523,8 @@ func runJob(g api.TransferGrant) {
 		}
 	}
 
-	if !g.Verify(signPub) || g.Src != nodeID {
-		done(false, "grant 验签失败")
-		return
-	}
-	if time.Now().After(g.ExpiresAt) {
-		done(false, "grant 已过期")
+	if !g.Verify(signPub) || time.Now().After(g.ExpiresAt) {
+		done(false, "grant 验签失败或已过期")
 		return
 	}
 	timeout := time.Until(g.ExpiresAt)
@@ -528,23 +537,116 @@ func runJob(g api.TransferGrant) {
 		done(false, "grant 路径不完整")
 		return
 	}
-	firstHop := g.Hops[1]
+	var open transfer.StreamOpener
+	via := ""
+	switch g.Mode {
+	case "switch":
+		open = transfer.OpenerSwitch(ctx, g.Hops[1], tlsConf, &g)
+		via = fmt.Sprintf("（经 %s 交换台对接）", g.Hops[1].NodeID)
+	default:
+		open = transfer.OpenerDirect(ctx, g.Hops[1], tlsConf)
+		if len(g.Hops) > 2 {
+			ids := make([]string, 0, len(g.Hops)-2)
+			for _, h := range g.Hops[1 : len(g.Hops)-1] {
+				ids = append(ids, h.NodeID)
+			}
+			via = "（经 " + strings.Join(ids, " -> ") + " 中继）"
+		}
+	}
 	start := time.Now()
-	if err := transfer.SendFile(ctx, g.SrcPath, firstHop, tlsConf, &g); err != nil {
+	if err := transfer.SendFile(ctx, g.SrcPath, open, &g); err != nil {
 		done(false, err.Error())
 		log.Printf("任务 %s 失败：%v", g.ID, err)
 		return
 	}
-	via := ""
-	if len(g.Hops) > 2 {
-		ids := make([]string, 0, len(g.Hops)-2)
-		for _, h := range g.Hops[1 : len(g.Hops)-1] {
-			ids = append(ids, h.NodeID)
-		}
-		via = "（经 " + strings.Join(ids, " -> ") + " 中继）"
-	}
 	done(true, "")
 	log.Printf("任务 %s 完成：%s -> %s%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, via, time.Since(start).Round(time.Millisecond))
+}
+
+// runSwitchRecv 交换台模式的目的端：按 grant.Streams 出站拨向交换台
+// 配对，每条连接独立接收一个份额（与发送端的并行连接一一配对）。
+func runSwitchRecv(g api.TransferGrant) {
+	mu.Lock()
+	if running["recv-"+g.ID] {
+		mu.Unlock()
+		return
+	}
+	running["recv-"+g.ID] = true
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		delete(running, "recv-"+g.ID)
+		mu.Unlock()
+	}()
+
+	if !g.Verify(signPub) || g.Dst != nodeID || len(g.Hops) < 2 {
+		log.Printf("接收任务 %s 验签失败", g.ID)
+		return
+	}
+	timeout := time.Until(g.ExpiresAt)
+	if timeout > 30*time.Minute {
+		timeout = 30 * time.Minute
+	}
+	n := g.Streams
+	if n < 1 {
+		n = 1
+	}
+	start := time.Now()
+	var wg sync.WaitGroup
+	var fail int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			if err := switchRecvShare(ctx, g); err != nil {
+				atomic.AddInt32(&fail, 1)
+				log.Printf("接收任务 %s 份额失败：%v", g.ID, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if fail > 0 {
+		log.Printf("接收任务 %s 失败（%d/%d 份额失败）", g.ID, fail, n)
+		return
+	}
+	log.Printf("接收完成：%s（src=%s，交换台 %s，耗时 %s）", g.ID, g.Src, g.Hops[1].NodeID, time.Since(start).Round(time.Millisecond))
+}
+
+// switchRecvShare 接入交换台并按标准 FFJ1 逻辑接收一个连接份额。
+func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
+	stream, closeConn, err := transfer.DialSwitch(ctx, g.Hops[1].Addr, g.Hops[1].Proto, tlsConf, &g)
+	if err != nil {
+		return err
+	}
+	defer closeConn()
+
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(stream, head); err != nil {
+		return err
+	}
+	if string(head) != "FFJ1" {
+		return fmt.Errorf("非传输流 %q", head)
+	}
+	br := bufio.NewReader(stream)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	var gg api.TransferGrant
+	if err := json.Unmarshal([]byte(line), &gg); err != nil || gg.ID != g.ID {
+		return fmt.Errorf("grant 不符")
+	}
+	transfer.RecvStream(br, stream, &gg)
+	// ACK 已写入流：只半关写侧，等对端读走、对端关闭后再退出，
+	// 避免 QUIC 立即关连接丢弃未送达的 ACK
+	transfer.CloseWrite(stream)
+	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		s.SetReadDeadline(time.Now().Add(60 * time.Second))
+	}
+	io.ReadFull(stream, make([]byte, 1))
+	return nil
 }
 
 // probeLoop 探测所有目标：广播地址（节点表）+ 打洞公网映射。

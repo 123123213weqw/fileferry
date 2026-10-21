@@ -140,6 +140,10 @@ func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (S
 	}
 }
 
+// CloseWrite 半关闭写侧（向对端发 FIN 但保持可读），QUIC 的 Close
+// 与 TCP/TLS 的 CloseWrite 语义一致。
+func CloseWrite(s Stream) { closeWrite(s) }
+
 // closeWrite 半关闭写侧（向对端发 FIN 但保持可读），QUIC 的 Close
 // 与 TCP/TLS 的 CloseWrite 语义一致。
 func closeWrite(s Stream) {
@@ -197,13 +201,15 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 	return idx, data, nil
 }
 
-// SendFile 把 path 的内容经 firstHop 发出，grant 头随流首行传递。
-// 直连时 firstHop 就是目的端；有中继时是第一跳中继，后续跳对发送端
-// 透明（ACK 沿管道回流）。
-// grant.Streams > 1 时并行开多条连接（各自独立五元组），交错发送
-// 分块——绕过按流的 UDP 限速、填满带宽延迟积。
+// StreamOpener 建立一条数据面流（常规拨号或交换台配对）。
+type StreamOpener func() (Stream, func(), error)
+
+// SendFile 把 path 的内容经 open 建立的流发出（常规路径 firstHop
+// 直拨/中继透明转发；交换台模式下 open 完成配对握手）。
+// grant.Streams > 1 时并行开多条连接，交错分块——绕过按流的 UDP
+// 限速、填满带宽延迟积。
 // TODO(M2.5)：限速（grant.RateLimit）、按已完成块续传。
-func SendFile(ctx context.Context, path string, firstHop api.Hop, tlsConf *tls.Config, grant *api.TransferGrant) error {
+func SendFile(ctx context.Context, path string, open StreamOpener, grant *api.TransferGrant) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -219,7 +225,7 @@ func SendFile(ctx context.Context, path string, firstHop api.Hop, tlsConf *tls.C
 		wg.Add(1)
 		go func(r int) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, firstHop, tlsConf, grant, r, n)
+			errCh <- sendShare(ctx, f, open, grant, r, n)
 		}(r)
 	}
 	wg.Wait()
@@ -232,13 +238,58 @@ func SendFile(ctx context.Context, path string, firstHop api.Hop, tlsConf *tls.C
 	return nil
 }
 
+// OpenerDirect 返回常规模式的建流函数（拨 firstHop）。
+func OpenerDirect(ctx context.Context, firstHop api.Hop, tlsConf *tls.Config) StreamOpener {
+	return func() (Stream, func(), error) {
+		return DialStream(ctx, firstHop.Addr, firstHop.Proto, tlsConf)
+	}
+}
+
+// OpenerSwitch 返回交换台模式的建流函数：出站拨交换台并完成
+// FFSW 配对握手，返回的流在协议上与直连流完全同构。
+func OpenerSwitch(ctx context.Context, sw api.Hop, tlsConf *tls.Config, grant *api.TransferGrant) StreamOpener {
+	return func() (Stream, func(), error) {
+		return DialSwitch(ctx, sw.Addr, sw.Proto, tlsConf, grant)
+	}
+}
+
+// DialSwitch 出站拨向交换台，发送 FFSW + grant 完成配对，等 OK。
+func DialSwitch(ctx context.Context, addr, proto string, tlsConf *tls.Config, grant *api.TransferGrant) (Stream, func(), error) {
+	stream, closeConn, err := DialStream(ctx, addr, proto, tlsConf)
+	if err != nil {
+		return nil, nil, err
+	}
+	gj, err := json.Marshal(grant)
+	if err != nil {
+		closeConn()
+		return nil, nil, err
+	}
+	if _, err := fmt.Fprintf(stream, "FFSW%s\n", gj); err != nil {
+		closeConn()
+		return nil, nil, err
+	}
+	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		s.SetReadDeadline(time.Now().Add(75 * time.Second))
+	}
+	reply := make([]byte, 3)
+	if _, err := io.ReadFull(stream, reply); err != nil {
+		closeConn()
+		return nil, nil, fmt.Errorf("等待交换台配对失败：%w", err)
+	}
+	if string(reply) != "OK\n" {
+		closeConn()
+		return nil, nil, fmt.Errorf("交换台拒绝：%q", reply)
+	}
+	return stream, closeConn, nil
+}
+
 // sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
 // 保证各连接进度均衡。完成后发哨兵帧并等 ACK（接收端在全部份额
 // 落盘后才统一回 ACK）。
-func sendShare(ctx context.Context, f *os.File, firstHop api.Hop, tlsConf *tls.Config, grant *api.TransferGrant, r, n int) error {
-	stream, closeConn, err := DialStream(ctx, firstHop.Addr, firstHop.Proto, tlsConf)
+func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, r, n int) error {
+	stream, closeConn, err := open()
 	if err != nil {
-		return fmt.Errorf("dial %s(%s): %w", firstHop.Addr, firstHop.Proto, err)
+		return fmt.Errorf("建流失败: %w", err)
 	}
 	defer closeConn()
 
@@ -251,14 +302,12 @@ func sendShare(ctx context.Context, f *os.File, firstHop api.Hop, tlsConf *tls.C
 	}
 
 	buf := make([]byte, ChunkSize)
-	var count int64
 	for idx := int64(r); ; idx += int64(n) {
 		nread, rerr := f.ReadAt(buf, idx*ChunkSize)
 		if nread > 0 {
 			if err := WriteFrame(stream, idx, buf[:nread]); err != nil {
 				return err
 			}
-			count++
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
@@ -288,7 +337,8 @@ func sendShare(ctx context.Context, f *os.File, firstHop api.Hop, tlsConf *tls.C
 // GrantVerifier 在数据面本地验签 grant（agent 注入 controller 公钥实现）。
 type GrantVerifier func(*api.TransferGrant) bool
 
-// ServeQUIC 在 QUIC 监听上分发流。tlsConf 用于中继时拨下一跳。
+// ServeQUIC 在 QUIC 监听上分发流。tlsConf 用于中继时拨下一跳；
+// peerCN 为本连接对端证书 CN（交换台校验参与方用）。
 func ServeQUIC(ln *quic.Listener, selfID string, verify GrantVerifier, tlsConf *tls.Config) error {
 	for {
 		conn, err := ln.Accept(context.Background())
@@ -297,12 +347,16 @@ func ServeQUIC(ln *quic.Listener, selfID string, verify GrantVerifier, tlsConf *
 		}
 		go func() {
 			defer conn.CloseWithError(0, "")
+			cn := ""
+			if pcs := conn.ConnectionState().TLS.PeerCertificates; len(pcs) > 0 {
+				cn = pcs[0].Subject.CommonName
+			}
 			for {
 				stream, err := conn.AcceptStream(context.Background())
 				if err != nil {
 					return
 				}
-				go HandleStream(stream, selfID, verify, tlsConf)
+				go HandleStream(stream, selfID, verify, tlsConf, cn)
 			}
 		}()
 	}
@@ -315,12 +369,12 @@ func ServeTCP(ln net.Listener, selfID string, verify GrantVerifier, tlsConf *tls
 		if err != nil {
 			return err
 		}
-		go HandleStream(conn, selfID, verify, tlsConf)
+		go HandleStream(conn, selfID, verify, tlsConf, "")
 	}
 }
 
-// HandleStream 处理一条数据面流：探测 / 接收 / 中继。
-func HandleStream(stream Stream, selfID string, verify GrantVerifier, tlsConf *tls.Config) {
+// HandleStream 处理一条数据面流：探测 / 接收 / 中继 / 交换台接入。
+func HandleStream(stream Stream, selfID string, verify GrantVerifier, tlsConf *tls.Config, peerCNStr string) {
 	defer stream.Close()
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(stream, head); err != nil {
@@ -347,18 +401,148 @@ func HandleStream(stream Stream, selfID string, verify GrantVerifier, tlsConf *t
 		}
 		switch {
 		case grant.Dst == selfID:
-			recvStream(br, stream, &grant)
+			RecvStream(br, stream, &grant)
 		default:
 			relayStream(br, stream, &grant, selfID, tlsConf)
 		}
+	case "FFSW":
+		handleSwitchJoin(bufio.NewReader(stream), stream, verify, peerCNStr)
 	default:
 		fmt.Printf("未知流类型 %q\n", head)
 	}
 }
 
-// recvStream 接收一个连接份额：帧按块号稀疏写入共享临时文件，
+// resolveCN 解析对端证书 CN：优先服务层传入（QUIC 场景），否则
+// 从 TCP TLS 连接自取。
+func resolveCN(stream Stream, cn string) string {
+	if cn != "" {
+		return cn
+	}
+	if tc, ok := stream.(*tls.Conn); ok {
+		if pcs := tc.ConnectionState().PeerCertificates; len(pcs) > 0 {
+			return pcs[0].Subject.CommonName
+		}
+	}
+	return ""
+}
+
+// —— M7 交换台：两端各自出站拨入，凭同一份签名 grant 配对对接 ——
+
+type swWaiter struct {
+	stream Stream
+	br     *bufio.Reader
+	cn     string
+	paired chan struct{} // 配对成功
+	done   chan struct{} // 管道结束
+}
+
+type switchboard struct {
+	mu  sync.Mutex
+	src map[string][]*swWaiter // grantID -> Src 侧待配对
+	dst map[string][]*swWaiter // grantID -> Dst 侧待配对
+}
+
+var swBoard = &switchboard{src: map[string][]*swWaiter{}, dst: map[string][]*swWaiter{}}
+
+// handleSwitchJoin 处理一条 FFSW 流：验签、校验参与方身份、按
+// 行别（Src 侧 × Dst 侧）配对——同侧绝不互配，配对成功后双向管道
+// 直到传输结束。对端未到则超时退出。
+func handleSwitchJoin(br *bufio.Reader, stream Stream, verify GrantVerifier, peerCNStr string) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	var grant api.TransferGrant
+	if err := json.Unmarshal([]byte(line), &grant); err != nil {
+		fmt.Println("交换台 grant 解析失败：", err)
+		return
+	}
+	if verify == nil || !verify(&grant) {
+		fmt.Printf("交换台拒绝未授权对接 %s\n", grant.ID)
+		return
+	}
+	cn := resolveCN(stream, peerCNStr)
+	if cn != grant.Src && cn != grant.Dst {
+		fmt.Printf("交换台拒绝 %s：%s 不是传输参与方\n", grant.ID, cn)
+		return
+	}
+	w := &swWaiter{stream: stream, br: br, cn: cn, paired: make(chan struct{}), done: make(chan struct{})}
+
+	pool := swBoard.dst
+	if cn == grant.Src {
+		pool = swBoard.src
+	}
+	swBoard.mu.Lock()
+	list := append(pool[grant.ID], w)
+	pool[grant.ID] = list
+	// Src 侧与 Dst 侧各有一名时配对（可能一次消化多对）
+	for len(swBoard.src[grant.ID]) > 0 && len(swBoard.dst[grant.ID]) > 0 {
+		a := swBoard.src[grant.ID][0]
+		b := swBoard.dst[grant.ID][0]
+		swBoard.src[grant.ID] = swBoard.src[grant.ID][1:]
+		swBoard.dst[grant.ID] = swBoard.dst[grant.ID][1:]
+		if len(swBoard.src[grant.ID]) == 0 {
+			delete(swBoard.src, grant.ID)
+		}
+		if len(swBoard.dst[grant.ID]) == 0 {
+			delete(swBoard.dst, grant.ID)
+		}
+		a.stream.Write([]byte("OK\n"))
+		b.stream.Write([]byte("OK\n"))
+		close(a.paired)
+		close(b.paired)
+		go func(a, b *swWaiter) {
+			pipeWaiters(a, b)
+			close(a.done)
+			close(b.done)
+		}(a, b)
+	}
+	swBoard.mu.Unlock()
+
+	select {
+	case <-w.paired:
+		<-w.done // 等管道结束，避免外层 defer 提前关流
+	case <-time.After(75 * time.Second):
+		swBoard.remove(grant.ID, w)
+		fmt.Printf("交换台配对超时：%s（%s）\n", grant.ID, cn)
+	}
+}
+
+func (s *switchboard) remove(grantID string, w *swWaiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, pool := range []map[string][]*swWaiter{s.src, s.dst} {
+		list := pool[grantID]
+		for i, x := range list {
+			if x == w {
+				pool[grantID] = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+		if len(pool[grantID]) == 0 {
+			delete(pool, grantID)
+		}
+	}
+}
+
+// pipeWaiters 双向管道（与中继转发同一套语义：反向半关闭保证
+// ACK 之后的 FIN 不丢数据）。
+func pipeWaiters(a, b *swWaiter) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // 正向：a -> b
+		defer wg.Done()
+		io.Copy(b.stream, a.br)
+		closeWrite(b.stream)
+	}()
+	io.Copy(a.stream, b.br) // 反向：b -> a
+	closeWrite(a.stream)
+	wg.Wait()
+}
+
+// RecvStream 接收一个连接份额：帧按块号稀疏写入共享临时文件，
 // 本连接哨兵到齐后等全局完成再回 ACK。
-func recvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant) {
+func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant) {
 	g, err := groupFor(grant)
 	if err != nil {
 		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)

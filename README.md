@@ -75,6 +75,11 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 ## 里程碑
 
 - [x] M0 骨架：仓库 / 构建 / 单测 / 冒烟管道
+- [x] M7 交换台模式（DERP 式反向中继）：无常规路径时，两端各自
+      **出站**拨向一台选举产生的交换台节点（负载最低、双方可达），
+      交换台按 grant 行别配对两条现成连接后双向管道——NAT 不构成
+      障碍。真实环境验证：V100 ↔ node5 跨两个校园 NAT 传输 50MB，
+      sha256 一致，52s 完成
 - [ ] M1 信任与观测（进行中）：✅ CA/enrollment/心跳 ✅ status 展示
       ✅ 探测回填可达边 ⬜ /proc 指标采集 ⬜ 证书自动续期 ⬜ SQLite 持久化
 - [ ] M2 直连传输（基础可用）：✅ grant 签发与两端验签 ✅ 分块传输

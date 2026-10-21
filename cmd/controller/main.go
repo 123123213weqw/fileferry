@@ -376,6 +376,9 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := c.graph.Path(req.Src, req.Dst)
+	if (path == nil || len(path) < 2) && c.trySwitch(w, req) {
+		return // 走交换台模式（响应已写）
+	}
 	if path == nil || len(path) < 2 {
 		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
 		return
@@ -453,6 +456,74 @@ func (c *controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(c.graph.Snapshot())
+}
+
+// trySwitch 交换台模式：常规路径不存在时，选举一台"源和目的都
+// 能出站够到"的最闲节点当交换台（DERP 式——两端各自出站拨入，
+// 交换台把两条现成连接对接，NAT 不构成障碍）。grant 同时投递给
+// 源和目的两端。
+func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) bool {
+	snap := c.graph.Snapshot()
+	best := api.NodeID("")
+	bestScore := 1e9
+	for _, hb := range snap {
+		R := hb.NodeID
+		if R == req.Src || R == req.Dst {
+			continue
+		}
+		// 两端都要有到 R 的出站边（谁探测的谁去拨）
+		if _, _, ok := c.graph.EdgeDetail(req.Src, R); !ok {
+			continue
+		}
+		if _, _, ok := c.graph.EdgeDetail(req.Dst, R); !ok {
+			continue
+		}
+		load := hb.LoadPct()
+		if load > topology.MaxLoadPct {
+			continue
+		}
+		score := load + float64(hb.ActiveXfers)*10 // 负载优先，在途传输数加权
+		if score < bestScore {
+			bestScore = score
+			best = R
+		}
+	}
+	if best == "" {
+		return false
+	}
+	proto, addr, _ := c.graph.EdgeDetail(req.Src, best)
+	if addr == "" {
+		addr = c.graph.Addr(best)
+	}
+	if proto == "" {
+		proto = "quic"
+	}
+
+	c.mu.Lock()
+	c.nextID++
+	id := c.nextID
+	c.mu.Unlock()
+	grant := api.TransferGrant{
+		ID:        fmt.Sprintf("xfer-%d", id),
+		Src:       req.Src,
+		Dst:       req.Dst,
+		Mode:      "switch",
+		Hops:      []api.Hop{{NodeID: req.Src}, {NodeID: best, Addr: addr, Proto: proto}, {NodeID: req.Dst}},
+		SrcPath:   req.SrcPath,
+		DstPath:   req.DstPath,
+		ChunkSize: 4 << 20,
+		Streams:   4,
+		RateLimit: req.RateLimit,
+		ExpiresAt: time.Now().Add(30 * time.Minute),
+	}
+	grant.Sign(c.signer)
+	c.mu.Lock()
+	c.pending[req.Src] = append(c.pending[req.Src], grant) // 源端：发送
+	c.pending[req.Dst] = append(c.pending[req.Dst], grant) // 目的端：出站接入交换台
+	c.mu.Unlock()
+	log.Printf("交换台模式：%s -> %s 经 %s 对接", req.Src, req.Dst, best)
+	json.NewEncoder(w).Encode(grant)
+	return true
 }
 
 func loadOrCreateSignKeys(dir string) (ed25519.PrivateKey, ed25519.PublicKey, error) {

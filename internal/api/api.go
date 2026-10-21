@@ -124,7 +124,12 @@ type TransferGrant struct {
 	ID         string    `json:"id"`
 	Src        NodeID    `json:"src"`
 	Dst        NodeID    `json:"dst"`
-	Hops       []Hop     `json:"hops"` // 完整路径：源端、各中继、目的端
+	// Mode 为空 = 常规模式（直连或逐跳中继，前驱拨下一跳）；
+	// "switch" = 交换台模式：两端各自**出站**拨向 Hops[1] 指定的
+	// 交换台节点（DERP 式），交换台把两条现成连接对接。适用于
+	// 任何一方都拨不进对方 NAT 的场景。
+	Mode       string    `json:"mode,omitempty"`
+	Hops       []Hop     `json:"hops"` // 完整路径：源端、各中继/交换台、目的端
 	Relays     []NodeID  `json:"relays"`
 	SrcPath    string    `json:"src_path"`
 	DstPath    string    `json:"dst_path"`
