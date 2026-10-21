@@ -92,6 +92,46 @@ func grantKeys(t *testing.T) (sign func(*api.TransferGrant), verify GrantVerifie
 		func(g *api.TransferGrant) bool { return g.Verify(pub) }
 }
 
+// 并行多流直传：3 条连接交错分块，逐字节一致。
+func TestParallelStreams(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, verify := grantKeys(t)
+	dstQ, stopDst := startNode(t, "dst", root, verify)
+	defer stopDst()
+
+	dir := t.TempDir()
+	payload := make([]byte, 12*1024*1024) // 12MB，非整块数
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(dir, "src.bin")
+	dstPath := filepath.Join(dir, "out", "dst.bin")
+	os.WriteFile(srcPath, payload, 0o600)
+
+	grant := &api.TransferGrant{
+		ID: "xfer-par", Src: "src", Dst: "dst", Streams: 3,
+		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+		SrcPath: srcPath, DstPath: dstPath,
+	}
+	sign(grant)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := SendFile(ctx, srcPath, grant.Hops[1], clientTLSFor(t, root, "src"), grant); err != nil {
+		t.Fatalf("并行发送失败：%v", err)
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("目的文件未落盘：%v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("内容不一致：源 %d 字节，目的 %d 字节", len(payload), len(got))
+	}
+}
+
 // 源 -> 中继 -> 目的，全程 QUIC，9MB 逐字节一致。
 func TestRelayTransferQUIC(t *testing.T) {
 	root, err := ca.LoadOrCreate(t.TempDir())

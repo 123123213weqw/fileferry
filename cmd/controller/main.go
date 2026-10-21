@@ -302,6 +302,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		SrcPath:   req.SrcPath,
 		DstPath:   req.DstPath,
 		ChunkSize: 4 << 20,
+		Streams:   4, // TODO(M4)：按路径质量与负载动态定
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 	}

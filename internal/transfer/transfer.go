@@ -164,8 +164,42 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 // SendFile 把 path 的内容经 firstHop 发出，grant 头随流首行传递。
 // 直连时 firstHop 就是目的端；有中继时是第一跳中继，后续跳对发送端
 // 透明（ACK 沿管道回流）。
+// grant.Streams > 1 时并行开多条连接（各自独立五元组），交错发送
+// 分块——绕过按流的 UDP 限速、填满带宽延迟积。
 // TODO(M2.5)：限速（grant.RateLimit）、按已完成块续传。
 func SendFile(ctx context.Context, path string, firstHop api.Hop, tlsConf *tls.Config, grant *api.TransferGrant) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	n := grant.Streams
+	if n < 1 {
+		n = 1
+	}
+	errCh := make(chan error, n)
+	var wg sync.WaitGroup
+	for r := 0; r < n; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			errCh <- sendShare(ctx, f, firstHop, tlsConf, grant, r, n)
+		}(r)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
+// 保证各连接进度均衡。完成后发哨兵帧并等 ACK（接收端在全部份额
+// 落盘后才统一回 ACK）。
+func sendShare(ctx context.Context, f *os.File, firstHop api.Hop, tlsConf *tls.Config, grant *api.TransferGrant, r, n int) error {
 	stream, closeConn, err := DialStream(ctx, firstHop.Addr, firstHop.Proto, tlsConf)
 	if err != nil {
 		return fmt.Errorf("dial %s(%s): %w", firstHop.Addr, firstHop.Proto, err)
@@ -180,20 +214,15 @@ func SendFile(ctx context.Context, path string, firstHop api.Hop, tlsConf *tls.C
 		return err
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 	buf := make([]byte, ChunkSize)
-	var idx int64
-	for {
-		n, rerr := io.ReadFull(f, buf)
-		if n > 0 {
-			if err := WriteFrame(stream, idx, buf[:n]); err != nil {
+	var count int64
+	for idx := int64(r); ; idx += int64(n) {
+		nread, rerr := f.ReadAt(buf, idx*ChunkSize)
+		if nread > 0 {
+			if err := WriteFrame(stream, idx, buf[:nread]); err != nil {
 				return err
 			}
-			idx++
+			count++
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
@@ -202,14 +231,14 @@ func SendFile(ctx context.Context, path string, firstHop api.Hop, tlsConf *tls.C
 			return rerr
 		}
 	}
-	// 完成哨兵：零长度帧。QUIC 下直接关连接会丢弃对端未读完的
-	// 流数据，必须等接收端落盘后回 ACK 才能关闭。
-	if err := WriteFrame(stream, idx, []byte{}); err != nil {
+	// 完成哨兵：零长度帧。接收端收齐全部份额的哨兵才落盘改名并回 ACK；
+	// QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
+	if err := WriteFrame(stream, -1, []byte{}); err != nil {
 		return err
 	}
 	ack := make([]byte, 4)
 	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-		s.SetReadDeadline(time.Now().Add(60 * time.Second))
+		s.SetReadDeadline(time.Now().Add(10 * time.Minute))
 	}
 	if _, err := io.ReadFull(stream, ack); err != nil {
 		return fmt.Errorf("等待接收端 ACK 失败：%w", err)
@@ -291,13 +320,124 @@ func HandleStream(stream Stream, selfID string, verify GrantVerifier, tlsConf *t
 	}
 }
 
-// recvStream 接收文件：临时文件 + 原子改名 + 回 ACK。
+// recvStream 接收一个连接份额：帧按块号稀疏写入共享临时文件，
+// 本连接哨兵到齐后等全局完成再回 ACK。
 func recvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant) {
-	if err := recvInto(br, stream, grant.DstPath); err != nil {
-		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
-	} else {
-		fmt.Printf("接收完成：%s（src=%s）-> %s\n", grant.ID, grant.Src, grant.DstPath)
+	g, err := groupFor(grant)
+	if err != nil {
+		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
+		return
 	}
+	feedErr := g.feed(br)
+	var doneCh <-chan struct{}
+	if feedErr == nil {
+		doneCh, err = g.done(grant.ID)
+	}
+	if feedErr != nil || err != nil {
+		fmt.Printf("接收 %s 失败：%v\n", grant.ID, feedErr)
+		return
+	}
+	<-doneCh // 等全部份额落盘、原子改名完成
+	stream.Write([]byte("ACK\n"))
+	fmt.Printf("接收完成：%s（src=%s）-> %s\n", grant.ID, grant.Src, grant.DstPath)
+}
+
+// recvGroup 协调同一 grant 的并行接收：N 条连接交错写同一临时文件，
+// 收齐 N 个哨兵才 sync + 原子改名，然后唤醒所有等待者回 ACK。
+// 块号在帧头里，WriteAt 稀疏落盘天然支持乱序到达。
+// TODO(M4)：失败份额的组回收（当前依赖 grant 过期清理）。
+type recvGroup struct {
+	mu        sync.Mutex
+	finalPath string
+	tmp       *os.File
+	tmpName   string
+	streams   int
+	sentinels int
+	waiters   []chan struct{}
+	finished  bool
+	finErr    error
+}
+
+var (
+	recvMu     sync.Mutex
+	recvGroups = map[string]*recvGroup{}
+)
+
+func groupFor(grant *api.TransferGrant) (*recvGroup, error) {
+	recvMu.Lock()
+	defer recvMu.Unlock()
+	if g, ok := recvGroups[grant.ID]; ok {
+		return g, nil
+	}
+	dir := filepath.Dir(grant.DstPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	tmp, err := os.CreateTemp(dir, ".ff-*")
+	if err != nil {
+		return nil, err
+	}
+	n := grant.Streams
+	if n < 1 {
+		n = 1
+	}
+	g := &recvGroup{finalPath: grant.DstPath, tmp: tmp, tmpName: tmp.Name(), streams: n}
+	recvGroups[grant.ID] = g
+	return g, nil
+}
+
+// feed 消费一条连接的帧流直到哨兵。WriteAt 并发安全（各写各的偏移）。
+func (g *recvGroup) feed(r io.Reader) error {
+	for {
+		idx, data, err := ReadFrame(r)
+		if err == io.EOF {
+			return nil // 对端未发哨兵直接 FIN（旧版本兼容）
+		}
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 { // 本连接份额完成哨兵
+			return nil
+		}
+		if _, err := g.tmp.WriteAt(data, idx*int64(ChunkSize)); err != nil {
+			return err
+		}
+	}
+}
+
+// done 登记本连接哨兵；返回的通道在全部哨兵集齐且改名完成后关闭。
+func (g *recvGroup) done(grantID string) (<-chan struct{}, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ch := make(chan struct{})
+	g.waiters = append(g.waiters, ch)
+	if !g.finished {
+		g.sentinels++
+		if g.sentinels >= g.streams {
+			g.finished = true
+			if err := g.tmp.Sync(); err != nil {
+				g.finErr = err
+			} else if err := g.tmp.Close(); err != nil {
+				g.finErr = err
+			} else if err := os.Rename(g.tmpName, g.finalPath); err != nil {
+				g.finErr = err
+			} else {
+				recvMu.Lock()
+				delete(recvGroups, grantID)
+				recvMu.Unlock()
+			}
+		}
+	}
+	if g.finished {
+		if g.finErr != nil {
+			return nil, g.finErr
+		}
+		for _, w := range g.waiters {
+			close(w)
+		}
+		g.waiters = nil
+	}
+	return ch, nil
 }
 
 // relayStream 中继转发：确认自己在签名路径上，拨下一跳，双向管道。
@@ -347,53 +487,6 @@ func relayStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, self
 	io.Copy(stream, ns) // 反向：下一跳 -> 源（ACK 在这里回流）
 	closeWrite(stream)
 	wg.Wait()
-}
-
-// recvInto 把帧流写入临时文件；收到零长度哨兵帧后原子改名为最终
-// 路径并向发送端回 ACK。
-func recvInto(r io.Reader, w io.Writer, finalPath string) error {
-	dir := filepath.Dir(finalPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".ff-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	finalize := func() error {
-		if err := tmp.Sync(); err != nil {
-			tmp.Close()
-			return err
-		}
-		if err := tmp.Close(); err != nil {
-			return err
-		}
-		return os.Rename(tmp.Name(), finalPath)
-	}
-	for {
-		_, data, err := ReadFrame(r)
-		if err == io.EOF {
-			return finalize() // 对端未发哨兵直接 FIN（旧版本兼容）
-		}
-		if err != nil {
-			tmp.Close()
-			return err
-		}
-		if len(data) == 0 { // 完成哨兵
-			if err := finalize(); err != nil {
-				return err
-			}
-			if _, err := w.Write([]byte("ACK\n")); err != nil {
-				return err
-			}
-			return nil
-		}
-		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
-			return err
-		}
-	}
 }
 
 // Probe 探测一个数据面地址：先 QUIC（UDP），失败回退 TCP（约定端口

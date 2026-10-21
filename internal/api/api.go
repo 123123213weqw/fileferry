@@ -112,6 +112,7 @@ type TransferGrant struct {
 	DstPath    string    `json:"dst_path"`
 	FileSHA256 string    `json:"file_sha256"`
 	ChunkSize  int       `json:"chunk_size"`
+	Streams    int       `json:"streams"` // 并行连接数：绕 per-flow 限速、填满带宽延迟积
 	RateLimit  int64     `json:"rate_limit_bps"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
