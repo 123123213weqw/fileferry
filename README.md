@@ -13,7 +13,11 @@
 - **ffctl**（任意已入网机器）：`send` / `status`。
 
 信任模型：根私钥只在 controller；agent 之间无任何共享密钥；每次
-传输由 controller 签发短时效 grant（ed25519），节点本地验签。
+传输由 controller 签发短时效 grant（ed25519），节点本地验签。**角色
+权限**：证书分 admin / node 两级——admin（操作者，controller 首次
+启动生成 `admin.crt/admin.key`，请拷走保管）才能发起传输与查看
+状态；node 只能心跳与执行任务；接收端只接受 controller 签名且发给
+自己的 grant，落盘路径由此决定，陌生节点无法投递文件。
 
 路由模型：可达性是**有向图**——每跳只需起点主动连得到终点；
 边权 = rtt × (1 + 中继负载/100)，负载超 80% 的节点不做中继；
@@ -51,12 +55,15 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 
 ## 里程碑
 
-- [ ] M1 信任与观测：CA/enrollment/心跳落地，/proc 指标采集，
-      status 展示，证书自动续期，SQLite 任务表
-- [ ] M2 直连传输：grant 通知与验签、限速、原子落盘、断点续传
-- [ ] M3 复杂网络：探测循环、TCP 回退、中继链数据面、换链续传
-- [ ] M4 精准负载：边权调优、每任务限速、磁盘水位参与调度
-- [ ] M5 收尾：ffctl 管理令牌、systemd 单元、部署打包
+- [x] M0 骨架：仓库 / 构建 / 单测 / 冒烟管道
+- [ ] M1 信任与观测（进行中）：✅ CA/enrollment/心跳 ✅ status 展示
+      ✅ 探测回填可达边 ⬜ /proc 指标采集 ⬜ 证书自动续期 ⬜ SQLite 持久化
+- [ ] M2 直连传输（基础可用）：✅ grant 签发与两端验签 ✅ 分块传输
+      + 逐块校验 + 原子落盘 ✅ 完成回报 ⬜ 限速 ⬜ 断点续传接线
+- [ ] M3 复杂网络：⬜ TCP 回退 ⬜ 中继链数据面 ⬜ 断链换路续传
+- [ ] M4 精准负载：⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
+- [ ] M5 收尾：⬜ ffctl 管理令牌 ⬜ systemd 单元 ⬜ 部署打包
+      ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
 
 ## 协议
 

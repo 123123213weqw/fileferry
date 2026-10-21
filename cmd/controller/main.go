@@ -1,16 +1,21 @@
 // ff-controller：控制面单实例。职责：CA 与一次性 enrollment、
-// 心跳汇聚进拓扑图、为按需传输选链并签发授权（grant）、任务记录
-// 落 SQLite。跑在一台能同时够到内外网的机器上即可。
+// 心跳汇聚进拓扑图、为按需传输选链并签发授权（grant）、任务下发、
+// 任务记录落 SQLite。权限模型：admin 角色（操作者本人）才能发起
+// 传输与查看状态；node 角色只能心跳与执行。跑在一台能同时够到
+// 内外网的机器上，且只有操作者可登录。
 package main
 
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -31,16 +36,17 @@ type Config struct {
 }
 
 type controller struct {
-	cfg    Config
-	ca     *ca.CA
-	signer ed25519.PrivateKey
-	verify ed25519.PublicKey
-	graph  *topology.Graph
-	db     *sql.DB
+	cfg     Config
+	ca      *ca.CA
+	signer  ed25519.PrivateKey
+	signPub ed25519.PublicKey
+	graph   *topology.Graph
+	db      *sql.DB
 
-	mu     sync.Mutex
-	tokens map[string]bool // 已核销的一次性令牌
-	nextID int64
+	mu      sync.Mutex
+	tokens  map[string]bool                // 已核销的一次性令牌
+	pending map[api.NodeID][]api.TransferGrant // 源节点待执行任务
+	nextID  int64
 }
 
 func main() {
@@ -61,7 +67,7 @@ func main() {
 	}
 
 	// 传输授权签名密钥（grant 的签发/验签，全系统唯一非证书密钥材料）
-	signer, verify, err := loadOrCreateSignKeys(cfg.DataDir)
+	signer, signPub, err := loadOrCreateSignKeys(cfg.DataDir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -73,26 +79,42 @@ func main() {
 	// TODO(M1)：任务表 schema 与持久化
 
 	c := &controller{
-		cfg:    cfg,
-		ca:     rootCA,
-		signer: signer,
-		verify: verify,
-		graph:  topology.New(),
-		db:     db,
-		tokens: map[string]bool{},
+		cfg:     cfg,
+		ca:      rootCA,
+		signer:  signer,
+		signPub: signPub,
+		graph:   topology.New(),
+		db:      db,
+		tokens:  map[string]bool{},
+		pending: map[api.NodeID][]api.TransferGrant{},
+	}
+
+	// 管理员证书：仅首次启动生成到 data-dir。拷到你自己的机器保管
+	// 后，建议从服务器上删除——持有它的人就是操作者。
+	adminCrt, adminKey := cfg.DataDir+"/admin.crt", cfg.DataDir+"/admin.key"
+	if _, err := os.Stat(adminCrt); err != nil {
+		certPEM, keyPEM, _, err := rootCA.Issue("admin", false, ca.RoleAdmin)
+		if err != nil {
+			log.Fatal("生成管理员证书失败：", err)
+		}
+		os.WriteFile(adminCrt, certPEM, 0o600)
+		os.WriteFile(adminKey, keyPEM, 0o600)
+		log.Printf("已生成管理员证书：%s 与 %s（拷走保管，勿留在服务器）", adminCrt, adminKey)
+	}
+
+	host, _ := os.Hostname()
+	_, _, cert, err := rootCA.Issue("controller", true, "controller", "127.0.0.1", "localhost", host)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/enroll", c.handleEnroll)
 	mux.HandleFunc("POST /v1/heartbeat", c.handleHeartbeat)
 	mux.HandleFunc("POST /v1/transfer", c.handleTransfer)
+	mux.HandleFunc("POST /v1/jobdone", c.handleJobDone)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
 
-	host, _ := os.Hostname()
-	_, _, cert, err := rootCA.Issue("controller", true, "127.0.0.1", "localhost", host)
-	if err != nil {
-		log.Fatal(err)
-	}
 	srv := &http.Server{
 		Addr:      cfg.Listen,
 		Handler:   mux,
@@ -120,8 +142,36 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// handleEnroll：一次性 token 换节点证书。核销即废，无证书也可访问
-// （ServerTLS 用 VerifyClientCertIfGiven 放行本路径）。
+// clientRole 从 mTLS 客户端证书取角色（OU 字段）。
+func clientRole(r *http.Request) string {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return ""
+	}
+	ous := r.TLS.PeerCertificates[0].Subject.OrganizationalUnit
+	if len(ous) == 0 {
+		return ""
+	}
+	return ous[0]
+}
+
+func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
+	if clientRole(r) != role {
+		http.Error(w, fmt.Sprintf("requires %s role", role), http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func signPubPEM(pub ed25519.PublicKey) string {
+	b, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return ""
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: b}))
+}
+
+// handleEnroll：一次性 token 换节点证书（角色固定为 node）。
+// 核销即废，无证书也可访问（ServerTLS 用 VerifyClientCertIfGiven 放行）。
 func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req api.EnrollRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -143,20 +193,27 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or used token", http.StatusUnauthorized)
 		return
 	}
-	certPEM, keyPEM, _, err := c.ca.Issue(nodeID, true, req.Hostname) // agent 同时做数据面服务端；生产环境 SAN 在 M2 按心跳上报地址补签
+	// 证书 SAN：enrollment 报上来的数据面 IP + 主机名
+	sans := []string{req.Hostname}
+	if host, _, err := net.SplitHostPort(req.Addr); err == nil && net.ParseIP(host) != nil {
+		sans = append(sans, host)
+	}
+	certPEM, keyPEM, _, err := c.ca.Issue(nodeID, true, ca.RoleNode, sans...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(api.EnrollResponse{
-		NodeID:  nodeID,
-		CertPEM: string(certPEM),
-		KeyPEM:  string(keyPEM),
-		RootPEM: string(c.ca.RootPEM()),
+		NodeID:     nodeID,
+		CertPEM:    string(certPEM),
+		KeyPEM:     string(keyPEM),
+		RootPEM:    string(c.ca.RootPEM()),
+		SignPubPEM: signPubPEM(c.signPub),
 	})
 }
 
-// handleHeartbeat：要求 mTLS；节点身份以证书 CN 为准，不可谎报。
+// handleHeartbeat：要求 node 证书；节点身份以证书 CN 为准，不可谎报。
+// 响应携带该节点的待执行任务与全网在线节点表。
 func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if len(r.TLS.PeerCertificates) == 0 {
 		http.Error(w, "client cert required", http.StatusUnauthorized)
@@ -172,13 +229,16 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.graph.Apply(hb)
-	w.WriteHeader(http.StatusOK)
+	c.mu.Lock()
+	jobs := c.pending[hb.NodeID]
+	delete(c.pending, hb.NodeID)
+	c.mu.Unlock()
+	json.NewEncoder(w).Encode(api.HeartbeatResponse{Jobs: jobs, Peers: c.graph.Peers()})
 }
 
-// handleTransfer：选链 + 签发 grant。TODO(M2)：通知源/目的/中继节点。
+// handleTransfer：仅 admin。选链 + 签发 grant 并投递到源节点任务队列。
 func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
+	if !requireRole(w, r, ca.RoleAdmin) {
 		return
 	}
 	var req api.TransferRequest
@@ -191,29 +251,64 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
 		return
 	}
+	if len(path) > 2 {
+		// TODO(M3)：中继链数据面
+		http.Error(w, "relay path not supported yet (M3), direct only", http.StatusNotImplemented)
+		return
+	}
+	dstAddr := c.graph.Addr(req.Dst)
+	if dstAddr == "" {
+		http.Error(w, "dst offline", http.StatusUnprocessableEntity)
+		return
+	}
 	c.mu.Lock()
 	c.nextID++
 	id := c.nextID
 	c.mu.Unlock()
-	grant := &api.TransferGrant{
-		ID:         fmt.Sprintf("xfer-%d", id),
-		Src:        req.Src,
-		Dst:        req.Dst,
-		Relays:     path[1 : len(path)-1],
-		SrcPath:    req.SrcPath,
-		DstPath:    req.DstPath,
-		ChunkSize:  4 << 20,
-		RateLimit:  req.RateLimit,
-		ExpiresAt:  time.Now().Add(30 * time.Minute),
+	grant := api.TransferGrant{
+		ID:        fmt.Sprintf("xfer-%d", id),
+		Src:       req.Src,
+		Dst:       req.Dst,
+		DstAddr:   dstAddr,
+		SrcPath:   req.SrcPath,
+		DstPath:   req.DstPath,
+		ChunkSize: 4 << 20,
+		RateLimit: req.RateLimit,
+		ExpiresAt: time.Now().Add(30 * time.Minute),
 	}
 	grant.Sign(c.signer)
+	c.mu.Lock()
+	c.pending[req.Src] = append(c.pending[req.Src], grant) // 投递到源节点队列，随下次心跳下发
+	c.mu.Unlock()
 	json.NewEncoder(w).Encode(grant)
 }
 
-// handleStatus：全图快照，ffctl status 用。
-func (c *controller) handleStatus(w http.ResponseWriter, r *http.Request) {
+// handleJobDone：agent 回报任务结果，node 角色。
+func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 	if len(r.TLS.PeerCertificates) == 0 {
 		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	var req api.DoneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if cn := r.TLS.PeerCertificates[0].Subject.CommonName; cn != req.NodeID {
+		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
+		return
+	}
+	if req.OK {
+		log.Printf("任务 %s 完成（%s）", req.GrantID, req.NodeID)
+	} else {
+		log.Printf("任务 %s 失败（%s）：%s", req.GrantID, req.NodeID, req.Err)
+	}
+	// TODO(M1)：结果落 SQLite
+}
+
+// handleStatus：仅 admin，返回全图快照。
+func (c *controller) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
 		return
 	}
 	json.NewEncoder(w).Encode(c.graph.Snapshot())

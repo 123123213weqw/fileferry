@@ -75,12 +75,22 @@ func main() {
 		if len(grant.Relays) > 0 {
 			fmt.Printf("（经 %s 中继）", strings.Join(grant.Relays, " -> "))
 		}
-		fmt.Println()
+		fmt.Println("；任务已入队，源节点下次心跳（≤5s）后开始执行")
 		// TODO(M2)：等待传输完成与状态查询
 	case "status":
-		// TODO(M1)：GET /v1/status 展示全图
-		fmt.Fprintln(os.Stderr, "status 展示在 M1 落地")
-		os.Exit(1)
+		hbs, err := cl.Status()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "状态查询失败：", err)
+			os.Exit(1)
+		}
+		for _, h := range hbs {
+			edges := make([]string, 0, len(h.Edges))
+			for _, e := range h.Edges {
+				edges = append(edges, fmt.Sprintf("%s/%.1fms/%s", e.To, e.RTTms, e.Proto))
+			}
+			fmt.Printf("%-8s %-20s cpu=%3.0f%% mem=%3.0f%% 负载传输=%d 出边=[%s]\n",
+				h.NodeID, h.Hostname, h.CPUPct, h.MemPct, h.ActiveXfers, strings.Join(edges, " "))
+		}
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -88,7 +98,13 @@ func main() {
 }
 
 func newClient(controller, certDir string) (*api.Client, error) {
-	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, "node.crt"), filepath.Join(certDir, "node.key"))
+	// 优先使用管理员证书（admin.crt，由 controller 首次启动生成）；
+	// 否则退回节点证书（node 角色无法发起传输，仅用于诊断连通性）。
+	crt, key := filepath.Join(certDir, "node.crt"), filepath.Join(certDir, "node.key")
+	if _, err := os.Stat(filepath.Join(certDir, "admin.crt")); err == nil {
+		crt, key = filepath.Join(certDir, "admin.crt"), filepath.Join(certDir, "admin.key")
+	}
+	cert, err := tls.LoadX509KeyPair(crt, key)
 	if err != nil {
 		return nil, err
 	}

@@ -1,8 +1,12 @@
 // ff-agent：每台服务器一个。职责：enrollment（首次）、心跳上报
-// （负载 + 可达性）、数据面监听与传输执行。
+// （负载 + 可达性边）、对端探测、数据面监听与传输执行。
+// agent 只保持对 controller 的出站连接，任务与节点列表都由心跳
+// 响应捎带——天然穿越 NAT，无需任何入站端口（数据面监听除外）。
 package main
 
 import (
+	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -14,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,11 +37,19 @@ type Config struct {
 }
 
 var (
-	cfg   Config
+	cfg       Config
 	nodeID    string
+	hostname  string
 	tlsConf   *tls.Config
 	hbClient  *api.Client
-	hostname  string
+	signPub   ed25519.PublicKey // grant 验签公钥
+
+	mu      sync.Mutex
+	peers   []api.PeerInfo   // 最近一次心跳响应下发的在线节点
+	edges   []api.EdgeReport // 最近一轮探测的可达边
+	running map[string]bool  // 去重：正在执行的 grant ID
+
+	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
 )
 
 func main() {
@@ -58,7 +71,7 @@ func run(cfgPath string) error {
 		return err
 	}
 
-	// 1. 证书：本地没有就先 enrollment
+	// 1. 证书：本地没有就先 enrollment，同时取得 grant 验签公钥
 	cert, rootPool, err := loadOrCreateCert()
 	if err != nil {
 		return err
@@ -68,11 +81,16 @@ func run(cfgPath string) error {
 		RootCAs:      rootPool,
 		MinVersion:   tls.VersionTLS13,
 	}
+	if err := loadSignPub(); err != nil {
+		return err
+	}
 	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}}
+	running = map[string]bool{}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
 
-	// 2. 心跳循环（负载指标 M1 补 /proc 采集；可达性边 M3 探测产出）
+	// 2. 心跳 + 探测循环
 	go heartbeatLoop()
+	go probeLoop()
 
 	// 3. 数据面：QUIC 监听（TCP 回退 M3）
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", cfg.DataPort))
@@ -92,7 +110,7 @@ func run(cfgPath string) error {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	errCh := make(chan error, 1)
-	go func() { errCh <- transfer.Serve(ln, cfg.DataDir) }()
+	go func() { errCh <- transfer.Serve(ln, nodeID, verifyGrant) }()
 	select {
 	case err := <-errCh:
 		return err
@@ -146,7 +164,11 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 	cl := &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
 	}}}
-	resp, err := cl.Enroll(api.EnrollRequest{Token: cfg.EnrollToken, Hostname: hostname})
+	resp, err := cl.Enroll(api.EnrollRequest{
+		Token:    cfg.EnrollToken,
+		Hostname: hostname,
+		Addr:     fmt.Sprintf("%s:%d", localIP(), cfg.DataPort),
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("enroll: %w", err)
 	}
@@ -158,6 +180,9 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 		return nil, nil, err
 	}
 	if err := os.WriteFile(filepath.Join(cfg.DataDir, "ca.crt"), []byte(resp.RootPEM), 0o644); err != nil {
+		return nil, nil, err
+	}
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "sign.pub"), []byte(resp.SignPubPEM), 0o644); err != nil {
 		return nil, nil, err
 	}
 	cert, err := tls.X509KeyPair([]byte(resp.CertPEM), []byte(resp.KeyPEM))
@@ -184,22 +209,177 @@ func loadRootPool() (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// loadSignPub 载入 controller 的 grant 签名公钥（enrollment 时取得）。
+func loadSignPub() error {
+	b, err := os.ReadFile(filepath.Join(cfg.DataDir, "sign.pub"))
+	if err != nil {
+		return fmt.Errorf("读取 sign.pub：%w（删掉 data-dir 重新入网可修复）", err)
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return fmt.Errorf("sign.pub 不是合法 PEM")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return err
+	}
+	p, ok := pub.(ed25519.PublicKey)
+	if !ok {
+		return fmt.Errorf("sign.pub 不是 ed25519 公钥")
+	}
+	signPub = p
+	return nil
+}
+
+// verifyGrant 在数据面本地验签：签名有效、发给我、未过期。
+func verifyGrant(g *api.TransferGrant) bool {
+	return g.Verify(signPub) && g.Dst == nodeID && time.Now().Before(g.ExpiresAt)
+}
+
 func heartbeatLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for range t.C {
-		ip := localIP()
+		mu.Lock()
 		hb := api.Heartbeat{
 			NodeID:   nodeID,
 			Hostname: hostname,
-			Addr:     fmt.Sprintf("%s:%d", ip, cfg.DataPort),
+			Addr:     fmt.Sprintf("%s:%d", localIP(), cfg.DataPort),
+			Edges:    edges,
 			TS:       time.Now(),
 			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
-			// TODO(M3)：探测结果填充 Edges
 		}
-		if err := hbClient.Heartbeat(hb); err != nil {
+		mu.Unlock()
+		resp, err := hbClient.Heartbeat(hb)
+		if err != nil {
 			log.Println("心跳失败：", err)
+			continue
 		}
+		mu.Lock()
+		changed := !samePeerSet(peers, resp.Peers)
+		peers = resp.Peers
+		mu.Unlock()
+		if changed {
+			select { // 非阻塞触发：节点表变了，马上探测
+			case probeNow <- struct{}{}:
+			default:
+			}
+		}
+		for i := range resp.Jobs {
+			go runJob(resp.Jobs[i])
+		}
+	}
+}
+
+// samePeerSet 判断两份节点表是否含相同 ID 集合。
+func samePeerSet(a, b []api.PeerInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[api.NodeID]bool, len(a))
+	for _, p := range a {
+		set[p.ID] = true
+	}
+	for _, p := range b {
+		if !set[p.ID] {
+			return false
+		}
+	}
+	return true
+}
+
+// runJob 执行一次传输：源端验签 -> QUIC 发送 -> 回报结果。
+func runJob(g api.TransferGrant) {
+	mu.Lock()
+	if running[g.ID] {
+		mu.Unlock()
+		return
+	}
+	running[g.ID] = true
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		delete(running, g.ID)
+		mu.Unlock()
+	}()
+
+	done := func(ok bool, errStr string) {
+		if err := hbClient.JobDone(api.DoneRequest{GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr}); err != nil {
+			log.Println("回报失败：", err)
+		}
+	}
+
+	if !g.Verify(signPub) || g.Src != nodeID {
+		done(false, "grant 验签失败")
+		return
+	}
+	if time.Now().After(g.ExpiresAt) {
+		done(false, "grant 已过期")
+		return
+	}
+	timeout := time.Until(g.ExpiresAt)
+	if timeout > 30*time.Minute {
+		timeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	start := time.Now()
+	if err := transfer.SendFile(ctx, g.SrcPath, g.DstAddr, tlsConf, &g); err != nil {
+		done(false, err.Error())
+		log.Printf("任务 %s 失败：%v", g.ID, err)
+		return
+	}
+	done(true, "")
+	log.Printf("任务 %s 完成：%s -> %s:%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, g.DstAddr, time.Since(start).Round(time.Millisecond))
+}
+
+// probeLoop 探测所有在线对端，成功边回填到心跳。触发时机：节点表
+// 变化（立即）或每 30 秒兜底一轮。探测并行执行，单轮预算约 2 秒。
+// TODO(M3)：UDP 失败时 TCP 回退探测；失败对端指数退避。
+func probeLoop() {
+	runRound := func() {
+		mu.Lock()
+		targets := make([]api.PeerInfo, 0, len(peers))
+		for _, p := range peers {
+			if p.ID != nodeID {
+				targets = append(targets, p)
+			}
+		}
+		mu.Unlock()
+		var (
+			wg      sync.WaitGroup
+			muEdges sync.Mutex
+			found   []api.EdgeReport
+		)
+		for _, p := range targets {
+			wg.Add(1)
+			go func(p api.PeerInfo) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				rtt, err := transfer.Probe(ctx, p.Addr, tlsConf)
+				if err != nil {
+					log.Printf("探测 %s(%s) 失败：%v", p.ID, p.Addr, err)
+					return
+				}
+				muEdges.Lock()
+				found = append(found, api.EdgeReport{To: p.ID, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: "quic"})
+				muEdges.Unlock()
+			}(p)
+		}
+		wg.Wait()
+		mu.Lock()
+		edges = found
+		mu.Unlock()
+	}
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+		case <-probeNow:
+		}
+		runRound()
 	}
 }
 

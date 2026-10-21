@@ -43,17 +43,42 @@ type Heartbeat struct {
 // LoadPct 汇总负载水位，供拓扑调度作边权。
 func (h Heartbeat) LoadPct() float64 { return (h.CPUPct + h.MemPct) / 2 }
 
+// PeerInfo 是心跳响应里下发的在线节点信息，供 agent 互相探测。
+type PeerInfo struct {
+	ID   NodeID `json:"id"`
+	Addr string `json:"addr"` // 数据面地址 host:port（QUIC）
+}
+
+// HeartbeatResponse 是心跳的响应：下发给该节点的待执行任务与
+// 全网在线节点列表（agent 只需出站连接 controller，天然过 NAT）。
+type HeartbeatResponse struct {
+	Jobs   []TransferGrant `json:"jobs"`
+	Peers  []PeerInfo      `json:"peers"`
+}
+
 // EnrollRequest / EnrollResponse：一次性 token 换取本节点证书与根证书。
+// Addr 是本机数据面地址（host:port），其 IP 会被写进证书 SAN——
+// 对端按 IP 拨号时 TLS 校验依赖它。
 type EnrollRequest struct {
 	Token    string `json:"token"`
 	Hostname string `json:"hostname"`
+	Addr     string `json:"addr"`
 }
 
 type EnrollResponse struct {
-	NodeID  string `json:"node_id"`
-	CertPEM string `json:"cert_pem"`
-	KeyPEM  string `json:"key_pem"`
-	RootPEM string `json:"root_pem"`
+	NodeID     string `json:"node_id"`
+	CertPEM    string `json:"cert_pem"`
+	KeyPEM     string `json:"key_pem"`
+	RootPEM    string `json:"root_pem"`
+	SignPubPEM string `json:"sign_pub_pem"` // grant 验签公钥
+}
+
+// DoneRequest 是 agent 回报任务执行结果。
+type DoneRequest struct {
+	GrantID string `json:"grant_id"`
+	NodeID  NodeID `json:"node_id"`
+	OK      bool   `json:"ok"`
+	Err     string `json:"err,omitempty"`
 }
 
 // TransferRequest 是 ffctl 发起的按需传输请求。
@@ -72,6 +97,7 @@ type TransferGrant struct {
 	ID         string    `json:"id"`
 	Src        NodeID    `json:"src"`
 	Dst        NodeID    `json:"dst"`
+	DstAddr    string    `json:"dst_addr"` // 目的端数据面地址（直连场景；中继链地址 M3 补）
 	Relays     []NodeID  `json:"relays"`
 	SrcPath    string    `json:"src_path"`
 	DstPath    string    `json:"dst_path"`
@@ -136,9 +162,42 @@ func (c *Client) Enroll(req EnrollRequest) (*EnrollResponse, error) {
 	return &resp, nil
 }
 
-func (c *Client) Heartbeat(h Heartbeat) error {
+func (c *Client) Heartbeat(h Heartbeat) (*HeartbeatResponse, error) {
+	var resp HeartbeatResponse
+	if err := c.post("/v1/heartbeat", h, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) JobDone(req DoneRequest) error {
 	var ignored struct{}
-	return c.post("/v1/heartbeat", h, &ignored)
+	return c.post("/v1/jobdone", req, &ignored)
+}
+
+func (c *Client) Get(path string, resp any) error {
+	r, err := c.HC.Get(c.Base + path)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	if r.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: %s", r.Status, string(body))
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	return json.Unmarshal(body, resp)
+}
+
+// Status 拉取全图快照（admin）。
+func (c *Client) Status() ([]Heartbeat, error) {
+	var out []Heartbeat
+	if err := c.Get("/v1/status", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *Client) Send(req TransferRequest) (*TransferGrant, error) {

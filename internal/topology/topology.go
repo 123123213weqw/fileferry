@@ -67,6 +67,30 @@ func (g *Graph) Snapshot() []api.Heartbeat {
 	return out
 }
 
+// Peers 返回在线节点的 id 与数据面地址，随心跳响应下发，供互相探测。
+func (g *Graph) Peers() []api.PeerInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var out []api.PeerInfo
+	for id, n := range g.nodes {
+		if g.now().Sub(n.seen) < HeartbeatTimeout {
+			out = append(out, api.PeerInfo{ID: id, Addr: n.hb.Addr})
+		}
+	}
+	return out
+}
+
+// Addr 返回在线节点的数据面地址，离线返回空串。
+func (g *Graph) Addr(id api.NodeID) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n, ok := g.nodes[id]
+	if !ok || g.now().Sub(n.seen) >= HeartbeatTimeout {
+		return ""
+	}
+	return n.hb.Addr
+}
+
 type edge struct {
 	to    api.NodeID
 	rttMs float64

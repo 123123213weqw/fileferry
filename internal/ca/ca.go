@@ -116,12 +116,19 @@ func pemEncode(typ string, b []byte) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: b})
 }
 
+// 证书角色：写在 OU 字段里，controller 据此做权限判定。
+// admin = 操作者本人（发起传输、看状态）；node = 普通节点（心跳 + 干活）。
+const (
+	RoleAdmin = "admin"
+	RoleNode  = "node"
+)
+
 // Issue 为 nodeID 签发一张新证书。server=true 时附带 ServerAuth
-// 用途（controller 和数据面监听需要）；sans 填入对端拨号时使用的
-// 地址/主机名（IP 进 IPAddresses，其余进 DNSNames），否则 TLS
-// 校验会因缺 SAN 失败。返回 PEM 供 enrollment 响应下发，
-// tls.Certificate 供本进程直接使用。
-func (c *CA) Issue(nodeID string, server bool, sans ...string) (certPEM, keyPEM []byte, cert tls.Certificate, err error) {
+// 用途（controller 和数据面监听需要）；role 填 RoleAdmin 或 RoleNode；
+// sans 填入对端拨号时使用的地址/主机名（IP 进 IPAddresses，其余进
+// DNSNames），否则 TLS 校验会因缺 SAN 失败。返回 PEM 供 enrollment
+// 响应下发，tls.Certificate 供本进程直接使用。
+func (c *CA) Issue(nodeID string, server bool, role string, sans ...string) (certPEM, keyPEM []byte, cert tls.Certificate, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.serial++
@@ -134,12 +141,12 @@ func (c *CA) Issue(nodeID string, server bool, sans ...string) (certPEM, keyPEM 
 		eku = append(eku, x509.ExtKeyUsageServerAuth)
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(c.serial + 1),
-		Subject:      pkix.Name{CommonName: nodeID, Organization: []string{"fileferry"}},
-		NotBefore:    time.Now().Add(-5 * time.Minute),
-		NotAfter:     time.Now().Add(CertTTL),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  eku,
+		SerialNumber:          big.NewInt(c.serial + 1),
+		Subject:               pkix.Name{CommonName: nodeID, Organization: []string{"fileferry"}, OrganizationalUnit: []string{role}},
+		NotBefore:             time.Now().Add(-5 * time.Minute),
+		NotAfter:              time.Now().Add(CertTTL),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           eku,
 	}
 	for _, s := range sans {
 		if ip := net.ParseIP(s); ip != nil {
