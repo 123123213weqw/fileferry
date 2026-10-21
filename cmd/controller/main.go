@@ -53,6 +53,7 @@ type controller struct {
 	punchTried   map[[2]api.NodeID]time.Time
 	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
 	ledger       *enrollLedger                        // 持久化核销台账
+	limiter      *rateLimiter
 }
 
 type pubEntry struct {
@@ -87,7 +88,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// TODO(M1)：任务表 schema 与持久化
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS events(ts INTEGER, kind TEXT, node TEXT, detail TEXT)`,
+		`CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, src TEXT, dst TEXT, mode TEXT, status TEXT, grant_json TEXT, created INTEGER, updated INTEGER)`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			log.Fatal("初始化数据库失败：", err)
+		}
+	}
 
 	c := &controller{
 		cfg:          cfg,
@@ -98,9 +106,15 @@ func main() {
 		db:           db,
 		pending:      map[api.NodeID][]api.TransferGrant{},
 		ledger:       loadEnrollLedger(cfg.DataDir),
+		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
+	}
+
+	// 重启恢复未完成任务（任务与审计持久化于 SQLite）
+	if n := c.rehydrate(); n > 0 {
+		log.Printf("恢复未完成任务 %d 条", n)
 	}
 
 	// M6 打洞回声口：UDP 端口 = 控制端口 + 1。agent 从数据面 socket
@@ -174,6 +188,7 @@ func main() {
 	mux.HandleFunc("POST /v1/heartbeat", c.handleHeartbeat)
 	mux.HandleFunc("POST /v1/transfer", c.handleTransfer)
 	mux.HandleFunc("POST /v1/jobdone", c.handleJobDone)
+	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
 
 	srv := &http.Server{
@@ -183,6 +198,115 @@ func main() {
 	}
 	log.Printf("controller 监听 %s（数据目录 %s）", cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
+}
+
+// rehydrate 从 SQLite 恢复未完成任务到内存队列。
+func (c *controller) rehydrate() int {
+	rows, err := c.db.Query(`SELECT grant_json FROM jobs WHERE status='queued'`)
+	if err != nil {
+		log.Println("任务恢复查询失败：", err)
+		return 0
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var gj string
+		if rows.Scan(&gj) != nil {
+			continue
+		}
+		var g api.TransferGrant
+		if json.Unmarshal([]byte(gj), &g) == nil && g.Src != "" {
+			c.mu.Lock()
+			c.pending[g.Src] = append(c.pending[g.Src], g)
+			c.mu.Unlock()
+			n++
+		}
+	}
+	return n
+}
+
+// event 记录安全/审计事件（落 SQLite + 日志）。
+func (c *controller) event(kind, node, detail string) {
+	log.Printf("[audit] %s %s %s", kind, node, detail)
+	go c.db.Exec(`INSERT INTO events(ts,kind,node,detail) VALUES(?,?,?,?)`,
+		time.Now().Unix(), kind, node, detail)
+}
+
+// jobPersist 任务落库与状态更新。
+func (c *controller) jobPersist(g *api.TransferGrant) {
+	gj, _ := json.Marshal(g)
+	go c.db.Exec(`INSERT OR REPLACE INTO jobs(id,src,dst,mode,status,grant_json,created,updated) VALUES(?,?,?,?,?,?,?,?)`,
+		g.ID, g.Src, g.Dst, g.Mode, "queued", string(gj), time.Now().Unix(), time.Now().Unix())
+}
+
+func (c *controller) jobUpdate(id, status string) {
+	go c.db.Exec(`UPDATE jobs SET status=?, updated=? WHERE id=?`, status, time.Now().Unix(), id)
+}
+
+// rateLimiter 每身份滑动窗口限速（防合法证书节点刷爆 controller）。
+type rateLimiter struct {
+	mu   sync.Mutex
+	seen map[string][]time.Time
+}
+
+func (l *rateLimiter) allow(key string, perSec int) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	list := l.seen[key]
+	kept := list[:0]
+	for _, t := range list {
+		if now.Sub(t) < time.Second {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= perSec {
+		l.seen[key] = kept
+		return false
+	}
+	l.seen[key] = append(kept, now)
+	return true
+}
+
+// handleRenew：节点证书临期续期。身份由现有 mTLS 证书证明，
+// 新证书沿用同一 nodeID 与 node 角色。
+func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
+	if len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	cert := r.TLS.PeerCertificates[0]
+	role := ""
+	if ous := cert.Subject.OrganizationalUnit; len(ous) > 0 {
+		role = ous[0]
+	}
+	if role != ca.RoleNode {
+		http.Error(w, "node role only", http.StatusForbidden)
+		return
+	}
+	nodeID := cert.Subject.CommonName
+	if !c.limiter.allow("renew:"+nodeID, 1) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	// SAN 沿用该节点最近心跳上报的地址与主机名
+	sans := []string{nodeID}
+	for _, hb := range c.graph.Snapshot() {
+		if hb.NodeID == api.NodeID(nodeID) {
+			sans = append(sans, hb.Hostname)
+			if host, _, err := net.SplitHostPort(hb.Addr); err == nil && net.ParseIP(host) != nil {
+				sans = append(sans, host)
+			}
+			break
+		}
+	}
+	certPEM, keyPEM, _, err := c.ca.Issue(nodeID, true, ca.RoleNode, sans...)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	c.event("renew", nodeID, "")
+	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
 }
 
 func loadConfig(path string) (Config, error) {
@@ -264,6 +388,10 @@ func (l *enrollLedger) save(dir string) {
 // 核销即废且**跨重启持久**；节点编号单调递增，绝不复用。
 // 无证书也可访问（ServerTLS 用 VerifyClientCertIfGiven 放行）。
 func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
+	if !c.limiter.allow("enroll:"+r.RemoteAddr, 2) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	var req api.EnrollRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -297,6 +425,7 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	c.event("enroll", nodeID, r.RemoteAddr)
 	json.NewEncoder(w).Encode(api.EnrollResponse{
 		NodeID:     nodeID,
 		CertPEM:    string(certPEM),
@@ -311,6 +440,10 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if len(r.TLS.PeerCertificates) == 0 {
 		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	if !c.limiter.allow("hb:"+r.TLS.PeerCertificates[0].Subject.CommonName, 10) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	var hb api.Heartbeat
@@ -401,6 +534,7 @@ func (c *controller) pickPunches(hb *api.Heartbeat) []api.PunchDirective {
 // handleTransfer：仅 admin。选链 + 签发 grant 并投递到源节点任务队列。
 func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, ca.RoleAdmin) {
+		c.event("forbidden", clientRole(r), "transfer")
 		return
 	}
 	var req api.TransferRequest
@@ -457,6 +591,8 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.pending[req.Src] = append(c.pending[req.Src], grant) // 投递到源节点队列，随下次心跳下发
 	c.mu.Unlock()
+	c.jobPersist(&grant)
+	c.event("transfer", req.Src, req.Src+" -> "+req.Dst)
 	json.NewEncoder(w).Encode(grant)
 }
 
@@ -477,8 +613,11 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.OK {
 		log.Printf("任务 %s 完成（%s）", req.GrantID, req.NodeID)
+		c.jobUpdate(req.GrantID, "done")
 	} else {
 		log.Printf("任务 %s 失败（%s）：%s", req.GrantID, req.NodeID, req.Err)
+		c.jobUpdate(req.GrantID, "failed")
+		c.event("job-fail", string(req.NodeID), req.GrantID+": "+req.Err)
 	}
 	// TODO(M1)：结果落 SQLite
 }
@@ -555,6 +694,7 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 	c.pending[req.Dst] = append(c.pending[req.Dst], grant) // 目的端：出站接入交换台
 	c.mu.Unlock()
 	log.Printf("交换台模式：%s -> %s 经 %s 对接", req.Src, req.Dst, best)
+	c.jobPersist(&grant)
 	json.NewEncoder(w).Encode(grant)
 	return true
 }

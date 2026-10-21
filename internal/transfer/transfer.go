@@ -13,6 +13,10 @@
 package transfer
 
 import (
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"bufio"
 	"context"
 	"crypto/sha256"
@@ -201,15 +205,97 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 	return idx, data, nil
 }
 
+// Manifest 是源端对传输内容的认证清单：{grantID, 文件 SHA-256,
+// 字节数} 用源端节点证书私钥签名。它把"文件内容"与"授权"绑定：
+// 恶意中继即使整体替换数据和清单也无法通过验签；接收端按清单的
+// 总块数判定完成（而非哨兵计数），重放旧流只会重复写相同块，无害。
+type Manifest struct {
+	GrantID  string `json:"grant_id"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
+	CertB64  string `json:"cert"` // 源端证书 DER
+	SigB64   string `json:"sig"`  // ed25519 签名 over grantID|sha256|size
+}
+
+func manifestPayload(grantID, sha string, size int64) []byte {
+	return []byte(grantID + "|" + sha + "|" + strconv.FormatInt(size, 10))
+}
+
+// BuildManifest 计算文件指纹并用 tlsConf 中的节点证书签名（发送端）。
+func BuildManifest(grantID, path string, tlsConf *tls.Config) (*Manifest, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	size, err := io.Copy(h, f)
+	if err != nil {
+		return nil, err
+	}
+	if len(tlsConf.Certificates) == 0 {
+		return nil, fmt.Errorf("manifest: 无节点证书")
+	}
+	cert := tlsConf.Certificates[0]
+	priv, ok := cert.PrivateKey.(ed25519.PrivateKey)
+	if !ok || len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("manifest: 证书缺少 ed25519 私钥")
+	}
+	m := &Manifest{
+		GrantID: grantID,
+		SHA256:  hex.EncodeToString(h.Sum(nil)),
+		Size:    size,
+		CertB64: base64.StdEncoding.EncodeToString(cert.Certificate[0]),
+	}
+	m.SigB64 = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifestPayload(m.GrantID, m.SHA256, m.Size)))
+	return m, nil
+}
+
+// Verify 校验清单签名、证书链与 grant 参与方身份（接收端）。
+func (m *Manifest) Verify(grant *api.TransferGrant, roots *x509.CertPool) error {
+	certDER, err := base64.StdEncoding.DecodeString(m.CertB64)
+	if err != nil {
+		return err
+	}
+	sig, err := base64.StdEncoding.DecodeString(m.SigB64)
+	if err != nil {
+		return err
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return err
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, CurrentTime: time.Now()}); err != nil {
+		return fmt.Errorf("manifest: 证书链无效: %w", err)
+	}
+	if cert.Subject.CommonName != grant.Src {
+		return fmt.Errorf("manifest: 签名者 %s 不是源端 %s", cert.Subject.CommonName, grant.Src)
+	}
+	pub, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return fmt.Errorf("manifest: 非 ed25519 证书")
+	}
+	if !ed25519.Verify(pub, manifestPayload(m.GrantID, m.SHA256, m.Size), sig) {
+		return fmt.Errorf("manifest: 签名无效")
+	}
+	if m.GrantID != grant.ID {
+		return fmt.Errorf("manifest: grantID 不符")
+	}
+	return nil
+}
+
 // StreamOpener 建立一条数据面流（常规拨号或交换台配对）。
 type StreamOpener func() (Stream, func(), error)
 
-// SendFile 把 path 的内容经 open 建立的流发出（常规路径 firstHop
-// 直拨/中继透明转发；交换台模式下 open 完成配对握手）。
+// SendFile 计算并签名传输清单（manifest），经 open 建立的流发出。
 // grant.Streams > 1 时并行开多条连接，交错分块——绕过按流的 UDP
 // 限速、填满带宽延迟积。
 // TODO(M2.5)：限速（grant.RateLimit）、按已完成块续传。
-func SendFile(ctx context.Context, path string, open StreamOpener, grant *api.TransferGrant) error {
+func SendFile(ctx context.Context, path string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant) error {
+	mf, err := BuildManifest(grant.ID, path, tlsConf)
+	if err != nil {
+		return fmt.Errorf("构建清单失败: %w", err)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -225,7 +311,7 @@ func SendFile(ctx context.Context, path string, open StreamOpener, grant *api.Tr
 		wg.Add(1)
 		go func(r int) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, open, grant, r, n)
+			errCh <- sendShare(ctx, f, open, grant, mf, r, n)
 		}(r)
 	}
 	wg.Wait()
@@ -284,9 +370,8 @@ func DialSwitch(ctx context.Context, addr, proto string, tlsConf *tls.Config, gr
 }
 
 // sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
-// 保证各连接进度均衡。完成后发哨兵帧并等 ACK（接收端在全部份额
-// 落盘后才统一回 ACK）。
-func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, r, n int) error {
+// 保证各连接进度均衡。流头为 grant 行 + manifest 行，然后是数据帧。
+func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, r, n int) error {
 	stream, closeConn, err := open()
 	if err != nil {
 		return fmt.Errorf("建流失败: %w", err)
@@ -297,7 +382,11 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(stream, "FFJ1%s\n", gj); err != nil {
+	mj, err := json.Marshal(mf)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
 
@@ -401,7 +490,7 @@ func HandleStream(stream Stream, selfID string, verify GrantVerifier, tlsConf *t
 		}
 		switch {
 		case grant.Dst == selfID:
-			RecvStream(br, stream, &grant)
+			recvOne(br, stream, &grant, tlsConf)
 		default:
 			relayStream(br, stream, &grant, selfID, tlsConf)
 		}
@@ -540,52 +629,97 @@ func pipeWaiters(a, b *swWaiter) {
 	wg.Wait()
 }
 
-// RecvStream 接收一个连接份额：帧按块号稀疏写入共享临时文件，
-// 本连接哨兵到齐后等全局完成再回 ACK。
-func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant) {
-	g, err := groupFor(grant)
+// pathGuard 由 agent 注入：返回 false 表示该路径不在白名单内，
+// 拒绝写入。nil 表示不限制。
+var pathGuard func(string) bool
+
+// SetPathGuard 注入落盘路径白名单检查。
+func SetPathGuard(g func(string) bool) { pathGuard = g }
+
+// PathAllowed 报告路径是否被允许（发送端源路径与接收端目的路径通用）。
+func PathAllowed(p string) bool { return pathGuard == nil || pathGuard(p) }
+
+// RecvStream 按认证清单接收：读 manifest 行并验签，然后进组收块。
+// 这是接收端（直连与交换台路径共用的入口）。
+func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots *x509.CertPool) {
+	line, err := br.ReadString('\n') // manifest 行（grant 行由调用方已读）
+	if err != nil {
+		fmt.Println("manifest 读取失败：", err)
+		return
+	}
+	var mf Manifest
+	if err := json.Unmarshal([]byte(line), &mf); err != nil {
+		fmt.Println("manifest 解析失败：", err)
+		return
+	}
+	if err := mf.Verify(grant, roots); err != nil {
+		fmt.Printf("拒绝传输 %s：%v\n", grant.ID, err)
+		return
+	}
+	g, err := groupFor(grant, &mf)
 	if err != nil {
 		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
 		return
 	}
-	feedErr := g.feed(br)
-	var doneCh <-chan struct{}
-	if feedErr == nil {
-		doneCh, err = g.done(grant.ID)
-	}
-	if feedErr != nil || err != nil {
-		fmt.Printf("接收 %s 失败：%v\n", grant.ID, feedErr)
+	if err := g.feed(br); err != nil {
+		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
 		return
 	}
-	<-doneCh // 等全部份额落盘、原子改名完成
+	select {
+	case <-g.finished:
+	case <-time.After(10 * time.Minute):
+		fmt.Printf("接收 %s 超时：未收齐全部块\n", grant.ID)
+		return
+	}
+	if g.finErr != nil {
+		fmt.Printf("接收 %s 校验失败：%v（文件已丢弃）\n", grant.ID, g.finErr)
+		return
+	}
 	stream.Write([]byte("ACK\n"))
-	fmt.Printf("接收完成：%s（src=%s）-> %s\n", grant.ID, grant.Src, grant.DstPath)
+	fmt.Printf("接收完成：%s（src=%s，%d 字节）-> %s\n", grant.ID, grant.Src, mf.Size, grant.DstPath)
 }
 
-// recvGroup 协调同一 grant 的并行接收：N 条连接交错写同一临时文件，
-// 收齐 N 个哨兵才 sync + 原子改名，然后唤醒所有等待者回 ACK。
-// 块号在帧头里，WriteAt 稀疏落盘天然支持乱序到达。
-// TODO(M4)：失败份额的组回收（当前依赖 grant 过期清理）。
+// recvOne 是数据面监听上的接收入口（已读 head 与 grant 行）。
+func recvOne(br *bufio.Reader, stream Stream, grant *api.TransferGrant, tlsConf *tls.Config) {
+	var roots *x509.CertPool
+	if tlsConf != nil {
+		roots = tlsConf.RootCAs
+	}
+	RecvStream(br, stream, grant, roots)
+}
+
+// recvGroup 按"唯一块计数"协调并行接收：收齐 manifest 声明的全部
+// 块才校验全文件哈希、原子改名并唤醒等待者。重放旧流只会重复写
+// 相同的块（WriteAt 幂等），无法提前触发完成，也无法篡改内容。
 type recvGroup struct {
 	mu        sync.Mutex
+	grantID   string
+	wantSHA   string
 	finalPath string
 	tmp       *os.File
 	tmpName   string
-	streams   int
-	sentinels int
-	waiters   []chan struct{}
-	finished  bool
+	expected  int64
+	got       map[int64]bool
+	finished  chan struct{}
 	finErr    error
+	done      bool
 }
 
 var (
 	recvMu     sync.Mutex
 	recvGroups = map[string]*recvGroup{}
+	completed  = map[string]time.Time{} // 已完成的 grant，2h 内拒绝重放
 )
 
-func groupFor(grant *api.TransferGrant) (*recvGroup, error) {
+func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
+	if !PathAllowed(grant.DstPath) {
+		return nil, fmt.Errorf("目的路径不在白名单内：%s", grant.DstPath)
+	}
 	recvMu.Lock()
 	defer recvMu.Unlock()
+	if t, ok := completed[grant.ID]; ok && time.Since(t) < 2*time.Hour {
+		return nil, fmt.Errorf("grant 已完成，拒绝重放")
+	}
 	if g, ok := recvGroups[grant.ID]; ok {
 		return g, nil
 	}
@@ -597,21 +731,30 @@ func groupFor(grant *api.TransferGrant) (*recvGroup, error) {
 	if err != nil {
 		return nil, err
 	}
-	n := grant.Streams
+	n := (mf.Size + ChunkSize - 1) / ChunkSize
 	if n < 1 {
-		n = 1
+		n = 1 // 空文件：仅哨兵
 	}
-	g := &recvGroup{finalPath: grant.DstPath, tmp: tmp, tmpName: tmp.Name(), streams: n}
+	g := &recvGroup{
+		grantID:   grant.ID,
+		wantSHA:   mf.SHA256,
+		finalPath: grant.DstPath,
+		tmp:       tmp,
+		tmpName:   tmp.Name(),
+		expected:  n,
+		got:       map[int64]bool{},
+		finished:  make(chan struct{}),
+	}
 	recvGroups[grant.ID] = g
 	return g, nil
 }
 
-// feed 消费一条连接的帧流直到哨兵。WriteAt 并发安全（各写各的偏移）。
+// feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
 func (g *recvGroup) feed(r io.Reader) error {
 	for {
 		idx, data, err := ReadFrame(r)
 		if err == io.EOF {
-			return nil // 对端未发哨兵直接 FIN（旧版本兼容）
+			return nil
 		}
 		if err != nil {
 			return err
@@ -622,42 +765,63 @@ func (g *recvGroup) feed(r io.Reader) error {
 		if _, err := g.tmp.WriteAt(data, idx*int64(ChunkSize)); err != nil {
 			return err
 		}
+		g.mu.Lock()
+		g.got[idx] = true
+		complete := int64(len(g.got)) >= g.expected && !g.done
+		if complete {
+			g.done = true
+		}
+		g.mu.Unlock()
+		if complete {
+			g.finalize()
+		}
 	}
 }
 
-// done 登记本连接哨兵；返回的通道在全部哨兵集齐且改名完成后关闭。
-func (g *recvGroup) done(grantID string) (<-chan struct{}, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	ch := make(chan struct{})
-	g.waiters = append(g.waiters, ch)
-	if !g.finished {
-		g.sentinels++
-		if g.sentinels >= g.streams {
-			g.finished = true
-			if err := g.tmp.Sync(); err != nil {
-				g.finErr = err
-			} else if err := g.tmp.Close(); err != nil {
-				g.finErr = err
-			} else if err := os.Rename(g.tmpName, g.finalPath); err != nil {
-				g.finErr = err
-			} else {
-				recvMu.Lock()
-				delete(recvGroups, grantID)
-				recvMu.Unlock()
-			}
-		}
+// finalize 收尾：全文件 SHA-256 对清单核验，通过才原子改名。
+func (g *recvGroup) finalize() {
+	defer close(g.finished)
+	fail := func(err error) {
+		g.tmp.Close()
+		os.Remove(g.tmpName)
+		g.finErr = err
+		recvMu.Lock()
+		delete(recvGroups, g.grantID)
+		recvMu.Unlock()
 	}
-	if g.finished {
-		if g.finErr != nil {
-			return nil, g.finErr
-		}
-		for _, w := range g.waiters {
-			close(w)
-		}
-		g.waiters = nil
+	if err := g.tmp.Sync(); err != nil {
+		fail(err)
+		return
 	}
-	return ch, nil
+	if err := g.tmp.Close(); err != nil {
+		fail(err)
+		return
+	}
+	// 全文件哈希核验
+	f, err := os.Open(g.tmpName)
+	if err != nil {
+		fail(err)
+		return
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		f.Close()
+		fail(err)
+		return
+	}
+	f.Close()
+	if g.wantSHA != "" && hex.EncodeToString(h.Sum(nil)) != g.wantSHA {
+		fail(fmt.Errorf("全文件哈希与清单不符"))
+		return
+	}
+	if err := os.Rename(g.tmpName, g.finalPath); err != nil {
+		fail(err)
+		return
+	}
+	recvMu.Lock()
+	delete(recvGroups, g.grantID)
+	completed[g.grantID] = time.Now()
+	recvMu.Unlock()
 }
 
 // relayStream 中继转发：确认自己在签名路径上，拨下一跳，双向管道。

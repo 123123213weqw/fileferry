@@ -28,3 +28,7 @@ test:
 
 clean:
 	rm -rf bin
+
+# 安全审计：依赖漏洞扫描（govulncheck）
+audit:
+	GOTOOLCHAIN=auto GOFLAGS=-mod=mod $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...

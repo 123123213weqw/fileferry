@@ -1,0 +1,17 @@
+[Unit]
+Description=fileferry controller
+After=network-online.target
+
+[Service]
+User=xs
+ExecStart=/home/xs/ffctl/ff-controller -config /home/xs/ffctl/ctl.yaml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/home/xs/ffctl
+
+[Install]
+WantedBy=multi-user.target

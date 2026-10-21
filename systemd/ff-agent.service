@@ -1,0 +1,21 @@
+[Unit]
+Description=fileferry agent
+After=network-online.target
+
+[Service]
+# 专用低权限用户运行；按部署机器调整路径与用户
+User=wzu
+ExecStart=/home/wzu/fileferry/bin/ff-agent -config /home/wzu/ff-agent-v100/agent.yaml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/home/wzu/ff-agent-v100
+
+[Install]
+WantedBy=multi-user.target

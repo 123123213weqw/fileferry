@@ -242,6 +242,24 @@ func (c *Client) Send(req TransferRequest) (*TransferGrant, error) {
 }
 
 // TokenHash 供 controller 存储一次性令牌的摘要。
+// RenewRequest / RenewResponse：节点证书临期续期，身份由现有
+// mTLS 证书证明，新证书沿用同一 nodeID 与角色。
+type RenewRequest struct{}
+
+type RenewResponse struct {
+	NodeID  string `json:"node_id"`
+	CertPEM string `json:"cert_pem"`
+	KeyPEM  string `json:"key_pem"`
+}
+
+func (c *Client) Renew() (*RenewResponse, error) {
+	var resp RenewResponse
+	if err := c.post("/v1/renew", RenewRequest{}, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 func TokenHash(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])

@@ -80,8 +80,10 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       交换台按 grant 行别配对两条现成连接后双向管道——NAT 不构成
       障碍。真实环境验证：V100 ↔ node5 跨两个校园 NAT 传输 50MB，
       sha256 一致，52s 完成
-- [ ] M1 信任与观测（进行中）：✅ CA/enrollment/心跳 ✅ status 展示
-      ✅ 探测回填可达边 ⬜ /proc 指标采集 ⬜ 证书自动续期 ⬜ SQLite 持久化
+- [ ] M1 信任与观测（大部分完成）：✅ CA/enrollment/心跳 ✅ status 展示
+      ✅ 探测回填可达边 ✅ 证书自动续期（/v1/renew + 自我重启）
+      ✅ SQLite 审计与任务持久化（重启恢复队列）✅ API 限速
+      ✅ 落盘路径白名单 ⬜ /proc 指标采集
 - [ ] M2 直连传输（基础可用）：✅ grant 签发与两端验签 ✅ 分块传输
       + 逐块校验 + 原子落盘 ✅ 完成回报 ⬜ 限速 ⬜ 断点续传接线
 - [ ] M3 复杂网络（核心已落地）：✅ TCP 回退（探测 QUIC 失败自动
@@ -94,8 +96,13 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       真实环境验证：跨两个校园 NAT 的对等打洞被对称型 NAT 拒绝
       （双方同时行动、地址正确、失败被正确识别并回落中继）
 - [ ] M4 精准负载：⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
-- [ ] M5 收尾：⬜ ffctl 管理令牌 ⬜ systemd 单元 ⬜ 部署打包
-      ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
+- [ ] M5 收尾：✅ systemd 沙箱单元（systemd/）✅ 安全自检脚本
+      （scripts/security-check.sh）✅ make audit（govulncheck）
+      ⬜ ffctl 管理令牌 ⬜ 部署打包 ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
+- [x] 安全加固（自渗透驱动）：✅ token 核销持久化 ✅ 管理员证书 10 年
+      ✅ 认证清单 manifest（源端签名 文件哈希+大小，唯一块计数判定
+      完成 + 全文件验哈希——防重放、防恶意中继篡改内容）
+      ✅ 回声口限速 ✅ 密钥离机 + 备份
 
 ## 协议
 

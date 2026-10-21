@@ -46,6 +46,9 @@ type Config struct {
 	// Advertise 显式声明对外的数据面地址（host:port）。controller 与
 	// agent 同机时自动探测会得到 127.0.0.1，公网机必须手工指定。
 	Advertise string `yaml:"advertise"`
+	// AllowedDirs 落盘路径白名单：源路径与目的路径都必须位于其中，
+	// 恶意授权也写不了白名单外（如 /etc）。空 = 不限制。
+	AllowedDirs []string `yaml:"allowed-dirs"`
 }
 
 var (
@@ -126,15 +129,27 @@ func run(cfgPath string) error {
 	if err := loadSignPub(); err != nil {
 		return err
 	}
+	if len(cfg.AllowedDirs) > 0 {
+		transfer.SetPathGuard(func(p string) bool {
+			for _, dir := range cfg.AllowedDirs {
+				if strings.HasPrefix(p, dir) {
+					return true
+				}
+			}
+			return false
+		})
+		log.Printf("路径白名单：%v", cfg.AllowedDirs)
+	}
 	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}}
 	running = map[string]bool{}
 	punched = map[string]string{}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
 
-	// 2. 心跳 / 探测 / WHOAMI 保活
+	// 2. 心跳 / 探测 / WHOAMI 保活 / 证书续期
 	go heartbeatLoop()
 	go probeLoop()
 	go whoamiLoop()
+	go certRenewLoop()
 
 	// 3. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）
 	serverTLS := &tls.Config{
@@ -320,6 +335,49 @@ func advertisedAddr() string {
 		return cfg.Advertise
 	}
 	return fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort)
+}
+
+// certRenewLoop 证书临期自动续期：余量 <8h 时用现有证书身份向
+// controller 换新证书（同 nodeID），落盘后自我重启（exec）生效。
+func certRenewLoop() {
+	check := func() (time.Duration, error) {
+		b, err := os.ReadFile(filepath.Join(cfg.DataDir, "node.crt"))
+		if err != nil {
+			return 0, err
+		}
+		block, _ := pem.Decode(b)
+		if block == nil {
+			return 0, fmt.Errorf("node.crt 非法")
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return 0, err
+		}
+		return time.Until(c.NotAfter), nil
+	}
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		left, err := check()
+		if err != nil {
+			log.Println("证书检查失败：", err)
+		} else if left < 8*time.Hour {
+			resp, err := hbClient.Renew()
+			if err != nil {
+				log.Println("证书续期失败（稍后重试）：", err)
+			} else {
+				if err := os.WriteFile(filepath.Join(cfg.DataDir, "node.crt"), []byte(resp.CertPEM), 0o600); err != nil {
+					log.Fatal("续期证书写盘失败：", err)
+				}
+				if err := os.WriteFile(filepath.Join(cfg.DataDir, "node.key"), []byte(resp.KeyPEM), 0o600); err != nil {
+					log.Fatal("续期私钥写盘失败：", err)
+				}
+				log.Printf("证书已续期（nodeID=%s），自我重启生效", resp.NodeID)
+				syscall.Exec(os.Args[0], os.Args, os.Environ()) // 原地重启
+			}
+		}
+		<-t.C
+	}
 }
 
 func heartbeatLoop() {
@@ -527,6 +585,10 @@ func runJob(g api.TransferGrant) {
 		done(false, "grant 验签失败或已过期")
 		return
 	}
+	if !transfer.PathAllowed(g.SrcPath) {
+		done(false, "源路径不在白名单内")
+		return
+	}
 	timeout := time.Until(g.ExpiresAt)
 	if timeout > 30*time.Minute {
 		timeout = 30 * time.Minute
@@ -554,7 +616,7 @@ func runJob(g api.TransferGrant) {
 		}
 	}
 	start := time.Now()
-	if err := transfer.SendFile(ctx, g.SrcPath, open, &g); err != nil {
+	if err := transfer.SendFile(ctx, g.SrcPath, open, tlsConf, &g); err != nil {
 		done(false, err.Error())
 		log.Printf("任务 %s 失败：%v", g.ID, err)
 		return
@@ -638,7 +700,7 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
 	if err := json.Unmarshal([]byte(line), &gg); err != nil || gg.ID != g.ID {
 		return fmt.Errorf("grant 不符")
 	}
-	transfer.RecvStream(br, stream, &gg)
+	transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs)
 	// ACK 已写入流：只半关写侧，等对端读走、对端关闭后再退出，
 	// 避免 QUIC 立即关连接丢弃未送达的 ACK
 	transfer.CloseWrite(stream)

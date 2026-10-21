@@ -79,7 +79,7 @@ func TestSwitchTransfer(t *testing.T) {
 				t.Errorf("grant 解析失败：%v", err)
 				return
 			}
-			RecvStream(br, stream, &gg)
+			RecvStream(br, stream, &gg, clientTLSFor(t, root, "dst").RootCAs)
 			CloseWrite(stream)
 			io.ReadFull(stream, make([]byte, 1))
 		}()
@@ -88,7 +88,7 @@ func TestSwitchTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	swHop := api.Hop{NodeID: "sw", Addr: swQ, Proto: "quic"}
-	if err := SendFile(ctx, srcPath, OpenerSwitch(ctx, swHop, clientTLSFor(t, root, "src"), grant), grant); err != nil {
+	if err := SendFile(ctx, srcPath, OpenerSwitch(ctx, swHop, clientTLSFor(t, root, "src"), grant), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("交换台模式发送失败：%v", err)
 	}
 	wg.Wait()
@@ -99,5 +99,35 @@ func TestSwitchTransfer(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("内容不一致：%d vs %d 字节", len(payload), len(got))
+	}
+}
+
+// TestManifestTamper 清单防篡改：改一个字节的哈希，验签必须失败。
+func TestManifestTamper(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.bin")
+	os.WriteFile(path, []byte("hello"), 0o600)
+	tlsConf := clientTLSFor(t, root, "src")
+	grant := &api.TransferGrant{ID: "x", Src: "src", Dst: "dst"}
+	mf, err := BuildManifest(grant.ID, path, tlsConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mf.Verify(grant, root.Pool()); err != nil {
+		t.Fatalf("合法清单不应失败：%v", err)
+	}
+	bad := *mf
+	bad.SHA256 = "0000" + mf.SHA256[4:]
+	if err := bad.Verify(grant, root.Pool()); err == nil {
+		t.Fatal("篡改哈希的清单必须被拒绝")
+	}
+	bad2 := *mf
+	other := &api.TransferGrant{ID: "y", Src: "src", Dst: "dst"}
+	if err := bad2.Verify(other, root.Pool()); err == nil {
+		t.Fatal("跨 grant 重用的清单必须被拒绝")
 	}
 }
