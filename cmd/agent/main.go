@@ -36,6 +36,9 @@ type Config struct {
 	EnrollToken string `yaml:"enroll-token"`
 	DataPort    int    `yaml:"data-port"`
 	DataDir     string `yaml:"data-dir"`
+	// Advertise 显式声明对外的数据面地址（host:port）。controller 与
+	// agent 同机时自动探测会得到 127.0.0.1，公网机必须手工指定。
+	Advertise string `yaml:"advertise"`
 }
 
 var (
@@ -179,13 +182,14 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 	// enroll 阶段还没有根证书，无法校验 controller 身份，先跳过校验；
 	// 该连接只被一次性 token 保护。TODO(M1)：config 里支持证书指纹
 	// 固定（trust-on-first-use），消除这一窗口。
-	cl := &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
-	}}}
+	cl := &api.Client{Base: cfg.Controller, HC: &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}},
+	}}
 	resp, err := cl.Enroll(api.EnrollRequest{
 		Token:    cfg.EnrollToken,
 		Hostname: hostname,
-		Addr:     fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort),
+		Addr:     advertisedAddr(),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("enroll: %w", err)
@@ -254,6 +258,15 @@ func verifyGrant(g *api.TransferGrant) bool {
 	return g.Verify(signPub) && g.Dst == nodeID && time.Now().Before(g.ExpiresAt)
 }
 
+// advertisedAddr 返回对外广播的数据面地址：优先显式配置，
+// 否则取"通往 controller 方向"的本机源 IP。
+func advertisedAddr() string {
+	if cfg.Advertise != "" {
+		return cfg.Advertise
+	}
+	return fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort)
+}
+
 func heartbeatLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -262,7 +275,7 @@ func heartbeatLoop() {
 		hb := api.Heartbeat{
 			NodeID:   nodeID,
 			Hostname: hostname,
-			Addr:     fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort),
+			Addr:     advertisedAddr(),
 			Edges:    edges,
 			TS:       time.Now(),
 			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
