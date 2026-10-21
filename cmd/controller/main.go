@@ -102,8 +102,28 @@ func main() {
 		log.Printf("已生成管理员证书：%s 与 %s（拷走保管，勿留在服务器）", adminCrt, adminKey)
 	}
 
+	// 证书 SAN：本机全部非回环地址（LAN + Tailscale + 主机名），
+	// agent 从任何网络拨过来都能通过校验
 	host, _ := os.Hostname()
-	_, _, cert, err := rootCA.Issue("controller", true, "controller", "127.0.0.1", "localhost", host)
+	sans := []string{"127.0.0.1", "localhost", host}
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, ifc := range ifaces {
+			addrs, _ := ifc.Addrs()
+			for _, a := range addrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip != nil && !ip.IsLoopback() {
+					sans = append(sans, ip.String())
+				}
+			}
+		}
+	}
+	_, _, cert, err := rootCA.Issue("controller", true, "controller", sans...)
 	if err != nil {
 		log.Fatal(err)
 	}

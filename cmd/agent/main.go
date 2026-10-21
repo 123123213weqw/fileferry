@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -184,7 +185,7 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 	resp, err := cl.Enroll(api.EnrollRequest{
 		Token:    cfg.EnrollToken,
 		Hostname: hostname,
-		Addr:     fmt.Sprintf("%s:%d", localIP(), cfg.DataPort),
+		Addr:     fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("enroll: %w", err)
@@ -261,7 +262,7 @@ func heartbeatLoop() {
 		hb := api.Heartbeat{
 			NodeID:   nodeID,
 			Hostname: hostname,
-			Addr:     fmt.Sprintf("%s:%d", localIP(), cfg.DataPort),
+			Addr:     fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort),
 			Edges:    edges,
 			TS:       time.Now(),
 			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
@@ -411,6 +412,23 @@ func probeLoop() {
 		}
 		runRound()
 	}
+}
+
+// localIPTowardsController 返回"通往 controller 方向"的本机源 IP：
+// controller 在哪个网络里，这个地址就在哪个网络里可达（tailnet 场景
+// 下即 Tailscale IP，其他节点都能直连）。取不到时退化为公网出口 IP。
+func localIPTowardsController() string {
+	if u, err := url.Parse(cfg.Controller); err == nil {
+		if host := u.Hostname(); host != "" {
+			if c, err := net.DialTimeout("tcp", net.JoinHostPort(host, u.Port()), 2*time.Second); err == nil {
+				defer c.Close()
+				if addr, ok := c.LocalAddr().(*net.TCPAddr); ok {
+					return addr.IP.String()
+				}
+			}
+		}
+	}
+	return localIP()
 }
 
 func localIP() string {
