@@ -44,6 +44,19 @@ type Stream interface {
 	io.ReadWriteCloser
 }
 
+// quicConf 是数据面统一的 QUIC 参数：放宽流控窗口与空闲超时。
+// 默认窗口在小缓冲/高延迟链路上会把吞吐压到 1MB/s 量级。
+func quicConf() *quic.Config {
+	const mb = 1 << 20
+	return &quic.Config{
+		MaxIdleTimeout:              30 * time.Second,
+		InitialStreamReceiveWindow:  8 * mb,
+		MaxStreamReceiveWindow:      16 * mb,
+		InitialConnectionReceiveWindow: 16 * mb,
+		MaxConnectionReceiveWindow:  32 * mb,
+	}
+}
+
 // DialStream 按协议拨到 addr 并打开一条流。返回的 closer 关闭底层
 // 连接（QUIC conn / TCP conn），流本身的写侧由调用者按需半关闭。
 func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (Stream, func(), error) {
@@ -73,7 +86,10 @@ func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (S
 		if err != nil {
 			return nil, nil, err
 		}
-		conn, err := quic.Dial(ctx, udp, udpAddr, tlsConf, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+		if err := udp.SetReadBuffer(4 << 20); err == nil {
+			_ = udp.SetWriteBuffer(4 << 20)
+		}
+		conn, err := quic.Dial(ctx, udp, udpAddr, tlsConf, quicConf())
 		if err != nil {
 			udp.Close()
 			return nil, nil, err

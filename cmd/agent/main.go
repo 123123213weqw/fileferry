@@ -113,7 +113,16 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	ln, err := quic.Listen(udp, serverTLS, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	if err := udp.SetReadBuffer(4 << 20); err == nil {
+		_ = udp.SetWriteBuffer(4 << 20)
+	}
+	ln, err := quic.Listen(udp, serverTLS, &quic.Config{
+		MaxIdleTimeout:                  30 * time.Second,
+		InitialStreamReceiveWindow:      8 << 20,
+		MaxStreamReceiveWindow:          16 << 20,
+		InitialConnectionReceiveWindow:  16 << 20,
+		MaxConnectionReceiveWindow:      32 << 20,
+	})
 	if err != nil {
 		return err
 	}
