@@ -21,8 +21,12 @@ import (
 	"time"
 )
 
-// CertTTL 是签发证书的有效期；到期前由持有方向 controller 续期（M1 TODO）。
-const CertTTL = 24 * time.Hour
+// CertTTL 是节点证书的有效期；到期前由持有方向 controller 续期（M1 TODO）。
+// 管理员证书用 AdminCertTTL：操作者不便每天换证书，靠妥善保管弥补。
+const (
+	CertTTL     = 24 * time.Hour
+	AdminCertTTL = 10 * 365 * 24 * time.Hour
+)
 
 type CA struct {
 	mu        sync.Mutex
@@ -140,11 +144,15 @@ func (c *CA) Issue(nodeID string, server bool, role string, sans ...string) (cer
 	if server {
 		eku = append(eku, x509.ExtKeyUsageServerAuth)
 	}
+	ttl := CertTTL
+	if role == RoleAdmin {
+		ttl = AdminCertTTL
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(c.serial + 1),
 		Subject:               pkix.Name{CommonName: nodeID, Organization: []string{"fileferry"}, OrganizationalUnit: []string{role}},
 		NotBefore:             time.Now().Add(-5 * time.Minute),
-		NotAfter:              time.Now().Add(CertTTL),
+		NotAfter:              time.Now().Add(ttl),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           eku,
 	}

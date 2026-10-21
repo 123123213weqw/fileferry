@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -103,10 +104,14 @@ func ParseAndVerify(data []byte, pool *x509.CertPool, now time.Time) (nodeID str
 
 // EchoServer 在 UDP 端口上应答 WHOAMI，把观测到的公网地址回调给
 // controller（公网映射表由 controller 维护，agent 不自行声称）。
+// 每个来源 IP 限速（默认 5 次/秒）：WHOAMI 验证含证书链解析，
+// 不限速会被 UDP 洪水打成 CPU DoS。
 type EchoServer struct {
-	conn *net.UDPConn
-	pool *x509.CertPool
-	cb   func(nodeID, publicAddr string)
+	conn  *net.UDPConn
+	pool  *x509.CertPool
+	cb    func(nodeID, publicAddr string)
+	mu    sync.Mutex
+	seen  map[string][]time.Time
 }
 
 func NewEchoServer(port int, pool *x509.CertPool, cb func(nodeID, public string)) (*EchoServer, error) {
@@ -114,7 +119,27 @@ func NewEchoServer(port int, pool *x509.CertPool, cb func(nodeID, public string)
 	if err != nil {
 		return nil, err
 	}
-	return &EchoServer{conn: conn, pool: pool, cb: cb}, nil
+	return &EchoServer{conn: conn, pool: pool, cb: cb, seen: map[string][]time.Time{}}, nil
+}
+
+// allow 简单滑动窗口限速：每 IP 每秒最多 5 次验证。
+func (s *EchoServer) allow(ip string) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := s.seen[ip]
+	kept := list[:0]
+	for _, t := range list {
+		if now.Sub(t) < time.Second {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= 5 {
+		s.seen[ip] = kept
+		return false
+	}
+	s.seen[ip] = append(kept, now)
+	return true
 }
 
 func (s *EchoServer) Serve() error {
@@ -124,6 +149,9 @@ func (s *EchoServer) Serve() error {
 		n, from, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			return err
+		}
+		if !s.allow(from.IP.String()) {
+			continue // 限速丢弃，不做昂贵验证
 		}
 		nodeID, err := ParseAndVerify(buf[:n], s.pool, time.Now())
 		if err != nil {

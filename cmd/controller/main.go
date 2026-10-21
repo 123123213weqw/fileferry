@@ -45,14 +45,14 @@ type controller struct {
 	graph   *topology.Graph
 	db      *sql.DB
 
-	mu      sync.Mutex
-	tokens  map[string]bool                   // 已核销的一次性令牌
-	pending map[api.NodeID][]api.TransferGrant // 源节点待执行任务
-	nextID  int64
+	mu           sync.Mutex
+	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
+	nextID       int64
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
 	punchTried   map[[2]api.NodeID]time.Time
 	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
+	ledger       *enrollLedger                        // 持久化核销台账
 }
 
 type pubEntry struct {
@@ -90,14 +90,14 @@ func main() {
 	// TODO(M1)：任务表 schema 与持久化
 
 	c := &controller{
-		cfg:        cfg,
-		ca:         rootCA,
-		signer:     signer,
-		signPub:    signPub,
-		graph:      topology.New(),
-		db:         db,
-		tokens:     map[string]bool{},
-		pending:    map[api.NodeID][]api.TransferGrant{},
+		cfg:          cfg,
+		ca:           rootCA,
+		signer:       signer,
+		signPub:      signPub,
+		graph:        topology.New(),
+		db:           db,
+		pending:      map[api.NodeID][]api.TransferGrant{},
+		ledger:       loadEnrollLedger(cfg.DataDir),
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
@@ -231,8 +231,38 @@ func signPubPEM(pub ed25519.PublicKey) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: b}))
 }
 
+// —— enrollment 台账：核销状态与节点编号持久化（防重启后 token 复活、
+// 防 CN 撞号）。文件在 data-dir，随每次核销落盘。 ——
+type enrollLedger struct {
+	Burned   map[string]string `json:"burned"`    // tokenHash -> nodeID
+	NextNode int               `json:"next_node"` // 下一节点编号
+}
+
+func loadEnrollLedger(dir string) *enrollLedger {
+	l := &enrollLedger{Burned: map[string]string{}, NextNode: 1}
+	if b, err := os.ReadFile(dir + "/enroll-ledger.json"); err == nil {
+		json.Unmarshal(b, l)
+	}
+	if l.Burned == nil {
+		l.Burned = map[string]string{}
+	}
+	if l.NextNode < 1 {
+		l.NextNode = 1
+	}
+	return l
+}
+
+func (l *enrollLedger) save(dir string) {
+	b, err := json.Marshal(l)
+	if err != nil {
+		return
+	}
+	os.WriteFile(dir+"/enroll-ledger.json", b, 0o600)
+}
+
 // handleEnroll：一次性 token 换节点证书（角色固定为 node）。
-// 核销即废，无证书也可访问（ServerTLS 用 VerifyClientCertIfGiven 放行）。
+// 核销即废且**跨重启持久**；节点编号单调递增，绝不复用。
+// 无证书也可访问（ServerTLS 用 VerifyClientCertIfGiven 放行）。
 func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req api.EnrollRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -242,18 +272,21 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	valid := false
 	for _, t := range c.cfg.EnrollTokens {
-		if t == req.Token && !c.tokens[t] {
-			c.tokens[t] = true // 核销
+		if _, burned := c.ledger.Burned[api.TokenHash(t)]; t == req.Token && !burned {
 			valid = true
 			break
 		}
 	}
-	nodeID := fmt.Sprintf("node-%d", len(c.tokens)) // tokens 已含本次，从 node-1 起
-	c.mu.Unlock()
 	if !valid {
+		c.mu.Unlock()
 		http.Error(w, "invalid or used token", http.StatusUnauthorized)
 		return
 	}
+	nodeID := fmt.Sprintf("node-%d", c.ledger.NextNode)
+	c.ledger.NextNode++
+	c.ledger.Burned[api.TokenHash(req.Token)] = nodeID
+	c.ledger.save(c.cfg.DataDir)
+	c.mu.Unlock()
 	// 证书 SAN：enrollment 报上来的数据面 IP + 主机名
 	sans := []string{req.Hostname}
 	if host, _, err := net.SplitHostPort(req.Addr); err == nil && net.ParseIP(host) != nil {
