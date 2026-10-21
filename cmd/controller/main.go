@@ -251,15 +251,23 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
 		return
 	}
-	if len(path) > 2 {
-		// TODO(M3)：中继链数据面
-		http.Error(w, "relay path not supported yet (M3), direct only", http.StatusNotImplemented)
-		return
-	}
-	dstAddr := c.graph.Addr(req.Dst)
-	if dstAddr == "" {
-		http.Error(w, "dst offline", http.StatusUnprocessableEntity)
-		return
+	// 组装完整逐跳路径：每跳带数据面地址与拨号协议（协议来自
+	// 前驱节点探测该边的结果，QUIC 优先，不通则 TCP）
+	hops := make([]api.Hop, 0, len(path))
+	for i, id := range path {
+		hop := api.Hop{NodeID: id}
+		if i > 0 {
+			hop.Addr = c.graph.Addr(id)
+			if hop.Addr == "" {
+				http.Error(w, fmt.Sprintf("%s offline", id), http.StatusUnprocessableEntity)
+				return
+			}
+			hop.Proto = c.graph.EdgeInfo(path[i-1], id)
+			if hop.Proto == "" {
+				hop.Proto = "quic"
+			}
+		}
+		hops = append(hops, hop)
 	}
 	c.mu.Lock()
 	c.nextID++
@@ -269,7 +277,8 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		ID:        fmt.Sprintf("xfer-%d", id),
 		Src:       req.Src,
 		Dst:       req.Dst,
-		DstAddr:   dstAddr,
+		Hops:      hops,
+		Relays:    path[1 : len(path)-1],
 		SrcPath:   req.SrcPath,
 		DstPath:   req.DstPath,
 		ChunkSize: 4 << 20,

@@ -93,11 +93,20 @@ type TransferRequest struct {
 // TransferGrant 是 controller 签名的单次传输授权：写明源、目的、
 // 中继链、文件摘要、限速与过期时间。节点用 controller 公钥本地
 // 验签，全程不共享任何密钥。
+// Hop 是传输路径上的一跳。Proto 记录拨到这一跳用的协议
+// （"quic" 或 "tcp"，由前驱节点的探测结果决定）；Hops[0] 是源端，
+// 自身的 Addr/Proto 不使用。
+type Hop struct {
+	NodeID NodeID `json:"node_id"`
+	Addr   string `json:"addr"`
+	Proto  string `json:"proto"`
+}
+
 type TransferGrant struct {
 	ID         string    `json:"id"`
 	Src        NodeID    `json:"src"`
 	Dst        NodeID    `json:"dst"`
-	DstAddr    string    `json:"dst_addr"` // 目的端数据面地址（直连场景；中继链地址 M3 补）
+	Hops       []Hop     `json:"hops"` // 完整路径：源端、各中继、目的端
 	Relays     []NodeID  `json:"relays"`
 	SrcPath    string    `json:"src_path"`
 	DstPath    string    `json:"dst_path"`

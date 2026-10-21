@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -92,7 +93,14 @@ func run(cfgPath string) error {
 	go heartbeatLoop()
 	go probeLoop()
 
-	// 3. 数据面：QUIC 监听（TCP 回退 M3）
+	// 3. 数据面：QUIC 监听（UDP）+ TCP 回退监听（端口约定 +1）。
+	// 服务端强制校验客户端证书（此前仅靠 grant 验签兜底）。
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		ClientCAs:    rootPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS13,
+	}
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", cfg.DataPort))
 	if err != nil {
 		return err
@@ -101,16 +109,25 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	ln, err := quic.Listen(udp, tlsConf, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	ln, err := quic.Listen(udp, serverTLS, &quic.Config{MaxIdleTimeout: 30 * time.Second})
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
+	tcpLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", cfg.DataPort+1), serverTLS)
+	if err != nil {
+		log.Printf("TCP 回退监听失败（仅 QUIC 可用）：%v", err)
+	} else {
+		defer tcpLn.Close()
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	errCh := make(chan error, 1)
-	go func() { errCh <- transfer.Serve(ln, nodeID, verifyGrant) }()
+	errCh := make(chan error, 2)
+	go func() { errCh <- transfer.ServeQUIC(ln, nodeID, verifyGrant, tlsConf) }()
+	if tcpLn != nil {
+		go func() { errCh <- transfer.ServeTCP(tcpLn, nodeID, verifyGrant, tlsConf) }()
+	}
 	select {
 	case err := <-errCh:
 		return err
@@ -323,14 +340,27 @@ func runJob(g api.TransferGrant) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	if len(g.Hops) < 2 {
+		done(false, "grant 路径不完整")
+		return
+	}
+	firstHop := g.Hops[1]
 	start := time.Now()
-	if err := transfer.SendFile(ctx, g.SrcPath, g.DstAddr, tlsConf, &g); err != nil {
+	if err := transfer.SendFile(ctx, g.SrcPath, firstHop, tlsConf, &g); err != nil {
 		done(false, err.Error())
 		log.Printf("任务 %s 失败：%v", g.ID, err)
 		return
 	}
+	via := ""
+	if len(g.Hops) > 2 {
+		ids := make([]string, 0, len(g.Hops)-2)
+		for _, h := range g.Hops[1 : len(g.Hops)-1] {
+			ids = append(ids, h.NodeID)
+		}
+		via = "（经 " + strings.Join(ids, " -> ") + " 中继）"
+	}
 	done(true, "")
-	log.Printf("任务 %s 完成：%s -> %s:%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, g.DstAddr, time.Since(start).Round(time.Millisecond))
+	log.Printf("任务 %s 完成：%s -> %s%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, via, time.Since(start).Round(time.Millisecond))
 }
 
 // probeLoop 探测所有在线对端，成功边回填到心跳。触发时机：节点表
@@ -355,15 +385,15 @@ func probeLoop() {
 			wg.Add(1)
 			go func(p api.PeerInfo) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 				defer cancel()
-				rtt, err := transfer.Probe(ctx, p.Addr, tlsConf)
+				rtt, proto, err := transfer.Probe(ctx, p.Addr, tlsConf)
 				if err != nil {
 					log.Printf("探测 %s(%s) 失败：%v", p.ID, p.Addr, err)
 					return
 				}
 				muEdges.Lock()
-				found = append(found, api.EdgeReport{To: p.ID, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: "quic"})
+				found = append(found, api.EdgeReport{To: p.ID, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto})
 				muEdges.Unlock()
 			}(p)
 		}

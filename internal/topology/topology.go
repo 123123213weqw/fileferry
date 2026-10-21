@@ -91,6 +91,23 @@ func (g *Graph) Addr(id api.NodeID) string {
 	return n.hb.Addr
 }
 
+// EdgeInfo 返回 from→to 这条出边的协议（"quic"/"tcp"），
+// 不存在或陈旧返回空串。
+func (g *Graph) EdgeInfo(from, to api.NodeID) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n, ok := g.nodes[from]
+	if !ok || g.now().Sub(n.seen) >= HeartbeatTimeout {
+		return ""
+	}
+	for _, e := range n.hb.Edges {
+		if e.To == to && e.Proto != "" {
+			return e.Proto
+		}
+	}
+	return ""
+}
+
 type edge struct {
 	to    api.NodeID
 	rttMs float64
