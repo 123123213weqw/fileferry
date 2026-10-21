@@ -713,26 +713,25 @@ func probeLoop() {
 
 // localIPTowardsController 返回"通往 controller 方向"的本机源 IP：
 // controller 在哪个网络里，这个地址就在哪个网络里可达（tailnet 场景
-// 下即 Tailscale IP，其他节点都能直连）。取不到时退化为公网出口 IP。
+// 下即 Tailscale IP，其他节点都能直连）。用 UDP 拨号探测——不实际
+// 发包、只查路由决策，对端零噪音（TCP 拨 TLS 口再挂断会在 controller
+// 日志里留一串假扫描记录）。取不到时退化为公网出口 IP。
 func localIPTowardsController() string {
 	if u, err := url.Parse(cfg.Controller); err == nil {
 		if host := u.Hostname(); host != "" {
-			if c, err := net.DialTimeout("tcp", net.JoinHostPort(host, portOfController()), 2*time.Second); err == nil {
+			port := u.Port()
+			if port == "" {
+				port = "443"
+			}
+			if c, err := net.Dial("udp", net.JoinHostPort(host, port)); err == nil {
 				defer c.Close()
-				if addr, ok := c.LocalAddr().(*net.TCPAddr); ok {
+				if addr, ok := c.LocalAddr().(*net.UDPAddr); ok {
 					return addr.IP.String()
 				}
 			}
 		}
 	}
 	return localIP()
-}
-
-func portOfController() string {
-	if u, err := url.Parse(cfg.Controller); err == nil && u.Port() != "" {
-		return u.Port()
-	}
-	return "443"
 }
 
 func localIP() string {
