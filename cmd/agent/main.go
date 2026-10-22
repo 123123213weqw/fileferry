@@ -373,7 +373,12 @@ func certRenewLoop() {
 					log.Fatal("续期私钥写盘失败：", err)
 				}
 				log.Printf("证书已续期（nodeID=%s），自我重启生效", resp.NodeID)
-				syscall.Exec(os.Args[0], os.Args, os.Environ()) // 原地重启
+				// exec 要求绝对路径：启动时的相对路径换目录后会失败
+				exe, err := os.Executable()
+				if err != nil {
+					exe = os.Args[0]
+				}
+				syscall.Exec(exe, append([]string{exe}, os.Args[1:]...), os.Environ()) // 原地重启
 			}
 		}
 		<-t.C
