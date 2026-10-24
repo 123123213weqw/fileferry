@@ -9,7 +9,7 @@ SRCS := $(shell find cmd internal -name '*.go') go.mod
 
 all: build
 
-build: bin/ff-controller bin/ff-agent bin/ffctl
+build: bin/ff-controller bin/ff-agent bin/ffctl bin/ffmcp
 
 bin/ff-controller: $(SRCS)
 	$(ENV) $(GO) build $(LDFLAGS) -o $@ ./cmd/controller
@@ -32,3 +32,6 @@ clean:
 # 安全审计：依赖漏洞扫描（govulncheck）
 audit:
 	GOTOOLCHAIN=auto GOFLAGS=-mod=mod $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+bin/ffmcp: $(SRCS)
+	$(ENV) $(GO) build $(LDFLAGS) -o $@ ./cmd/ffmcp

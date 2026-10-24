@@ -58,6 +58,21 @@ internal/topology 有向可达图 + 负载加权选链
 internal/transfer QUIC 分块传输 / 断点续传 / 中继
 ```
 
+## 当作 MCP 服务器用（AI agent 原生工具）
+
+`ffmcp` 把传输能力封装为 MCP（Model Context Protocol）工具，ZCode /
+Claude Desktop 等 MCP 客户端可直接调用：
+
+```json
+{"mcpServers": {"fileferry": {
+  "command": "/path/to/ffmcp",
+  "env": {"FF_CERT_DIR": "/home/me/ff-admin",
+          "FF_CONTROLLER": "https://1.2.3.4:9443"}}}}
+```
+
+工具：`ff_send`（阻塞到完成）、`ff_status`（舰队拓扑）、
+`ff_jobs`（任务查询）、`ff_token`（铸入网令牌）。
+
 ## 部署一台新服务器（三步）
 
 ```bash
