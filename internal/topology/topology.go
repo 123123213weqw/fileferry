@@ -41,6 +41,13 @@ func (g *Graph) Apply(h api.Heartbeat) {
 	g.nodes[h.NodeID] = &node{hb: h, seen: g.now()}
 }
 
+// Remove 即刻将节点从图中剔除（吊销用）。
+func (g *Graph) Remove(id api.NodeID) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.nodes, id)
+}
+
 // NodeIDs 返回当前在线的节点。
 func (g *Graph) NodeIDs() []api.NodeID {
 	g.mu.RLock()
@@ -90,6 +97,9 @@ func (g *Graph) Addr(id api.NodeID) string {
 	}
 	return n.hb.Addr
 }
+
+// LoadPct 返回节点当前负载水位（0-100），离线返回 200（评分归零）。
+func (g *Graph) LoadPct(id api.NodeID) float64 { return g.loadPct(id) }
 
 // EdgeDetail 是 from→to 这条出边的细节：拨号协议与实际拨通地址
 //（打洞成功的边是公网映射）。不存在或陈旧时 ok=false。

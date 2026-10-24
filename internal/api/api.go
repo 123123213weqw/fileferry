@@ -197,6 +197,9 @@ type Client struct {
 	HC   *http.Client
 }
 
+// Post 供 ffctl 等外部调用方使用的通用 POST。
+func (c *Client) Post(path string, req, resp any) error { return c.post(path, req, resp) }
+
 func (c *Client) post(path string, req, resp any) error {
 	b, err := json.Marshal(req)
 	if err != nil {

@@ -149,6 +149,17 @@ func main() {
 			fmt.Printf("%-8s %-20s cpu=%3.0f%% mem=%3.0f%% 负载传输=%d 出边=[%s]\n",
 				h.NodeID, h.Hostname, h.CPUPct, h.MemPct, h.ActiveXfers, strings.Join(edges, " "))
 		}
+	case "revoke":
+		if len(rest) != 2 {
+			fmt.Fprintln(os.Stderr, "用法: ffctl revoke <node-id>")
+			os.Exit(2)
+		}
+		var ignored struct{}
+		if err := cl.Post("/v1/revoke", map[string]string{"node": rest[1]}, &ignored); err != nil {
+			fmt.Fprintln(os.Stderr, "吊销失败：", err)
+			os.Exit(1)
+		}
+		fmt.Printf("已吊销 %s（即刻剔除拓扑，旧授权 30 分钟内自然过期）\n", rest[1])
 	case "jobs":
 		jobs, err := cl.Jobs("")
 		if err != nil {

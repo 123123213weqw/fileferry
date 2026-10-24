@@ -49,7 +49,7 @@ type controller struct {
 
 	mu           sync.Mutex
 	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
-	nextID       int64
+	nextID       int64 // 初始化为 Unix 秒，重启后天然错开、永不重复
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
 	punchTried   map[[2]api.NodeID]time.Time
@@ -60,6 +60,7 @@ type controller struct {
 	replicas   map[string]map[api.NodeID]string   // sha256 -> nodeID -> path（M8 多源副本索引）
 	pathBW     map[[2]api.NodeID]float64          // 实测路径吞吐 MB/s（jobdone 回填）
 	indexCache map[api.NodeID][]api.IndexEntry    // 各节点最近索引（查源文件哈希/大小）
+	revoked    map[api.NodeID]bool                // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
 }
 
 type pubEntry struct {
@@ -97,6 +98,8 @@ func main() {
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS events(ts INTEGER, kind TEXT, node TEXT, detail TEXT)`,
 		`CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, src TEXT, dst TEXT, mode TEXT, status TEXT, grant_json TEXT, created INTEGER, updated INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS replicas(sha TEXT, node TEXT, path TEXT, size INTEGER, mtime INTEGER, PRIMARY KEY(sha,node))`,
+		`CREATE TABLE IF NOT EXISTS revoked(node TEXT PRIMARY KEY, ts INTEGER)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			log.Fatal("初始化数据库失败：", err)
@@ -111,19 +114,55 @@ func main() {
 		graph:        topology.New(),
 		db:           db,
 		pending:      map[api.NodeID][]api.TransferGrant{},
+		nextID:       time.Now().Unix(),
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
 		replicas:     map[string]map[api.NodeID]string{},
 		pathBW:       map[[2]api.NodeID]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
+		revoked:      map[api.NodeID]bool{},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
 	}
 
-	// 重启恢复未完成任务（任务与审计持久化于 SQLite）
+	// 重启恢复：未完成任务 + 副本索引 + 吊销名单（全部持久化于 SQLite）
 	if n := c.rehydrate(); n > 0 {
 		log.Printf("恢复未完成任务 %d 条", n)
+	}
+	if rows, err := c.db.Query(`SELECT sha,node,path,size,mtime FROM replicas`); err == nil {
+		n := 0
+		c.mu.Lock()
+		for rows.Next() {
+			var sha, node, path string
+			var size, mtime int64
+			if rows.Scan(&sha, &node, &path, &size, &mtime) != nil {
+				continue
+			}
+			if c.replicas[sha] == nil {
+				c.replicas[sha] = map[api.NodeID]string{}
+			}
+			c.replicas[sha][api.NodeID(node)] = path
+			c.indexCache[api.NodeID(node)] = append(c.indexCache[api.NodeID(node)],
+				api.IndexEntry{Path: path, Size: size, Mtime: mtime, SHA256: sha})
+			n++
+		}
+		c.mu.Unlock()
+		rows.Close()
+		if n > 0 {
+			log.Printf("恢复副本索引 %d 条", n)
+		}
+	}
+	if rows, err := c.db.Query(`SELECT node FROM revoked`); err == nil {
+		c.mu.Lock()
+		for rows.Next() {
+			var node string
+			if rows.Scan(&node) == nil {
+				c.revoked[api.NodeID(node)] = true
+			}
+		}
+		c.mu.Unlock()
+		rows.Close()
 	}
 
 	// M6 打洞回声口：UDP 端口 = 控制端口 + 1。agent 从数据面 socket
@@ -235,6 +274,7 @@ func main() {
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
 	mux.HandleFunc("GET /v1/jobs", c.handleJobs)
 	mux.HandleFunc("POST /v1/index", c.handleIndex)
+	mux.HandleFunc("POST /v1/revoke", c.handleRevoke)
 
 	tlsCfg := rootCA.ServerTLS(tls.Certificate{})
 	tlsCfg.Certificates = nil // 交由 GetCertificate 动态提供（有静态列表时 TLS 不走回调）
@@ -350,6 +390,13 @@ func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodeID := cert.Subject.CommonName
+	c.mu.Lock()
+	revoked := c.revoked[api.NodeID(nodeID)]
+	c.mu.Unlock()
+	if revoked {
+		http.Error(w, "revoked", http.StatusForbidden)
+		return
+	}
 	if !c.limiter.allow("renew:"+nodeID, 1) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
@@ -374,6 +421,39 @@ func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
 }
 
+// handleRevoke：仅 admin。软吊销一个节点：从拓扑/队列/索引中即刻
+// 剔除，拒绝其后续心跳与续期；已签发的旧 grant 在 30 分钟内自然
+// 过期。节点证书作废靠"无处可用"实现（无需 CRL 分发）。
+func (c *controller) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
+		return
+	}
+	var req struct {
+		Node api.NodeID `json:"node"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Node == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	c.mu.Lock()
+	c.revoked[req.Node] = true
+	delete(c.pending, req.Node)
+	delete(c.pendingPunch, req.Node)
+	delete(c.publics, req.Node)
+	delete(c.indexCache, req.Node)
+	for sha, m := range c.replicas {
+		delete(m, req.Node)
+		if len(m) == 0 {
+			delete(c.replicas, sha)
+		}
+	}
+	c.mu.Unlock()
+	c.graph.Remove(req.Node)
+	c.db.Exec(`INSERT OR REPLACE INTO revoked(node,ts) VALUES(?,?)`, req.Node, time.Now().Unix())
+	c.event("revoke", string(req.Node), "")
+	w.WriteHeader(http.StatusOK)
+}
+
 // handleIndex：node 角色上报共享目录索引（全量替换该节点条目）。
 // 副本索引是 M8 多源并行的数据源：同一 sha256 出现在多台 → 可多源。
 func (c *controller) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -394,6 +474,13 @@ func (c *controller) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if rep.NodeID != api.NodeID(cn) {
 		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
 		return
+	}
+	c.db.Exec(`DELETE FROM replicas WHERE node=?`, rep.NodeID)
+	for _, e := range rep.Entries {
+		if e.SHA256 != "" {
+			c.db.Exec(`INSERT OR REPLACE INTO replicas(sha,node,path,size,mtime) VALUES(?,?,?,?,?)`,
+				e.SHA256, rep.NodeID, e.Path, e.Size, e.Mtime)
+		}
 	}
 	c.mu.Lock()
 	c.indexCache[rep.NodeID] = rep.Entries
@@ -610,6 +697,13 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
 		return
 	}
+	c.mu.Lock()
+	revoked := c.revoked[hb.NodeID]
+	c.mu.Unlock()
+	if revoked {
+		http.Error(w, "revoked", http.StatusForbidden)
+		return
+	}
 	// 公网映射以 controller 回声口的观测为准，agent 上报值仅作参考
 	c.mu.Lock()
 	if pe, ok := c.publics[hb.NodeID]; ok && time.Since(pe.seen) < 90*time.Second {
@@ -621,6 +715,13 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	jobs := c.pending[hb.NodeID]
 	delete(c.pending, hb.NodeID)
 	c.mu.Unlock()
+	fresh := jobs[:0]
+	for _, j := range jobs {
+		if time.Now().Before(j.ExpiresAt) {
+			fresh = append(fresh, j)
+		}
+	}
+	jobs = fresh
 	directives := c.pickPunches(&hb)
 	c.mu.Lock()
 	// 另一端排队中的指令（对端发牌时给本端登记的）一并下发，
@@ -744,6 +845,19 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
 	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。
+	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4
+	if sz := c.indexedSize(req.Src, req.SrcPath); sz > 0 {
+		switch {
+		case sz >= 256<<20:
+			grant.Streams = 6
+		case sz >= 64<<20:
+			grant.Streams = 4
+		case sz >= 16<<20:
+			grant.Streams = 3
+		default:
+			grant.Streams = 1
+		}
+	}
 	c.applyMultiSource(&grant)
 	grant.Sign(c.signer)
 	targets := grant.AllSources()
@@ -759,6 +873,18 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	c.event("transfer", req.Src, strings.Join(srcs, "+")+" -> "+req.Dst)
 	json.NewEncoder(w).Encode(grant)
+}
+
+// indexedSize 查源文件大小（索引）。
+func (c *controller) indexedSize(node api.NodeID, path string) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.indexCache[node] {
+		if e.Path == path {
+			return e.Size
+		}
+	}
+	return 0
 }
 
 // applyMultiSource 查副本索引，构造多源分片。源文件的哈希/大小取自
@@ -795,9 +921,11 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 		proto string
 		w     float64
 	}
+	// 候选评分 = 实测带宽 × 负载折扣 100/(100+load)：自动在
+	// "路径快"与"节点闲"之间取最优（多源版的最优负载）
 	cands := []cand{}
 	if proto, addr, ok := c.graph.EdgeDetail(g.Src, g.Dst); ok && addr != "" {
-		w := c.bw(g.Src, g.Dst, 2.0)
+		w := c.score(g.Src, g.Dst, 2.0)
 		cands = append(cands, cand{g.Src, addr, proto, w})
 	}
 	for id := range others {
@@ -805,7 +933,7 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 		if !ok || addr == "" {
 			continue // 无直连边的副本不参与（v1）
 		}
-		cands = append(cands, cand{id, addr, proto, c.bw(id, g.Dst, 1.0)})
+		cands = append(cands, cand{id, addr, proto, c.score(id, g.Dst, 1.0)})
 	}
 	if len(cands) < 2 {
 		return
@@ -840,14 +968,16 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 	log.Printf("多源并行：%d 副本，%d 块分区", len(g.Sources), totalChunks)
 }
 
-// bw 取路径实测吞吐（MB/s），无记录用缺省值。
-func (c *controller) bw(from, to api.NodeID, def float64) float64 {
+// score 候选评分：实测带宽 × 负载折扣 100/(100+load)。
+func (c *controller) score(from, to api.NodeID, defBW float64) float64 {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	bw := defBW
 	if v, ok := c.pathBW[[2]api.NodeID{from, to}]; ok && v > 0 {
-		return v
+		bw = v
 	}
-	return def
+	c.mu.Unlock()
+	load := c.graph.LoadPct(to)
+	return bw * 100.0 / (100.0 + load)
 }
 
 // handleJobDone：agent 回报任务结果，node 角色。

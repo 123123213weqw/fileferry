@@ -17,6 +17,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"bufio"
 	"context"
 	"crypto/sha256"
@@ -686,6 +687,11 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		return
 	}
 	g, err := groupFor(grant, &mf)
+	if err == ErrAlreadyDone {
+		stream.Write([]byte("ACK\n"))
+		fmt.Printf("迟到流确认：%s（文件此前已完整落盘）\n", grant.ID)
+		return
+	}
 	if err != nil {
 		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
 		return
@@ -734,6 +740,9 @@ type recvGroup struct {
 	done      bool
 }
 
+// ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
+var ErrAlreadyDone = errors.New("grant 已完成")
+
 var (
 	recvMu     sync.Mutex
 	recvGroups = map[string]*recvGroup{}
@@ -747,7 +756,9 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 	recvMu.Lock()
 	defer recvMu.Unlock()
 	if t, ok := completed[grant.ID]; ok && time.Since(t) < 2*time.Hour {
-		return nil, fmt.Errorf("grant 已完成，拒绝重放")
+		// 文件已完整落盘：不是攻击，是发送端重试流晚到。回 ACK 让
+		// 对端成功收尾（"文件到达但任务报失败"的收尾问题）。
+		return nil, ErrAlreadyDone
 	}
 	if g, ok := recvGroups[grant.ID]; ok {
 		return g, nil
@@ -902,27 +913,38 @@ func relayStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, self
 	wg.Wait()
 }
 
-// Probe 探测一个数据面地址：先 QUIC（UDP），失败回退 TCP（约定端口
-// +1）。返回往返时延与实际可用的协议。
+// Probe 探测一个数据面地址：QUIC 与 TCP 各测一次往返，都通时若
+// TCP 的 RTT 不劣于 QUIC 的 1.5 倍则选 TCP——UDP 被策略限速的网络
+// 里 TCP 吞吐常有数量级优势（实测 4.5×），RTT 相近时应优选；
+// UDP 被禁则自然回退 TCP。返回往返时延与选定协议。
 func Probe(ctx context.Context, addr string, tlsConf *tls.Config) (rtt time.Duration, proto string, err error) {
-	start := time.Now()
-	s, closeConn, derr := DialStream(ctx, addr, "quic", tlsConf)
-	if derr == nil {
-		defer closeConn()
-		if _, err = pingPong(s); err == nil {
-			return time.Since(start), "quic", nil
-		}
+	qRTT, qErr := probeOne(ctx, addr, "quic", tlsConf)
+	tRTT, tErr := probeOne(ctx, addr, "tcp", tlsConf)
+	switch {
+	case qErr != nil && tErr != nil:
+		return 0, "", tErr
+	case qErr != nil:
+		return tRTT, "tcp", nil
+	case tErr != nil:
+		return qRTT, "quic", nil
+	case tRTT < qRTT*3/2:
+		return tRTT, "tcp", nil // RTT 接近 → TCP（吞吐优先）
+	default:
+		return qRTT, "quic", nil
 	}
-	start = time.Now()
-	s, closeConn, derr = DialStream(ctx, addr, "tcp", tlsConf)
-	if derr != nil {
-		return 0, "", derr
+}
+
+func probeOne(ctx context.Context, addr, proto string, tlsConf *tls.Config) (time.Duration, error) {
+	start := time.Now()
+	s, closeConn, err := DialStream(ctx, addr, proto, tlsConf)
+	if err != nil {
+		return 0, err
 	}
 	defer closeConn()
-	if _, err = pingPong(s); err != nil {
-		return 0, "", err
+	if _, err := pingPong(s); err != nil {
+		return 0, err
 	}
-	return time.Since(start), "tcp", nil
+	return time.Since(start), nil
 }
 
 func pingPong(s Stream) (int, error) {
