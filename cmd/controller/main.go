@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,10 @@ type controller struct {
 	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
 	ledger       *enrollLedger                        // 持久化核销台账
 	limiter      *rateLimiter
+
+	replicas   map[string]map[api.NodeID]string   // sha256 -> nodeID -> path（M8 多源副本索引）
+	pathBW     map[[2]api.NodeID]float64          // 实测路径吞吐 MB/s（jobdone 回填）
+	indexCache map[api.NodeID][]api.IndexEntry    // 各节点最近索引（查源文件哈希/大小）
 }
 
 type pubEntry struct {
@@ -108,6 +113,9 @@ func main() {
 		pending:      map[api.NodeID][]api.TransferGrant{},
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
+		replicas:     map[string]map[api.NodeID]string{},
+		pathBW:       map[[2]api.NodeID]float64{},
+		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
@@ -226,6 +234,7 @@ func main() {
 	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
 	mux.HandleFunc("GET /v1/jobs", c.handleJobs)
+	mux.HandleFunc("POST /v1/index", c.handleIndex)
 
 	tlsCfg := rootCA.ServerTLS(tls.Certificate{})
 	tlsCfg.Certificates = nil // 交由 GetCertificate 动态提供（有静态列表时 TLS 不走回调）
@@ -241,6 +250,19 @@ func main() {
 	}
 	log.Printf("controller 监听 %s（数据目录 %s，自身证书自动续期已启用）", cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
+}
+
+// lookupGrantDst 从任务表反查目的端（吞吐回填用）。
+func (c *controller) lookupGrantDst(id string) api.NodeID {
+	var gj string
+	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, id).Scan(&gj); err != nil {
+		return ""
+	}
+	var g api.TransferGrant
+	if json.Unmarshal([]byte(gj), &g) != nil {
+		return ""
+	}
+	return g.Dst
 }
 
 // rehydrate 从 SQLite 恢复未完成任务到内存队列。
@@ -350,6 +372,62 @@ func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 	c.event("renew", nodeID, "")
 	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
+}
+
+// handleIndex：node 角色上报共享目录索引（全量替换该节点条目）。
+// 副本索引是 M8 多源并行的数据源：同一 sha256 出现在多台 → 可多源。
+func (c *controller) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	cn := r.TLS.PeerCertificates[0].Subject.CommonName
+	if !c.limiter.allow("index:"+cn, 1) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	var rep api.IndexReport
+	if err := json.NewDecoder(r.Body).Decode(&rep); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if rep.NodeID != api.NodeID(cn) {
+		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
+		return
+	}
+	c.mu.Lock()
+	c.indexCache[rep.NodeID] = rep.Entries
+	// 全量替换：先移除该节点旧条目，再插入新条目
+	for sha, m := range c.replicas {
+		delete(m, rep.NodeID)
+		if len(m) == 0 {
+			delete(c.replicas, sha)
+		}
+	}
+	for _, e := range rep.Entries {
+		if e.SHA256 == "" {
+			continue
+		}
+		if c.replicas[e.SHA256] == nil {
+			c.replicas[e.SHA256] = map[api.NodeID]string{}
+		}
+		c.replicas[e.SHA256][rep.NodeID] = e.Path
+	}
+	c.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+// lookupReplicas 返回持有该哈希的其他在线节点（node -> path）。
+func (c *controller) lookupReplicas(sha string, exclude map[api.NodeID]bool) map[api.NodeID]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := map[api.NodeID]string{}
+	for node, path := range c.replicas[sha] {
+		if !exclude[node] && c.graph.Addr(node) != "" {
+			out[node] = path
+		}
+	}
+	return out
 }
 
 // handleJobs：仅 admin。任务列表（含状态），支持 ?id= 精确查——
@@ -664,13 +742,112 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 	}
+	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
+	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。
+	c.applyMultiSource(&grant)
 	grant.Sign(c.signer)
+	targets := grant.AllSources()
 	c.mu.Lock()
-	c.pending[req.Src] = append(c.pending[req.Src], grant) // 投递到源节点队列，随下次心跳下发
+	for _, t := range targets {
+		c.pending[t] = append(c.pending[t], grant) // 每个源各收一份，各取自己的区间
+	}
 	c.mu.Unlock()
 	c.jobPersist(&grant)
-	c.event("transfer", req.Src, req.Src+" -> "+req.Dst)
+	srcs := make([]string, 0, len(targets))
+	for _, t := range targets {
+		srcs = append(srcs, string(t))
+	}
+	c.event("transfer", req.Src, strings.Join(srcs, "+")+" -> "+req.Dst)
 	json.NewEncoder(w).Encode(grant)
+}
+
+// applyMultiSource 查副本索引，构造多源分片。源文件的哈希/大小取自
+// 源节点的索引（索引缺失则退化为单源——安全无副作用）。
+func (c *controller) applyMultiSource(g *api.TransferGrant) {
+	c.mu.Lock()
+	var size int64
+	var sha string
+	for _, e := range c.indexCache[g.Src] {
+		if e.Path == g.SrcPath {
+			size, sha = e.Size, e.SHA256
+			break
+		}
+	}
+	c.mu.Unlock()
+	if sha == "" || size <= 0 {
+		return
+	}
+	others := c.lookupReplicas(sha, map[api.NodeID]bool{g.Src: true, g.Dst: true})
+	if len(others) == 0 {
+		return
+	}
+	g.FileSHA256 = sha
+	g.FileSize = size
+	totalChunks := (size + int64(g.ChunkSize) - 1) / int64(g.ChunkSize)
+	if totalChunks < 4 {
+		return // 太小不值得分片
+	}
+	// 权重：源本身按其到目的的实测带宽（缺省 2MB/s），副本按各自
+	// 实测带宽（缺省 1MB/s——副本路径通常未经实测，保守起步）
+	type cand struct {
+		id    api.NodeID
+		addr  string
+		proto string
+		w     float64
+	}
+	cands := []cand{}
+	if proto, addr, ok := c.graph.EdgeDetail(g.Src, g.Dst); ok && addr != "" {
+		w := c.bw(g.Src, g.Dst, 2.0)
+		cands = append(cands, cand{g.Src, addr, proto, w})
+	}
+	for id := range others {
+		proto, addr, ok := c.graph.EdgeDetail(id, g.Dst)
+		if !ok || addr == "" {
+			continue // 无直连边的副本不参与（v1）
+		}
+		cands = append(cands, cand{id, addr, proto, c.bw(id, g.Dst, 1.0)})
+	}
+	if len(cands) < 2 {
+		return
+	}
+	var wsum float64
+	for _, cd := range cands {
+		wsum += cd.w
+	}
+	g.Sources = nil
+	var cursor int64
+	for _, cd := range cands {
+		share := int64(float64(totalChunks) * cd.w / wsum)
+		if share < 1 {
+			share = 1
+		}
+		end := cursor + share
+		if end > totalChunks {
+			end = totalChunks
+		}
+		g.Sources = append(g.Sources, api.SourceSpec{
+			NodeID: cd.id, Addr: cd.addr, Proto: cd.proto, Start: cursor, End: end,
+		})
+		cursor = end
+		if cursor >= totalChunks {
+			break
+		}
+	}
+	// 兜底：最后一个源吃掉剩余全部
+	if cursor < totalChunks && len(g.Sources) > 0 {
+		g.Sources[len(g.Sources)-1].End = totalChunks
+	}
+	log.Printf("多源并行：%d 副本，%d 块分区", len(g.Sources), totalChunks)
+}
+
+// bw 取路径实测吞吐（MB/s），无记录用缺省值。
+func (c *controller) bw(from, to api.NodeID, def float64) float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.pathBW[[2]api.NodeID{from, to}]; ok && v > 0 {
+		return v
+	}
+	return def
 }
 
 // handleJobDone：agent 回报任务结果，node 角色。
@@ -691,6 +868,13 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 	if req.OK {
 		log.Printf("任务 %s 完成（%s）", req.GrantID, req.NodeID)
 		c.jobUpdate(req.GrantID, "done")
+		if req.Bytes > 0 && req.Duration > 0 {
+			if dst := c.lookupGrantDst(req.GrantID); dst != "" {
+				c.mu.Lock()
+				c.pathBW[[2]api.NodeID{req.NodeID, dst}] = float64(req.Bytes) / req.Duration / 1e6
+				c.mu.Unlock()
+			}
+		}
 	} else {
 		log.Printf("任务 %s 失败（%s）：%s", req.GrantID, req.NodeID, req.Err)
 		c.jobUpdate(req.GrantID, "failed")

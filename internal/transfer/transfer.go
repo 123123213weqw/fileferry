@@ -268,8 +268,15 @@ func (m *Manifest) Verify(grant *api.TransferGrant, roots *x509.CertPool) error 
 	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, CurrentTime: time.Now()}); err != nil {
 		return fmt.Errorf("manifest: 证书链无效: %w", err)
 	}
-	if cert.Subject.CommonName != grant.Src {
-		return fmt.Errorf("manifest: 签名者 %s 不是源端 %s", cert.Subject.CommonName, grant.Src)
+	srcOK := cert.Subject.CommonName == grant.Src
+	for _, sp := range grant.Sources { // M8 多源：任一源签的清单均可
+		if cert.Subject.CommonName == sp.NodeID {
+			srcOK = true
+			break
+		}
+	}
+	if !srcOK {
+		return fmt.Errorf("manifest: 签名者 %s 不在源集合", cert.Subject.CommonName)
 	}
 	pub, ok := cert.PublicKey.(ed25519.PublicKey)
 	if !ok {
@@ -287,18 +294,23 @@ func (m *Manifest) Verify(grant *api.TransferGrant, roots *x509.CertPool) error 
 // StreamOpener 建立一条数据面流（常规拨号或交换台配对）。
 type StreamOpener func() (Stream, func(), error)
 
-// SendFile 计算并签名传输清单（manifest），经 open 建立的流发出。
-// grant.Streams > 1 时并行开多条连接，交错分块——绕过按流的 UDP
-// 限速、填满带宽延迟积。
-// TODO(M2.5)：限速（grant.RateLimit）、按已完成块续传。
-func SendFile(ctx context.Context, path string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant) error {
+// SendFile 发送整个文件（单源模式）。
+func SendFile(ctx context.Context, path string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant) (int64, error) {
+	return SendFileRange(ctx, path, open, tlsConf, grant, 0, -1)
+}
+
+// SendFileRange 计算并签名传输清单（manifest），经 open 建立的流发出
+// 块区间 [startCh, endCh)（endCh<0 = 到文件尾）。多源模式各源只发
+// 自己的区间；接收端按块号稀疏写，天然汇聚。返回发送字节数。
+// grant.Streams 是本源的并行连接数，区间内交错分块。
+func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant, startCh, endCh int64) (int64, error) {
 	mf, err := BuildManifest(grant.ID, path, tlsConf)
 	if err != nil {
-		return fmt.Errorf("构建清单失败: %w", err)
+		return 0, fmt.Errorf("构建清单失败: %w", err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 	n := grant.Streams
@@ -311,17 +323,17 @@ func SendFile(ctx context.Context, path string, open StreamOpener, tlsConf *tls.
 		wg.Add(1)
 		go func(r int) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, open, grant, mf, r, n)
+			errCh <- sendShare(ctx, f, open, grant, mf, startCh, endCh, r, n)
 		}(r)
 	}
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return mf.Size, nil
 }
 
 // OpenerDirect 返回常规模式的建流函数（拨 firstHop）。
@@ -371,7 +383,21 @@ func DialSwitch(ctx context.Context, addr, proto string, tlsConf *tls.Config, gr
 
 // sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
 // 保证各连接进度均衡。流头为 grant 行 + manifest 行，然后是数据帧。
-func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, r, n int) error {
+func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, startCh, endCh int64, r, n int) error {
+	// 连接失败/中断 → 重连重发整个份额（最多 3 次）：多流交错下
+	// 单条连接的块缺口会让收发两端同时死等，必须自愈
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := sendShareOnce(ctx, f, open, grant, mf, startCh, endCh, r, n); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return fmt.Errorf("份额 [%d,%d) 第 %d 流 3 次尝试均失败: %w", startCh, endCh, r, lastErr)
+}
+
+func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, startCh, endCh int64, r, n int) error {
 	stream, closeConn, err := open()
 	if err != nil {
 		return fmt.Errorf("建流失败: %w", err)
@@ -391,7 +417,10 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 	}
 
 	buf := make([]byte, ChunkSize)
-	for idx := int64(r); ; idx += int64(n) {
+	if wd, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		wd.SetWriteDeadline(time.Now().Add(5 * time.Minute)) // 写阻塞自断，交给份额重试
+	}
+	for idx := startCh + int64(r); endCh < 0 || idx < endCh; idx += int64(n) {
 		nread, rerr := f.ReadAt(buf, idx*ChunkSize)
 		if nread > 0 {
 			if err := WriteFrame(stream, idx, buf[:nread]); err != nil {

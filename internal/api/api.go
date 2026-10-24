@@ -92,12 +92,15 @@ type EnrollResponse struct {
 	SignPubPEM string `json:"sign_pub_pem"` // grant 验签公钥
 }
 
-// DoneRequest 是 agent 回报任务执行结果。
+// DoneRequest 是 agent 回报任务执行结果。Bytes/Duration 用于
+// controller 回填路径实测吞吐（多源调度按带宽分配块区间）。
 type DoneRequest struct {
-	GrantID string `json:"grant_id"`
-	NodeID  NodeID `json:"node_id"`
-	OK      bool   `json:"ok"`
-	Err     string `json:"err,omitempty"`
+	GrantID  string `json:"grant_id"`
+	NodeID   NodeID `json:"node_id"`
+	OK       bool   `json:"ok"`
+	Err      string `json:"err,omitempty"`
+	Bytes    int64  `json:"bytes,omitempty"`
+	Duration float64 `json:"duration_s,omitempty"`
 }
 
 // TransferRequest 是 ffctl 发起的按需传输请求。
@@ -132,14 +135,40 @@ type TransferGrant struct {
 	Mode       string    `json:"mode,omitempty"`
 	Hops       []Hop     `json:"hops"` // 完整路径：源端、各中继/交换台、目的端
 	Relays     []NodeID  `json:"relays"`
+	// Sources 是 M8 多源并行：文件存在多份副本时，controller 把块
+	// 区间按路径带宽分配给各源，目的端同时从多台拉不同块——叠加
+	// 各"源-目的对"独立的限速配额。为空时单源（Hops[1]）。每个源
+	// 节点收到同一份 grant，各取自己的区间发送。
+	Sources    []SourceSpec `json:"sources,omitempty"`
 	SrcPath    string    `json:"src_path"`
 	DstPath    string    `json:"dst_path"`
 	FileSHA256 string    `json:"file_sha256"`
+	FileSize   int64     `json:"file_size"`
 	ChunkSize  int       `json:"chunk_size"`
-	Streams    int       `json:"streams"` // 并行连接数：绕 per-flow 限速、填满带宽延迟积
+	Streams    int       `json:"streams"` // 每源的并行连接数：绕 per-flow 限速、填满带宽延迟积
 	RateLimit  int64     `json:"rate_limit_bps"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
+}
+
+// SourceSpec 是多源 grant 中一个源的分片：负责块区间 [Start, End)。
+type SourceSpec struct {
+	NodeID NodeID `json:"node_id"`
+	Addr   string `json:"addr"`
+	Proto  string `json:"proto"`
+	Start  int64  `json:"start"` // 起始块号（含）
+	End    int64  `json:"end"`   // 结束块号（不含）
+}
+
+// AllSources 返回参与发送的全部节点 ID（含主源）。
+func (g *TransferGrant) AllSources() []NodeID {
+	out := []NodeID{g.Src}
+	for _, s := range g.Sources {
+		if s.NodeID != g.Src {
+			out = append(out, s.NodeID)
+		}
+	}
+	return out
 }
 
 // payload 返回待签名字节（不含 Sig 本身）。
@@ -282,6 +311,27 @@ func (c *Client) Renew() (*RenewResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+
+// IndexEntry 是 agent 上报的共享目录文件索引（M8 多源副本发现）。
+// SHA256 由 agent 后台计算并缓存（size+mtime 不变不重算）。
+type IndexEntry struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Mtime  int64  `json:"mtime"`
+	SHA256 string `json:"sha256"`
+}
+
+// IndexReport 是全量索引上报（替换该节点的全部旧条目）。
+type IndexReport struct {
+	NodeID  NodeID       `json:"node_id"`
+	Entries []IndexEntry `json:"entries"`
+}
+
+func (c *Client) Index(rep IndexReport) error {
+	var ignored struct{}
+	return c.post("/v1/index", rep, &ignored)
 }
 
 func TokenHash(token string) string {

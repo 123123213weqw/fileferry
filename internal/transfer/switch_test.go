@@ -88,7 +88,7 @@ func TestSwitchTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	swHop := api.Hop{NodeID: "sw", Addr: swQ, Proto: "quic"}
-	if err := SendFile(ctx, srcPath, OpenerSwitch(ctx, swHop, clientTLSFor(t, root, "src"), grant), clientTLSFor(t, root, "src"), grant); err != nil {
+	if _, err := SendFile(ctx, srcPath, OpenerSwitch(ctx, swHop, clientTLSFor(t, root, "src"), grant), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("交换台模式发送失败：%v", err)
 	}
 	wg.Wait()
@@ -130,4 +130,76 @@ func TestManifestTamper(t *testing.T) {
 	if err := bad2.Verify(other, root.Pool()); err == nil {
 		t.Fatal("跨 grant 重用的清单必须被拒绝")
 	}
+}
+
+// TestMultiSource 双源一目的：同一文件两份副本各发自己的块区间，
+// 接收端稀疏写汇聚，逐字节一致。
+func TestMultiSource(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify := func(g *api.TransferGrant) bool { return g.Verify(pub) }
+
+	s1Q, stop1 := startNode(t, "src1", root, verify)
+	s2Q, stop2 := startNode(t, "src2", root, verify)
+	dstQ, stopD := startNode(t, "dst", root, verify)
+	defer stop1()
+	defer stop2()
+	defer stopD()
+
+	dir := t.TempDir()
+	payload := make([]byte, 10*1024*1024) // 10MB = 3 块（4MB 块）
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	// 两份副本（路径不同，内容相同）
+	p1 := filepath.Join(dir, "copy1.bin")
+	p2 := filepath.Join(dir, "copy2.bin")
+	os.WriteFile(p1, payload, 0o600)
+	os.WriteFile(p2, payload, 0o600)
+	dstPath := filepath.Join(dir, "out", "d.bin")
+
+	grant := &api.TransferGrant{
+		ID: "xfer-ms", Src: "src1", Dst: "dst", Streams: 1,
+		Hops:    []api.Hop{{NodeID: "src1"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}, {NodeID: "dst"}},
+		SrcPath: p1, DstPath: dstPath,
+		// 块 0-1 给 src1，块 2 给 src2（10MB/4MB=3 块）
+		Sources: []api.SourceSpec{
+			{NodeID: "src1", Addr: dstQ, Proto: "quic", Start: 0, End: 2},
+			{NodeID: "src2", Addr: dstQ, Proto: "quic", Start: 2, End: 3},
+		},
+	}
+	grant.Sign(priv)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // src2 发自己的区间
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := SendFileRange(ctx, p2, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src2")), clientTLSFor(t, root, "src2"), grant, 2, 3); err != nil {
+			t.Errorf("src2 分片失败：%v", err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := SendFileRange(ctx, p1, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src1")), clientTLSFor(t, root, "src1"), grant, 0, 2); err != nil {
+		t.Fatalf("src1 分片失败：%v", err)
+	}
+	wg.Wait()
+
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("目的文件未落盘：%v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("多源汇聚不一致：%d vs %d 字节", len(payload), len(got))
+	}
+	_ = s1Q
+	_ = s2Q
 }

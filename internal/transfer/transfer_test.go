@@ -120,7 +120,7 @@ func TestParallelStreams(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
+	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("并行发送失败：%v", err)
 	}
 	got, err := os.ReadFile(dstPath)
@@ -168,7 +168,7 @@ func TestRelayTransferQUIC(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
+	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("经中继发送失败：%v", err)
 	}
 	got, err := os.ReadFile(dstPath)
@@ -232,7 +232,7 @@ func TestDirectTransferTCP(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
+	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("TCP 直传失败：%v", err)
 	}
 	got, err := os.ReadFile(dstPath)
@@ -273,7 +273,7 @@ func TestRelayRejectsUnknownNode(t *testing.T) {
 	defer cancel()
 	// innocent 节点验签通过但发现自己不在路径上，拒绝转发并断流，
 	// 发送端应得到错误而非成功
-	if err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "a")), clientTLSFor(t, root, "a"), grant); err == nil {
+	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "a")), clientTLSFor(t, root, "a"), grant); err == nil {
 		t.Fatal("不应成功：中继节点不在路径上，应拒绝且发送失败")
 	}
 }

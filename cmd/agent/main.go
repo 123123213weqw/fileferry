@@ -9,6 +9,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
@@ -49,6 +51,10 @@ type Config struct {
 	// AllowedDirs 落盘路径白名单：源路径与目的路径都必须位于其中，
 	// 恶意授权也写不了白名单外（如 /etc）。空 = 不限制。
 	AllowedDirs []string `yaml:"allowed-dirs"`
+	// ShareDir 共享目录：M8 多源副本发现的数据源，agent 定期扫描
+	// 并上报文件索引（后台算哈希，mtime 不变不重算）。空 = 用第一
+	// 个 allowed-dir；再为空则不参与多源。
+	ShareDir string `yaml:"share-dir"`
 }
 
 var (
@@ -144,6 +150,10 @@ func run(cfgPath string) error {
 	running = map[string]bool{}
 	punched = map[string]string{}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
+
+	if shareDir() != "" {
+		go indexLoop()
+	}
 
 	// 2. 心跳 / 探测 / WHOAMI 保活 / 证书续期
 	go heartbeatLoop()
@@ -385,6 +395,79 @@ func certRenewLoop() {
 	}
 }
 
+// shareDir 返回多源共享目录：显式配置 > 第一个 allowed-dir > 空。
+func shareDir() string {
+	if cfg.ShareDir != "" {
+		return cfg.ShareDir
+	}
+	if len(cfg.AllowedDirs) > 0 {
+		return cfg.AllowedDirs[0]
+	}
+	return ""
+}
+
+// indexLoop 定期扫描共享目录并向 controller 上报文件索引。哈希缓存
+// 在 data-dir（size+mtime 命中不重算），大文件的哈希只算一次。
+func indexLoop() {
+	dir := shareDir()
+	type cached struct {
+		Size  int64  `json:"size"`
+		Mtime int64  `json:"mtime"`
+		SHA   string `json:"sha256"`
+	}
+	cachePath := filepath.Join(cfg.DataDir, "index-cache.json")
+	cache := map[string]cached{}
+	if b, err := os.ReadFile(cachePath); err == nil {
+		json.Unmarshal(b, &cache)
+	}
+	save := func() {
+		if b, err := json.Marshal(cache); err == nil {
+			os.WriteFile(cachePath, b, 0o600)
+		}
+	}
+	scan := func() {
+		entries := []api.IndexEntry{}
+		filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || strings.HasPrefix(d.Name(), ".ff-") {
+				return nil // 跳过临时文件
+			}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			key := p
+			c, hit := cache[key]
+			if !hit || c.Size != info.Size() || c.Mtime != info.ModTime().Unix() {
+				f, err := os.Open(p)
+				if err != nil {
+					return nil
+				}
+				h := sha256.New()
+				io.Copy(h, f)
+				f.Close()
+				c = cached{info.Size(), info.ModTime().Unix(), hex.EncodeToString(h.Sum(nil))}
+				cache[key] = c
+			}
+			entries = append(entries, api.IndexEntry{
+				Path: p, Size: c.Size, Mtime: c.Mtime, SHA256: c.SHA,
+			})
+			return nil
+		})
+		save()
+		if err := hbClient.Index(api.IndexReport{NodeID: nodeID, Entries: entries}); err != nil {
+			log.Println("索引上报失败：", err)
+		} else {
+			log.Printf("索引已上报：%d 个文件", len(entries))
+		}
+	}
+	scan()
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		scan()
+	}
+}
+
 func heartbeatLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -580,8 +663,14 @@ func runJob(g api.TransferGrant) {
 		mu.Unlock()
 	}()
 
+	startTime := time.Now()
+	sentBytes := int64(0)
 	done := func(ok bool, errStr string) {
-		if err := hbClient.JobDone(api.DoneRequest{GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr}); err != nil {
+		d := time.Since(startTime).Seconds()
+		if err := hbClient.JobDone(api.DoneRequest{
+			GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr,
+			Bytes: sentBytes, Duration: d,
+		}); err != nil {
 			log.Println("回报失败：", err)
 		}
 	}
@@ -604,14 +693,31 @@ func runJob(g api.TransferGrant) {
 		done(false, "grant 路径不完整")
 		return
 	}
-	var open transfer.StreamOpener
+	// 多源模式：本节点只发自己分到的块区间 [Start, End)；单源模式
+	// 发全文件。找不到自己的分片则忽略（这份 grant 是发给别的源的）。
+	var startCh, endCh int64 = 0, -1
+	var hopAddr, hopProto string
 	via := ""
-	switch g.Mode {
-	case "switch":
-		open = transfer.OpenerSwitch(ctx, g.Hops[1], tlsConf, &g)
+	switch {
+	case len(g.Sources) > 0:
+		mine := -1
+		for i, sp := range g.Sources {
+			if sp.NodeID == nodeID {
+				mine = i
+				break
+			}
+		}
+		if mine < 0 {
+			return // 不是我的分片
+		}
+		startCh, endCh = g.Sources[mine].Start, g.Sources[mine].End
+		hopAddr, hopProto = g.Sources[mine].Addr, g.Sources[mine].Proto
+		via = fmt.Sprintf("（多源分片 [%d,%d)）", startCh, endCh)
+	case g.Mode == "switch":
+		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
 		via = fmt.Sprintf("（经 %s 交换台对接）", g.Hops[1].NodeID)
 	default:
-		open = transfer.OpenerDirect(ctx, g.Hops[1], tlsConf)
+		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
 		if len(g.Hops) > 2 {
 			ids := make([]string, 0, len(g.Hops)-2)
 			for _, h := range g.Hops[1 : len(g.Hops)-1] {
@@ -620,14 +726,22 @@ func runJob(g api.TransferGrant) {
 			via = "（经 " + strings.Join(ids, " -> ") + " 中继）"
 		}
 	}
-	start := time.Now()
-	if err := transfer.SendFile(ctx, g.SrcPath, open, tlsConf, &g); err != nil {
+	// switch 模式建流走配对；直连/多源直接拨
+	var open transfer.StreamOpener
+	if g.Mode == "switch" {
+		open = transfer.OpenerSwitch(ctx, g.Hops[1], tlsConf, &g)
+	} else {
+		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto}
+		open = transfer.OpenerDirect(ctx, hop, tlsConf)
+	}
+	sentBytes, err := transfer.SendFileRange(ctx, g.SrcPath, open, tlsConf, &g, startCh, endCh)
+	if err != nil {
 		done(false, err.Error())
 		log.Printf("任务 %s 失败：%v", g.ID, err)
 		return
 	}
 	done(true, "")
-	log.Printf("任务 %s 完成：%s -> %s%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, via, time.Since(start).Round(time.Millisecond))
+	log.Printf("任务 %s 完成：%s -> %s%s（耗时 %s）", g.ID, g.SrcPath, g.Dst, via, time.Since(startTime).Round(time.Millisecond))
 }
 
 // runSwitchRecv 交换台模式的目的端：按 grant.Streams 出站拨向交换台
