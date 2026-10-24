@@ -1,0 +1,79 @@
+name: CI
+
+# 守住两件曾经出过事的事：
+#   1. 依赖漏声明导致干净克隆编不出来（f808635 之前 go.mod 只有两行）
+#   2. 代码能过编译但测试不过
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 只用 setup-go 装好的工具链，不在 CI 里偷偷下载别的版本：
+  # go.mod 里的 go 指令若与实际工具链不符，这里会直接失败而不是静默降级。
+  GOTOOLCHAIN: local
+
+jobs:
+  build:
+    name: 构建 / 静态检查 / 依赖一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 依赖版本
+        run: go version
+
+      - name: go.mod / go.sum 与代码保持一致
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod/go.sum 与代码不同步，请在本地执行 'go mod tidy' 并提交结果"
+            exit 1
+          fi
+
+      - name: 构建（依赖缺失即失败）
+        run: CGO_ENABLED=0 GOFLAGS=-mod=readonly go build ./...
+
+      - name: 校验已下载模块的校验和
+        run: go mod verify
+
+      - name: go vet
+        run: GOFLAGS=-mod=readonly go vet ./...
+
+      # README「快速开始」的第一条命令，别让它悄悄坏掉
+      - name: make build
+        run: make build
+
+      - name: 产物存在
+        run: |
+          for b in ff-controller ff-agent ffctl; do
+            test -x "bin/$b" || { echo "::error::缺少产物 bin/$b"; exit 1; }
+          done
+          ls -l bin/
+
+  test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test（含竞态检测）
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
