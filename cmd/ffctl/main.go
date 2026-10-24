@@ -7,11 +7,13 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"fileferry/internal/api"
 	"fileferry/internal/ca"
@@ -27,6 +29,8 @@ TODO(M5)：独立的管理员令牌，无需借用节点证书。`
 func main() {
 	certDir := ""
 	controller := "https://127.0.0.1:8443"
+	jsonOut := false
+	noWait := false
 	args := os.Args[1:]
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -39,6 +43,14 @@ func main() {
 				}
 			}
 			i++
+			continue
+		}
+		if args[i] == "-json" {
+			jsonOut = true
+			continue
+		}
+		if args[i] == "-nowait" {
+			noWait = true
 			continue
 		}
 		rest = args[i:]
@@ -81,11 +93,35 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("已签发 %s：%s -> %s", grant.ID, grant.Src, grant.Dst)
-		if len(grant.Relays) > 0 {
+		if grant.Mode == "switch" {
+			fmt.Printf("（交换台 %s 对接）", grant.Hops[1].NodeID)
+		} else if len(grant.Relays) > 0 {
 			fmt.Printf("（经 %s 中继）", strings.Join(grant.Relays, " -> "))
 		}
-		fmt.Println("；任务已入队，源节点下次心跳（≤5s）后开始执行")
-		// TODO(M2)：等待传输完成与状态查询
+		if noWait {
+			fmt.Println("；任务已入队（-nowait：不等待完成）")
+			return
+		}
+		// 默认等待完成：轮询任务状态，退出码反映结果（agent/脚本友好）
+		fmt.Println("；等待完成…")
+		deadline := time.Now().Add(10 * time.Minute)
+		for time.Now().Before(deadline) {
+			time.Sleep(2 * time.Second)
+			jobs, err := cl.Jobs(grant.ID)
+			if err != nil || len(jobs) == 0 {
+				continue
+			}
+			switch jobs[0].Status {
+			case "done":
+				fmt.Printf("完成：%s（%s -> %s）\n", jobs[0].ID, jobs[0].Src, jobs[0].Dst)
+				return
+			case "failed":
+				fmt.Fprintf(os.Stderr, "失败：%s（%s -> %s）\n", jobs[0].ID, jobs[0].Src, jobs[0].Dst)
+				os.Exit(1)
+			}
+		}
+		fmt.Fprintln(os.Stderr, "超时：10 分钟内未完成（可用 -nowait 改为只入队）")
+		os.Exit(1)
 	case "token":
 		// 铸造一枚一次性入网令牌：打印后由管理员加入 controller
 		// 配置的 enroll-tokens 并重启 controller，再交给新服务器
@@ -101,6 +137,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "状态查询失败：", err)
 			os.Exit(1)
 		}
+		if jsonOut { // 机器可读输出（agent/脚本）
+			json.NewEncoder(os.Stdout).Encode(hbs)
+			return
+		}
 		for _, h := range hbs {
 			edges := make([]string, 0, len(h.Edges))
 			for _, e := range h.Edges {
@@ -108,6 +148,19 @@ func main() {
 			}
 			fmt.Printf("%-8s %-20s cpu=%3.0f%% mem=%3.0f%% 负载传输=%d 出边=[%s]\n",
 				h.NodeID, h.Hostname, h.CPUPct, h.MemPct, h.ActiveXfers, strings.Join(edges, " "))
+		}
+	case "jobs":
+		jobs, err := cl.Jobs("")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "任务查询失败：", err)
+			os.Exit(1)
+		}
+		if jsonOut {
+			json.NewEncoder(os.Stdout).Encode(jobs)
+			return
+		}
+		for _, j := range jobs {
+			fmt.Printf("%-10s %-8s -> %-8s %-8s %s\n", j.ID, j.Src, j.Dst, j.Status, time.Unix(j.Updated, 0).Format("15:04:05"))
 		}
 	default:
 		fmt.Fprintln(os.Stderr, usage)

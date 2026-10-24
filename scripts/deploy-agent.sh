@@ -57,7 +57,9 @@ sudo -n systemctl daemon-reload
 sudo -n systemctl enable --now ff-agent"
   echo "==> systemd 服务 ff-agent 已启用"
 else
-  ssh "$HOST" "nohup ~/ff/ff-agent -config ~/ff/agent.yaml > ~/ff/agent.log 2>&1 &
+  # setsid 新会话 + stdin 脱离 + 追加重定向：ssh 断开后进程才能
+  # 长期持有文件句柄（否则 stdout 挂在已断开的 socket 上，日志全丢）
+  ssh "$HOST" "setsid nohup ~/ff/ff-agent -config ~/ff/agent.yaml >> ~/ff/agent.log 2>&1 < /dev/null &
 sleep 2; pgrep -x ff-agent >/dev/null && echo 'nohup 已拉起（注意：机器重启后需手动拉起）'"
 fi
 

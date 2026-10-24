@@ -225,6 +225,7 @@ func main() {
 	mux.HandleFunc("POST /v1/jobdone", c.handleJobDone)
 	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
+	mux.HandleFunc("GET /v1/jobs", c.handleJobs)
 
 	tlsCfg := rootCA.ServerTLS(tls.Certificate{})
 	tlsCfg.Certificates = nil // 交由 GetCertificate 动态提供（有静态列表时 TLS 不走回调）
@@ -349,6 +350,40 @@ func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 	c.event("renew", nodeID, "")
 	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
+}
+
+// handleJobs：仅 admin。任务列表（含状态），支持 ?id= 精确查——
+// ffctl send --wait 轮询用，也是程序化集成的任务查询接口。
+func (c *controller) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
+		return
+	}
+	id := r.URL.Query().Get("id")
+	rows, err := c.db.Query(`SELECT id,src,dst,mode,status,updated FROM jobs WHERE (?1='' OR id=?1) ORDER BY updated DESC LIMIT 100`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	type jobRow struct {
+		ID      string `json:"id"`
+		Src     string `json:"src"`
+		Dst     string `json:"dst"`
+		Mode    string `json:"mode,omitempty"`
+		Status  string `json:"status"`
+		Updated int64  `json:"updated"`
+	}
+	var out []jobRow
+	for rows.Next() {
+		var j jobRow
+		if rows.Scan(&j.ID, &j.Src, &j.Dst, &j.Mode, &j.Status, &j.Updated) == nil {
+			out = append(out, j)
+		}
+	}
+	if out == nil {
+		out = []jobRow{}
+	}
+	json.NewEncoder(w).Encode(out)
 }
 
 func loadConfig(path string) (Config, error) {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"net/http"
 	"time"
 )
@@ -228,6 +229,29 @@ func (c *Client) Get(path string, resp any) error {
 func (c *Client) Status() ([]Heartbeat, error) {
 	var out []Heartbeat
 	if err := c.Get("/v1/status", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// JobInfo 是任务查询结果（/v1/jobs）。
+type JobInfo struct {
+	ID      string `json:"id"`
+	Src     string `json:"src"`
+	Dst     string `json:"dst"`
+	Mode    string `json:"mode,omitempty"`
+	Status  string `json:"status"`
+	Updated int64  `json:"updated"`
+}
+
+// Jobs 查询任务列表；id 为空返回全部（近期），否则精确匹配。
+func (c *Client) Jobs(id string) ([]JobInfo, error) {
+	var out []JobInfo
+	path := "/v1/jobs"
+	if id != "" {
+		path += "?id=" + url.QueryEscape(id)
+	}
+	if err := c.Get(path, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
