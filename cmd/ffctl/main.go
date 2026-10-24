@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"fileferry/internal/api"
+	"fileferry/internal/ca"
 )
 
 const usage = `用法：
@@ -44,6 +45,14 @@ func main() {
 		break
 	}
 	if certDir == "" || len(rest) == 0 {
+		// token 不需要证书即可执行
+		if len(rest) == 1 && rest[0] == "token" {
+			if tok, err := ca.NewEnrollToken(); err == nil {
+				fmt.Println(tok)
+				return
+			}
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
 	}
@@ -77,6 +86,15 @@ func main() {
 		}
 		fmt.Println("；任务已入队，源节点下次心跳（≤5s）后开始执行")
 		// TODO(M2)：等待传输完成与状态查询
+	case "token":
+		// 铸造一枚一次性入网令牌：打印后由管理员加入 controller
+		// 配置的 enroll-tokens 并重启 controller，再交给新服务器
+		tok, err := ca.NewEnrollToken()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "生成失败：", err)
+			os.Exit(1)
+		}
+		fmt.Println(tok)
 	case "status":
 		hbs, err := cl.Status()
 		if err != nil {

@@ -58,6 +58,43 @@ internal/topology 有向可达图 + 负载加权选链
 internal/transfer QUIC 分块传输 / 断点续传 / 中继
 ```
 
+## 部署一台新服务器（三步）
+
+```bash
+# 1. 铸造一次性入网令牌（管理员机器）
+ff token
+# → ff_enroll_xxxx……
+# 把它加入 hub 上 ffctl/ctl.yaml 的 enroll-tokens 列表并重启 controller
+
+# 2. 一键部署（在持有最新构建的机器上，ssh 别名直达目标机）
+scripts/deploy-agent.sh myserver "ff_enroll_xxxx……"
+#   自动：复制二进制 → 写配置（含 allowed-dirs 白名单）→
+#   systemd 守护（无 sudo 则 nohup）→ 打印验证命令
+
+# 3. 验证
+ff status          # 新节点应在 10 秒内出现并开始探测建边
+```
+
+手工部署等价步骤（不想用脚本时）：
+1. `scp bin/ff-agent myserver:~/ff/`
+2. 目标机写 `~/ff/agent.yaml`：
+
+```yaml
+controller: https://<controller地址>:9443
+enroll-token: ff_enroll_一次性令牌
+data-port: 7800            # 数据面 UDP 端口（TCP 回退自动用 7801）
+data-dir: /home/me/ff
+allowed-dirs:              # 落盘白名单：源/目的路径都必须在列表内
+  - /home/me/ff
+advertise: 1.2.3.4:7800    # 仅公网机/与 controller 同机时需要
+```
+
+3. 启动并守护：`nohup ~/ff/ff-agent -config ~/ff/agent.yaml &`，
+   或 `sudo systemctl enable --now ff-agent`（单元模板见 systemd/）。
+
+网络要求：出站可达 controller:9443（TCP）；想接收直连/被打洞则放行
+入站 7800/udp + 7801/tcp——都不满足时自动走交换台模式，仅出站也能收文件。
+
 ## 快速开始（开发机自测）
 
 ```bash

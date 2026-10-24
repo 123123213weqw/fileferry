@@ -8,6 +8,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
@@ -178,10 +179,44 @@ func main() {
 			}
 		}
 	}
-	_, _, cert, err := rootCA.Issue("controller", true, "controller", sans...)
-	if err != nil {
-		log.Fatal(err)
+	// controller 自身证书动态自续：GetCertificate 回调在剩余 <12h 时
+	// 重新签发热替换——根治"controller 证书 24h 过期导致全网失联"
+	//（2026-10-24 事故：agent 续期请求因 controller 证书过期被拒，
+	//  随后 agent 证书也过期，双向死锁）。
+	var (
+		selfMu   sync.Mutex
+		selfCert tls.Certificate
+		selfExp  time.Time
+	)
+	issueSelf := func() error {
+		_, _, c, err := rootCA.Issue("controller", true, "controller", sans...)
+		if err != nil {
+			return err
+		}
+		selfMu.Lock()
+		selfCert, selfExp = c, time.Now().Add(24*time.Hour)
+		selfMu.Unlock()
+		return nil
 	}
+	if err := issueSelf(); err != nil {
+		log.Fatal("controller 自身证书签发失败：", err)
+	}
+	go func() { // 每小时巡检，剩余 <12h 即重签
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for range t.C {
+			selfMu.Lock()
+			left := time.Until(selfExp)
+			selfMu.Unlock()
+			if left < 12*time.Hour {
+				if err := issueSelf(); err != nil {
+					log.Println("controller 自身证书重签失败：", err)
+				} else {
+					log.Println("controller 自身证书已热更新")
+				}
+			}
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/enroll", c.handleEnroll)
@@ -191,12 +226,19 @@ func main() {
 	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
 
+	tlsCfg := rootCA.ServerTLS(tls.Certificate{})
+	tlsCfg.Certificates = nil // 交由 GetCertificate 动态提供（有静态列表时 TLS 不走回调）
+	tlsCfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		selfMu.Lock()
+		defer selfMu.Unlock()
+		return &selfCert, nil
+	}
 	srv := &http.Server{
 		Addr:      cfg.Listen,
 		Handler:   mux,
-		TLSConfig: rootCA.ServerTLS(cert),
+		TLSConfig: tlsCfg,
 	}
-	log.Printf("controller 监听 %s（数据目录 %s）", cfg.Listen, cfg.DataDir)
+	log.Printf("controller 监听 %s（数据目录 %s，自身证书自动续期已启用）", cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
