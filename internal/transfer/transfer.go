@@ -2,10 +2,11 @@
 // 底层按探测结果走 QUIC（UDP）或 TCP+TLS，同一套流协议。
 //
 // 一个流（QUIC stream 或 TCP 连接）按首 4 字节分发：
-//   "PING" —— 探测流，回 "PONG\n"，供拓扑回填可达边（rtt）
-//   "FFJ1" —— 传输流，首行为 grant JSON：
-//             目的端 → 验签 + 收文件 + 原子落盘 + 回 ACK
-//             中继节点 → 验签 + 确认自己在路径上 → 拨下一跳、双向转发
+//
+//	"PING" —— 探测流，回 "PONG\n"，供拓扑回填可达边（rtt）
+//	"FFJ1" —— 传输流，首行为 grant JSON：
+//	          目的端 → 验签 + 收文件 + 原子落盘 + 回 ACK
+//	          中继节点 → 验签 + 确认自己在路径上 → 拨下一跳、双向转发
 //
 // 帧格式：[4B magic "FFCH"][4B chunk idx][8B length][data][32B sha256(data)]
 // 每个 chunk 独立校验；接收端先写临时文件再原子改名，落盘路径只
@@ -13,25 +14,25 @@
 package transfer
 
 import (
-	"log"
-	"strings"
-	"crypto/ed25519"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/hex"
-	"errors"
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,18 +57,18 @@ type Stream interface {
 func quicConf() *quic.Config {
 	const mb = 1 << 20
 	return &quic.Config{
-		MaxIdleTimeout:              30 * time.Second,
-		InitialStreamReceiveWindow:  8 * mb,
-		MaxStreamReceiveWindow:      16 * mb,
+		MaxIdleTimeout:                 30 * time.Second,
+		InitialStreamReceiveWindow:     8 * mb,
+		MaxStreamReceiveWindow:         16 * mb,
 		InitialConnectionReceiveWindow: 16 * mb,
-		MaxConnectionReceiveWindow:  32 * mb,
+		MaxConnectionReceiveWindow:     32 * mb,
 	}
 }
 
 // sharedTransport：M6 打洞要求"监听、探测、拨号、WHOAMI"共用同一
 // 个 UDP socket，NAT 映射才一致。Transport 按连接 ID 在一个 socket
 // 上多路分解全部 QUIC 连接（监听 + 各次拨号），agent 启动时注入
-//（Conn 是带嗅探的外壳，截流 WHOAMI 回复）；nil 时退回独立 socket。
+// （Conn 是带嗅探的外壳，截流 WHOAMI 回复）；nil 时退回独立 socket。
 var sharedTransport *quic.Transport
 
 // SetTransport 注入共享 Transport（监听与拨号同 socket）。
@@ -227,11 +228,11 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 // 恶意中继即使整体替换数据和清单也无法通过验签；接收端按清单的
 // 总块数判定完成（而非哨兵计数），重放旧流只会重复写相同块，无害。
 type Manifest struct {
-	GrantID  string `json:"grant_id"`
-	SHA256   string `json:"sha256"`
-	Size     int64  `json:"size"`
-	CertB64  string `json:"cert"` // 源端证书 DER
-	SigB64   string `json:"sig"`  // ed25519 签名 over grantID|sha256|size
+	GrantID string `json:"grant_id"`
+	SHA256  string `json:"sha256"`
+	Size    int64  `json:"size"`
+	CertB64 string `json:"cert"` // 源端证书 DER
+	SigB64  string `json:"sig"`  // ed25519 签名 over grantID|sha256|size
 }
 
 func manifestPayload(grantID, sha string, size int64) []byte {
@@ -304,6 +305,16 @@ func (m *Manifest) Verify(grant *api.TransferGrant, roots *x509.CertPool) error 
 	}
 	if m.GrantID != grant.ID {
 		return fmt.Errorf("manifest: grantID 不符")
+	}
+	// 把"文件内容"钉到 controller 签名的 grant 上：grant 里带摘要时，
+	// 清单必须与之一致，否则任何一个参与源都能替换自己那段内容并按
+	// 替换后的整文件重算哈希，接收端照样验收通过（多源模式的完整性
+	// 前提）。之前这里只验"签名者 ∈ 源集合"，不看 grant 的摘要。
+	if grant.FileSHA256 != "" && !strings.EqualFold(m.SHA256, grant.FileSHA256) {
+		return fmt.Errorf("manifest: 全文件哈希与授权不符")
+	}
+	if grant.FileSize > 0 && m.Size != grant.FileSize {
+		return fmt.Errorf("manifest: 文件大小与授权不符（%d vs %d）", m.Size, grant.FileSize)
 	}
 	return nil
 }
@@ -585,7 +596,7 @@ func HandleStream(stream Stream, selfID string, verify GrantVerifier, tlsConf *t
 		stream.Write([]byte("PONG\n"))
 	case "FFJ1":
 		br := bufio.NewReader(stream)
-		line, err := br.ReadString('\n') // grant JSON 行
+		line, err := readHeaderLine(br) // grant JSON 行
 		if err != nil {
 			fmt.Println("传输头读取失败：", err)
 			return
@@ -648,7 +659,7 @@ var swBoard = &switchboard{src: map[string][]*swWaiter{}, dst: map[string][]*swW
 // 行别（Src 侧 × Dst 侧）配对——同侧绝不互配，配对成功后双向管道
 // 直到传输结束。对端未到则超时退出。
 func handleSwitchJoin(br *bufio.Reader, stream Stream, verify GrantVerifier, peerCNStr string) {
-	line, err := br.ReadString('\n')
+	line, err := readHeaderLine(br)
 	if err != nil {
 		return
 	}
@@ -672,6 +683,7 @@ func handleSwitchJoin(br *bufio.Reader, stream Stream, verify GrantVerifier, pee
 	if cn == grant.Src {
 		pool = swBoard.src
 	}
+	var pairs [][2]*swWaiter
 	swBoard.mu.Lock()
 	list := append(pool[grant.ID], w)
 	pool[grant.ID] = list
@@ -687,6 +699,15 @@ func handleSwitchJoin(br *bufio.Reader, stream Stream, verify GrantVerifier, pee
 		if len(swBoard.dst[grant.ID]) == 0 {
 			delete(swBoard.dst, grant.ID)
 		}
+		pairs = append(pairs, [2]*swWaiter{a, b})
+	}
+	swBoard.mu.Unlock()
+
+	// 写 OK 与起管道都放在锁外：之前 a.stream.Write 在 swBoard.mu 里，
+	// 一个慢对端（TCP 零窗口、QUIC 流控打满）就阻塞整个交换台的所有
+	// 新配对，进而拖垮所有走交换台的传输。
+	for _, pr := range pairs {
+		a, b := pr[0], pr[1]
 		a.stream.Write([]byte("OK\n"))
 		b.stream.Write([]byte("OK\n"))
 		close(a.paired)
@@ -697,7 +718,6 @@ func handleSwitchJoin(br *bufio.Reader, stream Stream, verify GrantVerifier, pee
 			close(b.done)
 		}(a, b)
 	}
-	swBoard.mu.Unlock()
 
 	select {
 	case <-w.paired:
@@ -750,10 +770,110 @@ func SetPathGuard(g func(string) bool) { pathGuard = g }
 // PathAllowed 报告路径是否被允许（发送端源路径与接收端目的路径通用）。
 func PathAllowed(p string) bool { return pathGuard == nil || pathGuard(p) }
 
+// within 判断 p 是否在 dir 之内（按路径分量比较，不是字符串前缀）。
+// 之前的实现用 strings.HasPrefix：白名单 /home/me/ff 时
+// /home/me/ff-evil/x 也能通过，等于白名单无效。
+func within(p, dir string) bool {
+	rel, err := filepath.Rel(dir, p)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return !filepath.IsAbs(rel)
+}
+
+// resolveBest 尽量把路径解析成真实路径：逐级对已存在的部分做
+// EvalSymlinks，末尾尚不存在的部分按字面拼接。这样白名单位于符号
+// 链接之下（/home/me/ff -> /srv/data）时不会被误拒，而
+// /home/me/ff/link -> /etc 这类逃逸会被解析出来并被拦下。
+func resolveBest(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	dir, base := filepath.Split(p)
+	dir = filepath.Clean(dir)
+	if dir == string(filepath.Separator) || dir == "." || dir == p {
+		return filepath.Clean(p)
+	}
+	return filepath.Join(resolveBest(dir), base)
+}
+
+// NewPathGuard 构造白名单检查函数。白名单项本身同样先解析成真实路径，
+// 比较时两侧都解析，避免"白名单是软链、目标是真实路径"的假拒绝。
+func NewPathGuard(dirs []string) (func(string) bool, error) {
+	roots := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		if strings.TrimSpace(d) == "" {
+			continue
+		}
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			return nil, fmt.Errorf("白名单路径非法 %q: %w", d, err)
+		}
+		roots = append(roots, resolveBest(abs))
+	}
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("allowed-dirs 为空")
+	}
+	return func(p string) bool {
+		if p == "" {
+			return false
+		}
+		target := resolveBest(p)
+		for _, r := range roots {
+			if within(target, r) {
+				return true
+			}
+		}
+		return false
+	}, nil
+}
+
+// inboxRoot 是"取件码"落盘目录（agent 启动时注入 data-dir）。
+// 映射只在**接收端**做：之前写在源端的 runJob 里，源端把 grant 的
+// DstPath 改成自己的绝对路径后再转发，目的端按被改过的 DstPath 验签
+// 必然失败——所以 ff share / ff get 从来就没通过（一直被误判成
+// "密钥专递链路待修"）。
+var inboxRoot string
+
+// SetInboxRoot 注入取件落盘目录。
+func SetInboxRoot(dir string) { inboxRoot = dir }
+
+// SafeInboxPath 把 grant 里的 inbox: 标记映射到本机 dataDir/inbox 之内。
+// 只接受单层文件名：任何目录分隔、..、绝对路径都拒绝——之前直接
+// filepath.Join(dataDir, "inbox", TrimPrefix(dst,"inbox:"))，
+// "inbox:../../etc/cron.d/x" 会逃到 dataDir 之外。
+func SafeInboxPath(dataDir, dstPath string) (string, error) {
+	rest := strings.TrimPrefix(dstPath, "inbox:")
+	rest = strings.TrimPrefix(rest, "/")
+	if rest == "" {
+		return "", fmt.Errorf("取件路径为空")
+	}
+	// 只允许单个文件名，禁止任何路径分量
+	if rest != filepath.Base(rest) || rest == "." || rest == ".." ||
+		strings.ContainsRune(rest, filepath.Separator) {
+		return "", fmt.Errorf("取件路径非法：%q", dstPath)
+	}
+	inbox := filepath.Join(dataDir, "inbox")
+	out := filepath.Join(inbox, rest)
+	if !within(out, inbox) {
+		return "", fmt.Errorf("取件路径越界：%q", dstPath)
+	}
+	return out, nil
+}
+
 // RecvStream 按认证清单接收：读 manifest 行并验签，然后进组收块。
 // 这是接收端（直连与交换台路径共用的入口）。
 func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots *x509.CertPool) {
-	line, err := br.ReadString('\n') // manifest 行（grant 行由调用方已读）
+	line, err := readHeaderLine(br) // manifest 行（grant 行由调用方已读）
 	if err != nil {
 		fmt.Println("manifest 读取失败：", err)
 		return
@@ -767,15 +887,9 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		fmt.Printf("拒绝传输 %s：%v\n", grant.ID, err)
 		return
 	}
-	var deckey *streamCipher
-	if grant.Enc {
-		var kerr error
-		if deckey, kerr = cipherForGrant(grant.ID); kerr != nil {
-			fmt.Printf("接收 %s 取密钥失败：%v\n", grant.ID, kerr)
-			return
-		}
-	}
-	g, err := groupFor(grant, &mf, deckey)
+	// 解密器由接收组持有（建组时取一次，各并行流共用）。controller
+	// 对密钥是一次性发放，放在这里每流各取一次必然有流失败。
+	g, err := groupFor(grant, &mf)
 	if err == nil {
 		// 断点续传握手：告知发送端已收块位图（HAVE 行），对端跳块；
 		// 旧版发送端不读此行也无碍（多写一行被当数据丢弃的风险——
@@ -846,8 +960,8 @@ type recvGroup struct {
 	finErr    error
 	done      bool
 	deckey    *streamCipher // 端到端解密器（组级共享，建组时取一次）
-	size      int64 // 文件精确字节数（进度键）
-	dirty     int   // 距上次位图落盘的新块数
+	size      int64         // 文件精确字节数（进度键）
+	dirty     int           // 距上次位图落盘的新块数
 }
 
 // ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
@@ -859,12 +973,31 @@ var (
 	completed  = map[string]time.Time{} // 已完成的 grant，2h 内拒绝重放
 )
 
-func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*recvGroup, error) {
+func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
+	// 取件码落盘映射（仅接收端）：inbox:xxx → <data-dir>/inbox/xxx
+	if strings.HasPrefix(grant.DstPath, "inbox:") {
+		p, err := SafeInboxPath(inboxRoot, grant.DstPath)
+		if err != nil {
+			return nil, err
+		}
+		grant.DstPath = p
+	}
+	// 兜底：目标已存在且是目录时补上源文件名。controller 只能按
+	// 末尾分隔符判断，像 `node-2:/data` 这种不带斜杠的目录写法只有
+	// 接收端知道；不补的话 os.Rename 到目录会报 file exists。
+	if st, err := os.Stat(grant.DstPath); err == nil && st.IsDir() {
+		// Base("") 会返回 "."，拼接等于没拼——必须校验出真实文件名
+		if base := filepath.Base(grant.SrcPath); base != "" && base != "." &&
+			base != string(filepath.Separator) {
+			grant.DstPath = filepath.Join(grant.DstPath, base)
+		}
+	}
 	if !PathAllowed(grant.DstPath) {
 		return nil, fmt.Errorf("目的路径不在白名单内：%s", grant.DstPath)
 	}
+	// 第一次加锁：只做内存查询。取密钥是 HTTP 调用，绝不能持锁做——
+	// 否则一条流取密钥就会卡住全网所有接收组。
 	recvMu.Lock()
-	defer recvMu.Unlock()
 	for k, t := range completed { // 陈年条目卫生清扫
 		if time.Since(t) > 2*time.Hour {
 			delete(completed, k)
@@ -873,8 +1006,27 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 	if t, ok := completed[grant.ID]; ok && time.Since(t) < 2*time.Hour {
 		// 文件已完整落盘：不是攻击，是发送端重试流晚到。回 ACK 让
 		// 对端成功收尾（"文件到达但任务报失败"的收尾问题）。
+		recvMu.Unlock()
 		return nil, ErrAlreadyDone
 	}
+	if g, ok := recvGroups[grant.ID]; ok {
+		recvMu.Unlock()
+		return g, nil // 后续并行流：复用组（含它已取到的解密器）
+	}
+	recvMu.Unlock()
+
+	// 锁外取密钥：每个 grant 只取一次，各并行流共用
+	var deckey *streamCipher
+	if grant.Enc {
+		var kerr error
+		if deckey, kerr = cipherForGrant(grant.ID); kerr != nil {
+			return nil, fmt.Errorf("取密钥失败: %w", kerr)
+		}
+	}
+
+	// 第二次加锁：建组。并发流可能已经建好，再查一次。
+	recvMu.Lock()
+	defer recvMu.Unlock()
 	if g, ok := recvGroups[grant.ID]; ok {
 		return g, nil
 	}
@@ -886,13 +1038,17 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 	if err != nil {
 		return nil, err
 	}
+	// 块数按清单大小精确计算。空文件是 0 块——之前钳成 1 会让接收端
+	// 永远等一个不会到来的块 0，收发两端一起卡到 10 分钟超时。
 	n := (mf.Size + ChunkSize - 1) / ChunkSize
-	if n < 1 {
-		n = 1 // 空文件：仅哨兵
+	wantSHA := mf.SHA256
+	if grant.FileSHA256 != "" {
+		// 优先用 controller 签名钉死的摘要（Verify 已确认二者一致）
+		wantSHA = grant.FileSHA256
 	}
 	g := &recvGroup{
 		grantID:   grant.ID,
-		wantSHA:   mf.SHA256,
+		wantSHA:   wantSHA,
 		size:      mf.Size,
 		deckey:    deckey,
 		finalPath: grant.DstPath,
@@ -1005,7 +1161,27 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 			return err
 		}
 		if len(data) == 0 { // 本连接份额完成哨兵
+			// 空文件没有任何块，哨兵即是"全部到齐"，必须在这里收尾，
+			// 否则 finished 永远不会被关闭。
+			g.mu.Lock()
+			empty := g.expected == 0 && !g.done
+			if empty {
+				g.done = true
+			}
+			g.mu.Unlock()
+			if empty {
+				g.finalize()
+			}
 			return nil
+		}
+		// 块号必须落在清单声明的范围内：否则 WriteAt 会在超大偏移处
+		// 写一个稀疏文件，一个恶意（或出 bug 的）对端就能把接收端
+		// 磁盘写满。
+		g.mu.Lock()
+		expected := g.expected
+		g.mu.Unlock()
+		if idx < 0 || idx >= expected {
+			return fmt.Errorf("块号 %d 超出范围 [0,%d)", idx, expected)
 		}
 		if deckey != nil {
 			if data, err = deckey.open(idx, data); err != nil {
@@ -1189,6 +1365,31 @@ func pingPong(s Stream) (int, error) {
 }
 
 // readLine 从流读一行（到 \n，最长 8KB），不引入缓冲。
+// maxHeaderLine 是流首部单行的上限：grant / manifest 都是小 JSON
+// （源集合最多十几项），1 MiB 已经远超正常需要。之前用
+// bufio.Reader.ReadString，任何已入网节点只要不发换行就能把对端
+// 内存吃穿。
+const maxHeaderLine = 1 << 20
+
+// readHeaderLine 读一行并以 maxHeaderLine 封顶，超长直接报错断流。
+func readHeaderLine(br *bufio.Reader) (string, error) {
+	var sb []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(sb)+len(chunk) > maxHeaderLine {
+			return "", fmt.Errorf("首部行超长（>%d 字节）", maxHeaderLine)
+		}
+		sb = append(sb, chunk...)
+		if err == nil {
+			return string(sb), nil
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return "", err
+	}
+}
+
 func readLine(r io.Reader) (string, error) {
 	var sb []byte
 	one := make([]byte, 1)

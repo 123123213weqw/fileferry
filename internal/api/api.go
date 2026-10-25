@@ -3,17 +3,17 @@
 package api
 
 import (
-	"encoding/base64"
-	"strings"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -66,18 +66,22 @@ type PeerInfo struct {
 // （Private，同网段时直接可通）。双方同时向对方发包即可在两个
 // NAT 上留下放行记录。指令经 mTLS 心跳信道到达，无需额外签名。
 type PunchDirective struct {
-	Peer     NodeID `json:"peer"`
-	Addr     string `json:"addr"`     // 对端公网映射 host:port
-	Private  string `json:"private"`  // 对端广播地址 host:port
+	Peer    NodeID `json:"peer"`
+	Addr    string `json:"addr"`    // 对端公网映射 host:port
+	Private string `json:"private"` // 对端广播地址 host:port
 }
 
 // HeartbeatResponse 是心跳的响应：下发给该节点的待执行任务、
 // 全网在线节点表（agent 只需出站连接 controller，天然过 NAT）、
 // 以及打洞指令。
 type HeartbeatResponse struct {
-	Jobs    []TransferGrant   `json:"jobs"`
-	Peers   []PeerInfo        `json:"peers"`
-	Punches []PunchDirective  `json:"punches"`
+	Jobs    []TransferGrant  `json:"jobs"`
+	Peers   []PeerInfo       `json:"peers"`
+	Punches []PunchDirective `json:"punches"`
+	// Revoked 是已撤销节点名单（全量下发，几十个 ID 的量级）。
+	// 数据面据此拒收/拒发：之前撤销只体现在控制面（心跳/续期被拒），
+	// 被撤销节点的证书在 24h 内仍能直接把流推向任何目的端。
+	Revoked []NodeID `json:"revoked,omitempty"`
 }
 
 // EnrollRequest / EnrollResponse：一次性 token 换取本节点证书与根证书。
@@ -87,6 +91,10 @@ type EnrollRequest struct {
 	Token    string `json:"token"`
 	Hostname string `json:"hostname"`
 	Addr     string `json:"addr"`
+	// NodeName 是 agent 请求的稳定节点名（来自 node-name 配置，缺省
+	// 取主机名）。controller 可用则用之，不可用（重名/非法）才自增编号，
+	// 保证重装后身份不漂移。
+	NodeName string `json:"node_name,omitempty"`
 }
 
 type EnrollResponse struct {
@@ -100,11 +108,11 @@ type EnrollResponse struct {
 // DoneRequest 是 agent 回报任务执行结果。Bytes/Duration 用于
 // controller 回填路径实测吞吐（多源调度按带宽分配块区间）。
 type DoneRequest struct {
-	GrantID  string `json:"grant_id"`
-	NodeID   NodeID `json:"node_id"`
-	OK       bool   `json:"ok"`
-	Err      string `json:"err,omitempty"`
-	Bytes    int64  `json:"bytes,omitempty"`
+	GrantID  string  `json:"grant_id"`
+	NodeID   NodeID  `json:"node_id"`
+	OK       bool    `json:"ok"`
+	Err      string  `json:"err,omitempty"`
+	Bytes    int64   `json:"bytes,omitempty"`
 	Duration float64 `json:"duration_s,omitempty"`
 }
 
@@ -130,33 +138,33 @@ type Hop struct {
 }
 
 type TransferGrant struct {
-	ID         string    `json:"id"`
-	Src        NodeID    `json:"src"`
-	Dst        NodeID    `json:"dst"`
+	ID  string `json:"id"`
+	Src NodeID `json:"src"`
+	Dst NodeID `json:"dst"`
 	// Mode 为空 = 常规模式（直连或逐跳中继，前驱拨下一跳）；
 	// "switch" = 交换台模式：两端各自**出站**拨向 Hops[1] 指定的
 	// 交换台节点（DERP 式），交换台把两条现成连接对接。适用于
 	// 任何一方都拨不进对方 NAT 的场景。
-	Mode       string    `json:"mode,omitempty"`
-	Hops       []Hop     `json:"hops"` // 完整路径：源端、各中继/交换台、目的端
-	Relays     []NodeID  `json:"relays"`
+	Mode   string   `json:"mode,omitempty"`
+	Hops   []Hop    `json:"hops"` // 完整路径：源端、各中继/交换台、目的端
+	Relays []NodeID `json:"relays"`
 	// Sources 是 M8 多源并行：文件存在多份副本时，controller 把块
 	// 区间按路径带宽分配给各源，目的端同时从多台拉不同块——叠加
 	// 各"源-目的对"独立的限速配额。为空时单源（Hops[1]）。每个源
 	// 节点收到同一份 grant，各取自己的区间发送。
 	Sources    []SourceSpec `json:"sources,omitempty"`
-	SrcPath    string    `json:"src_path"`
-	DstPath    string    `json:"dst_path"`
-	FileSHA256 string    `json:"file_sha256"`
-	FileSize   int64     `json:"file_size"`
-	ChunkSize  int       `json:"chunk_size"`
-	Streams    int       `json:"streams"` // 每源的并行连接数：绕 per-flow 限速、填满带宽延迟积
-	RateLimit  int64     `json:"rate_limit_bps"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	Retries    int       `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
-	Enc        bool      `json:"enc,omitempty"`    // 端到端加密（密钥经 controller 专递，不进 grant）
-	Mix        bool      `json:"mix,omitempty"`    // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
-	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
+	SrcPath    string       `json:"src_path"`
+	DstPath    string       `json:"dst_path"`
+	FileSHA256 string       `json:"file_sha256"`
+	FileSize   int64        `json:"file_size"`
+	ChunkSize  int          `json:"chunk_size"`
+	Streams    int          `json:"streams"` // 每源的并行连接数：绕 per-flow 限速、填满带宽延迟积
+	RateLimit  int64        `json:"rate_limit_bps"`
+	ExpiresAt  time.Time    `json:"expires_at"`
+	Retries    int          `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
+	Enc        bool         `json:"enc,omitempty"`     // 端到端加密（密钥经 controller 专递，不进 grant）
+	Mix        bool         `json:"mix,omitempty"`     // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
+	Sig        string       `json:"sig"`               // ed25519，覆盖以上所有字段
 }
 
 // SourceSpec 是多源 grant 中一个源的分片：负责块区间 [Start, End)。
@@ -183,6 +191,51 @@ func (g *TransferGrant) AllSources() []NodeID {
 // payload 返回待签名的规范串（不含 Sig）。手工拼接而非 json.Marshal
 // 整个 struct——未来新增字段不进签名，新旧版本互验不破（曾因新增
 // Retries 字段导致新旧混编时全网验签失败）。
+// payloadV2 是长度前缀版本：手拼分隔符的旧格式里，NodeID / 路径若含
+// ',' ';' '|' 就能构造出"不同 JSON 却同一签名串"的歧义。V2 对每个
+// 变长字段前置长度，签名串与结构一一对应。
+func (g *TransferGrant) payloadV2() []byte {
+	var sb strings.Builder
+	sb.WriteString("ff2|")
+	wStr := func(v string) {
+		fmt.Fprintf(&sb, "%d:", len(v))
+		sb.WriteString(v)
+	}
+	wInt := func(v int64) { fmt.Fprintf(&sb, "%d;", v) }
+	wStr(g.ID)
+	wStr(string(g.Src))
+	wStr(string(g.Dst))
+	wStr(g.Mode)
+	wInt(g.FileSize)
+	wStr(g.FileSHA256)
+	wInt(int64(g.ChunkSize))
+	wInt(int64(len(g.Hops)))
+	for _, h := range g.Hops {
+		wStr(string(h.NodeID))
+		wStr(h.Addr) // Proto 不进签名（同 V1：拨号协议是路由提示）
+	}
+	wInt(int64(len(g.Sources)))
+	for _, sp := range g.Sources {
+		wStr(string(sp.NodeID))
+		wStr(sp.Addr)
+		wStr(sp.Path)
+		wInt(sp.Start)
+		wInt(sp.End)
+	}
+	wStr(g.SrcPath)
+	wStr(g.DstPath)
+	wInt(int64(g.Streams))
+	wInt(int64(g.Retries))
+	wInt(g.ExpiresAt.Unix())
+	if g.Enc {
+		wStr("enc")
+	}
+	if g.Mix {
+		wStr("mix")
+	}
+	return []byte(sb.String())
+}
+
 func (g *TransferGrant) payload() []byte {
 	var sb strings.Builder
 	sb.WriteString("ff1|")
@@ -210,7 +263,7 @@ func (g *TransferGrant) payload() []byte {
 }
 
 func (g *TransferGrant) Sign(priv ed25519.PrivateKey) {
-	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payload()))
+	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payloadV2()))
 }
 
 func (g *TransferGrant) Verify(pub ed25519.PublicKey) bool {
@@ -218,7 +271,10 @@ func (g *TransferGrant) Verify(pub ed25519.PublicKey) bool {
 	if err != nil {
 		return false
 	}
-	return ed25519.Verify(pub, g.payload(), sig)
+	// 先按 V2 验；不通过再按 V1 验，保证 controller 先升级、agent
+	// 后升级的滚动过程中已签发的旧 grant 仍然有效。
+	return ed25519.Verify(pub, g.payloadV2(), sig) ||
+		ed25519.Verify(pub, g.payload(), sig)
 }
 
 // Client 是 controller 的 HTTP 客户端；enroll 阶段可不带证书调用。
@@ -345,7 +401,6 @@ func (c *Client) Renew() (*RenewResponse, error) {
 	}
 	return &resp, nil
 }
-
 
 // IndexEntry 是 agent 上报的共享目录文件索引（M8 多源副本发现）。
 // SHA256 由 agent 后台计算并缓存（size+mtime 不变不重算）。
