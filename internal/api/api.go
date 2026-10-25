@@ -56,7 +56,6 @@ type Heartbeat struct {
 	CPUPct        float64      `json:"cpu_pct"`
 	MemPct        float64      `json:"mem_pct"`
 	DiskFreeBytes uint64       `json:"disk_free_bytes"`
-	NICBps        float64      `json:"nic_bps"`
 	ActiveXfers   int          `json:"active_xfers"`
 	Edges         []EdgeReport `json:"edges"`
 	TS            time.Time    `json:"ts"`
@@ -126,6 +125,20 @@ type DoneRequest struct {
 	Err      string  `json:"err,omitempty"`
 	Bytes    int64   `json:"bytes,omitempty"`
 	Duration float64 `json:"duration_s,omitempty"`
+}
+
+// PushRequest 是"本机 → 远端节点"直推的申请（等价 scp local host:/path）。
+// ffctl 在本地算好摘要与大小一起提交，controller 只负责签授权、给出
+// 目标的拨号地址——数据面由 ffctl 直接连目标节点，不经过 controller，
+// 也没有"先上传到某个源节点"的中转开销。
+type PushRequest struct {
+	Dst       NodeID `json:"dst"`
+	DstPath   string `json:"dst_path"`
+	LocalPath string `json:"local_path"` // 仅用于目标写成目录时补文件名
+	SHA256    string `json:"sha256"`
+	Size      int64  `json:"size"`
+	Streams   int    `json:"streams,omitempty"` // 0 = 默认
+	RateLimit int64  `json:"rate_limit_bps"`
 }
 
 // TransferRequest 是 ffctl 发起的按需传输请求。

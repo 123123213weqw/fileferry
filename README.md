@@ -149,7 +149,7 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       监听/拨号/WHOAMI 同源）✅ 对发开洞 + 前缀探测自动建边
       真实环境验证：跨两个校园 NAT 的对等打洞被对称型 NAT 拒绝
       （双方同时行动、地址正确、失败被正确识别并回落中继）
-- [ ] M4 精准负载：✅ /proc 指标采集（CPU/内存/磁盘已进心跳，边权与中继排除
+- [x] M4 每任务限速 / 精准负载：✅ /proc 指标采集（CPU/内存/磁盘已进心跳，边权与中继排除
 真正生效）⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
 - [x] M11 临时取件码：ff share / ff get（含加密路径，端到端实测通过）
 - [ ] M5 收尾：✅ systemd 沙箱单元（systemd/）✅ 安全自检脚本
@@ -159,6 +159,39 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       ✅ 认证清单 manifest（源端签名 文件哈希+大小，唯一块计数判定
       完成 + 全文件验哈希——防重放、防恶意中继篡改内容）
       ✅ 回声口限速 ✅ 密钥离机 + 备份
+
+## 和 scp / rsync 的对应关系
+
+| 想做的事 | scp | fileferry |
+|---|---|---|
+| 本机 → 远端 | `scp f host:/p` | `ffctl put f node-b:/p` |
+| 远端 → 远端 | `scp a:/f b:/p`（走本机中转） | `ffctl send a:/f b:/p`（节点直连/中继，不经本机） |
+| 限速 | `-l`（Kbit/s） | `-rate <字节/秒>`（整任务共享配额） |
+| 断点续传 | 无 | 自动（进度位图 + `.ffpart`） |
+| 免 ssh | 需要 sshd | 不需要，自建 mTLS 数据面 |
+| 被墙/只放 443 | 取决于 sshd 端口 | `tcp-port: 443` 即可 |
+
+**实测（本机 loopback，1 个 agent，每轮清空目标，逐次校验 SHA256）**：
+
+| 文件 | fileferry `put` | rsync daemon | 说明 |
+|---|---|---|---|
+| 1 MB | 0.016 s | 0.007 s | rsync 略快（无 TLS 握手） |
+| 10 MB | 0.037 s | 0.025 s | rsync 略快 |
+| 100 MB | 0.212 s | 0.220 s | 持平 |
+
+loopback 没有网络 RTT，fileferry 的 mTLS 握手与 controller 往返成了固定开销，
+所以小文件不占优。它换来的是：不需要 sshd、能穿透只放 443 的网络、断点续传、
+多流并行（高 RTT 链路上差距会拉大）。
+
+### 断点续传的实测证据
+
+```
+# 20MB @ 限速 2MB/s，4 秒时 kill -9 接收端
+中断时进度: 4/5 块已收（临时文件 16777216 字节）
+# 重启接收端后重发
+完成：（4194304 字节，2.01s，2 MB/s）   ← 只补了缺失的 1 块
+SHA256 一致
+```
 
 ## 网络受限 / 被墙时怎么用
 

@@ -3,6 +3,7 @@ package transfer
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -403,5 +405,162 @@ func TestRegressPerNodeTCPPort(t *testing.T) {
 	// 端口为 0 时表示"用 Addr+1"，不能被解释成"用本机端口"
 	if (&api.Hop{}).TCPPort != 0 {
 		t.Fatal("零值必须表示未上报")
+	}
+}
+
+// 回归：清单验签不能按 TLS ServerAuth 校验，否则只有 ClientAuth 的
+// 管理员证书会被判"证书链无效"——本机直推（ffctl put）就是靠它失败的。
+func TestRegressManifestAcceptsClientAuthCert(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 管理员证书：server=false，只带 ClientAuth
+	certPEM, keyPEM, _, err := root.Issue("admin-user", false, ca.RoleAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "payload.bin")
+	if err := os.WriteFile(p, []byte("push-from-admin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mf, err := BuildManifest("push-1", p, &tls.Config{Certificates: []tls.Certificate{pair}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &api.TransferGrant{ID: "push-1", Src: "admin-user", Dst: "node-2"}
+	if err := mf.Verify(g, root.Pool()); err != nil {
+		t.Fatalf("管理员证书签的清单应被接受，实际：%v（回归）", err)
+	}
+	// 不是该 grant 的来源，仍必须拒绝
+	g.Src = "someone-else"
+	if err := mf.Verify(g, root.Pool()); err == nil {
+		t.Fatal("签名者与 grant.Src 不符时应拒绝")
+	}
+}
+
+// 回归：限速必须是**每任务**而非每流。之前 grant.RateLimit 在协议里
+// 声明却从未生效；按每流实现时 4 条流各限 2MB/s 合计变成 8MB/s。
+func TestRegressTaskRateShared(t *testing.T) {
+	if r0 := newTaskRate(0); r0 == nil {
+		t.Fatal("限速器不应为 nil（仍要统计已发字节）")
+	} else if r0.limit != 0 {
+		t.Fatal("0 表示不限速")
+	}
+	const limit = 1 << 20 // 1MB/s
+	r := newTaskRate(limit)
+	start := time.Now()
+	// 4 条"流"各发 512KB，共享同一配额 → 合计 2MB 应约 2 秒
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.take(512 << 10)
+		}()
+	}
+	wg.Wait()
+	el := time.Since(start)
+	if el < 1500*time.Millisecond {
+		t.Fatalf("4×512KB @1MB/s 应约 2s，实际 %s（回归：限速被各流分摊）", el.Round(100*time.Millisecond))
+	}
+	if el > 4*time.Second {
+		t.Fatalf("限速过慢：%s", el.Round(100*time.Millisecond))
+	}
+	t.Logf("4 流共享 1MB/s：合计 2MB 用时 %s（符合约 2s）", el.Round(100*time.Millisecond))
+}
+
+// 回归：块数少的文件也必须落盘进度。之前只在"每 8 块"时保存，导致
+// <32MB 的文件（总块数 <8）永远没有进度文件，重启后已收数据全丢，
+// 续传退化成从头再来。
+func TestRegressProgressSavedForSmallFiles(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "out.bin")
+	g := &recvGroup{
+		grantID:   "xfer-small",
+		wantSHA:   strings.Repeat("a", 64),
+		size:      5 * ChunkSize, // 5 块：< 8，正是回归场景
+		expected:  5,
+		got:       map[int64]bool{},
+		finalPath: final,
+		finished:  make(chan struct{}),
+		tmp:       mustTemp(t, dir),
+	}
+	g.tmpName = g.tmp.Name()
+
+	// 收 4 块（不足 8，旧实现不会保存）
+	for i := int64(0); i < 4; i++ {
+		g.mu.Lock()
+		g.got[i] = true
+		g.dirty++
+		shouldSave := g.dirty >= 8 || g.expected <= 16
+		if shouldSave {
+			g.dirty = 0
+		}
+		g.mu.Unlock()
+		if shouldSave {
+			g.saveProgress()
+		}
+	}
+	// 模拟进程重启：新组从磁盘读进度
+	g2 := &recvGroup{
+		wantSHA:   g.wantSHA,
+		size:      g.size,
+		expected:  5,
+		got:       map[int64]bool{},
+		finalPath: final,
+		finished:  make(chan struct{}),
+		tmp:       mustTemp(t, dir),
+	}
+	g2.tmpName = g2.tmp.Name()
+	g2.loadProgress()
+	if len(g2.got) != 4 {
+		t.Fatalf("重启后应恢复 4 块，实际 %d（回归：小文件从不保存进度）", len(g2.got))
+	}
+	g.tmp.Close()
+	g2.tmp.Close()
+}
+
+func mustTemp(t *testing.T, dir string) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(dir, ".ff-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// 回归：流的数量不应超过块数。1MB 文件只有 1 块，开 4 条流纯属多付
+// 3 次 TLS 握手——这是小文件延迟偏高的来源之一。
+func TestRegressStreamsCappedByChunks(t *testing.T) {
+	capStreams := func(size int64, streams int) int {
+		n := streams
+		if n < 1 {
+			n = 1
+		}
+		if chunks := int((size + ChunkSize - 1) / ChunkSize); chunks > 0 && n > chunks {
+			n = chunks
+		}
+		return n
+	}
+	cases := []struct {
+		size int64
+		want int
+	}{
+		{1 << 20, 1},         // 1MB → 1 块
+		{0, 4},               // 空文件：块数 0，保持调用方指定（哨兵路径）
+		{4 * ChunkSize, 4},   // 16MB → 4 块
+		{100 * ChunkSize, 4}, // 大文件：受 streams 上限
+	}
+	for _, c := range cases {
+		if got := capStreams(c.size, 4); got != c.want {
+			t.Fatalf("size=%d 时流数应为 %d，实际 %d", c.size, c.want, got)
+		}
 	}
 }

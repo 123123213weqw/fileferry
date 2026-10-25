@@ -299,6 +299,7 @@ func main() {
 	mux.HandleFunc("POST /v1/enroll", c.handleEnroll)
 	mux.HandleFunc("POST /v1/heartbeat", c.handleHeartbeat)
 	mux.HandleFunc("POST /v1/transfer", c.handleTransfer)
+	mux.HandleFunc("POST /v1/push", c.handlePush)
 	mux.HandleFunc("POST /v1/jobdone", c.handleJobDone)
 	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
@@ -429,6 +430,105 @@ func (l *enrollLedger) claimName(name string) (string, bool) {
 	}
 	l.Used[key] = true
 	return name, true
+}
+
+const (
+	// grantChunkSize 与 transfer.ChunkSize 对齐（4 MiB）。集中定义，
+	// 避免三处授权构造各写一遍魔法数、日后改块大小漏掉其中一处。
+	grantChunkSize = 4 << 20
+	// grantTTL 是签发后的有效期；超时视为失效（防重放）。
+	grantTTL = 30 * time.Minute
+)
+
+// handlePush：本机(管理员) → 远端节点 直推。仅 admin。
+//
+// 设计要点：controller 只签授权 + 给出目标拨号地址，**数据不经过
+// controller**，也没有"先上传到某源节点再转"的中转开销。授权里的
+// Src 就是调用者的证书 CN，接收端靠它校验 manifest 签名者，所以
+// 完整性保证与节点间传输完全一致（mTLS + 逐块 SHA256 + 全文件摘要）。
+func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
+		c.event("forbidden", clientRole(r), "push")
+		return
+	}
+	var req api.PushRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Dst == "" || req.DstPath == "" {
+		http.Error(w, "dst/dst_path required", http.StatusBadRequest)
+		return
+	}
+	if req.SHA256 == "" || req.Size < 0 {
+		http.Error(w, "sha256/size required", http.StatusBadRequest)
+		return
+	}
+	// 限速按**调用者**而非目标节点：脚本里批量 put（for f in *.txt）
+	// 对同一目标连发几十次是正常用法，scp 也没有任何限制。之前按
+	// 目标限 5/秒，实测第 6 个文件就 429，直接把批量场景打死。
+	// 这里留足余量，只为挡住失控循环。
+	if !c.limiter.allow("push:"+clientRole(r)+":"+string(r.TLS.PeerCertificates[0].Subject.CommonName), 50) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	// 目标必须在线，否则给了授权也拨不通
+	addr := c.graph.Addr(req.Dst)
+	if addr == "" {
+		http.Error(w, "destination node offline", http.StatusUnprocessableEntity)
+		return
+	}
+	c.mu.Lock()
+	dstRevoked := c.revoked[req.Dst]
+	c.mu.Unlock()
+	if dstRevoked {
+		http.Error(w, "destination revoked", http.StatusForbidden)
+		return
+	}
+	caller := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
+	streams := req.Streams
+	if streams <= 0 {
+		streams = 4
+	}
+	if streams > 8 {
+		streams = 8
+	}
+
+	c.mu.Lock()
+	c.nextID++
+	g := api.TransferGrant{
+		ID:   fmt.Sprintf("push-%d", c.nextID),
+		Src:  caller,
+		Dst:  req.Dst,
+		Mode: "push",
+		Hops: []api.Hop{
+			{NodeID: caller}, // 本机不是舰队节点，仅占位（签名覆盖）
+			{
+				NodeID:  req.Dst,
+				Addr:    addr,
+				Proto:   "tcp",
+				TCPPort: c.graph.TCPPort(req.Dst),
+			},
+		},
+		SrcPath:    req.LocalPath, // 只用于目标写成目录时补文件名
+		DstPath:    normalizeDstPath(req.DstPath, req.LocalPath),
+		ChunkSize:  4 << 20,
+		Streams:    streams,
+		RateLimit:  req.RateLimit,
+		FileSHA256: req.SHA256,
+		FileSize:   req.Size,
+		ExpiresAt:  time.Now().Add(grantTTL),
+	}
+	g.Sign(c.signer)
+	c.mu.Unlock()
+	c.jobPersist(&g) // 落库：ffctl 可用 `ffctl jobs push-...` 查历史
+
+	c.mu.Lock()
+	c.jobUpdate(g.ID, "sent")
+	c.mu.Unlock()
+
+	c.event("push", caller, fmt.Sprintf("%s -> %s:%s", caller, g.Dst, g.DstPath))
+	json.NewEncoder(w).Encode(g)
 }
 
 // normalizeDstPath 把"目标写成目录"补成具体文件名。
@@ -751,10 +851,10 @@ func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
 		Hops:      hops,
 		SrcPath:   se.Path,
 		DstPath:   filepath.Join(shareInbox(dst), name),
-		ChunkSize: 4 << 20,
+		ChunkSize: grantChunkSize,
 		Streams:   2,
 		Enc:       true,
-		ExpiresAt: time.Now().Add(30 * time.Minute),
+		ExpiresAt: time.Now().Add(grantTTL),
 	}
 	grant.Sign(c.signer)
 	c.mu.Lock()
@@ -1386,10 +1486,10 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		Relays:    path[1 : len(path)-1],
 		SrcPath:   req.SrcPath,
 		DstPath:   normalizeDstPath(req.DstPath, req.SrcPath),
-		ChunkSize: 4 << 20,
+		ChunkSize: grantChunkSize,
 		Streams:   4, // TODO(M4)：按路径质量与负载动态定
 		RateLimit: req.RateLimit,
-		ExpiresAt: time.Now().Add(30 * time.Minute),
+		ExpiresAt: time.Now().Add(grantTTL),
 		Enc:       c.cfg.EncDefault, // 端到端加密（真机密钥专递链路待修，默认关；单测已验证）
 	}
 	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
@@ -1642,10 +1742,10 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 		Hops:      []api.Hop{{NodeID: req.Src}, {NodeID: best, Addr: addr, Proto: proto}, {NodeID: req.Dst}},
 		SrcPath:   req.SrcPath,
 		DstPath:   normalizeDstPath(req.DstPath, req.SrcPath),
-		ChunkSize: 4 << 20,
+		ChunkSize: grantChunkSize,
 		Streams:   4,
 		RateLimit: req.RateLimit,
-		ExpiresAt: time.Now().Add(30 * time.Minute),
+		ExpiresAt: time.Now().Add(grantTTL),
 	}
 	grant.Sign(c.signer)
 	c.mu.Lock()

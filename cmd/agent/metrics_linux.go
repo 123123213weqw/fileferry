@@ -11,7 +11,7 @@ import (
 )
 
 // 负载采集：M4「负载感知调度」的唯一数据源。之前 CPUPct/MemPct/
-// DiskFreeBytes/NICBps 全仓没有任何写入，导致
+// DiskFreeBytes 全仓没有任何写入，导致
 //   LoadPct() == 0 → 边权退化成纯 RTT 最短路
 //   MaxLoadPct=80 的中继排除永不触发
 //   多源的「负载折扣」恒为 1

@@ -5,10 +5,14 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,9 +22,12 @@ import (
 
 	"fileferry/internal/api"
 	"fileferry/internal/ca"
+	"fileferry/internal/transfer"
 )
 
 const usage = `用法：
+  ffctl -cert-dir <dir> put  <本机文件> <dst-node>:<path>   ← 本机直推（等价 scp）
+  ffctl -rate <字节/秒> ...                                   ← 可选：限速
   ffctl -cert-dir <dir> send <src-node>:<path> <dst-node>:<path>
   ffctl -cert-dir <dir> status
 
@@ -32,9 +39,19 @@ func main() {
 	controller := "https://127.0.0.1:8443"
 	jsonOut := false
 	noWait := false
+	rateBps := int64(0) // -rate：限速（字节/秒），0 = 不限
 	args := os.Args[1:]
 	var rest []string
 	for i := 0; i < len(args); i++ {
+		if args[i] == "-rate" {
+			if i+1 < len(args) {
+				if n, err := strconv.ParseInt(args[i+1], 10, 64); err == nil {
+					rateBps = n
+				}
+				i++
+			}
+			continue
+		}
 		if args[i] == "-cert-dir" || args[i] == "-controller" {
 			if i+1 < len(args) {
 				if args[i] == "-cert-dir" {
@@ -88,7 +105,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "路径格式应为 node:/path")
 			os.Exit(2)
 		}
-		grant, err := cl.Send(api.TransferRequest{Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath})
+		grant, err := cl.Send(api.TransferRequest{Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath, RateLimit: rateBps})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "传输请求失败：", err)
 			os.Exit(1)
@@ -130,6 +147,25 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "超时：10 分钟内未完成（可用 -nowait 改为只入队）")
 		os.Exit(1)
+	case "put":
+		// ffctl put <本机文件> <dst-node>:<远端路径>
+		// 等价于 scp local host:/path：本机直接连目标节点数据面推送，
+		// 不经过 controller，也不需要文件先存在于某台节点上。
+		if len(rest) != 3 {
+			fmt.Fprintln(os.Stderr, "用法: ffctl put <本机文件> <dst-node>:<远端路径>")
+			os.Exit(2)
+		}
+		localPath := rest[1]
+		dstNode, dstPath, ok := splitNodePath(rest[2])
+		if !ok {
+			fmt.Fprintln(os.Stderr, "目标格式应为 node:/path")
+			os.Exit(2)
+		}
+		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, noWait); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	case "token":
 		// 铸造一枚一次性入网令牌：打印后由管理员加入 controller
 		// 配置的 enroll-tokens 并重启 controller，再交给新服务器
@@ -220,24 +256,33 @@ func main() {
 	}
 }
 
-func newClient(controller, certDir string) (*api.Client, error) {
-	// 优先使用管理员证书（admin.crt，由 controller 首次启动生成）；
-	// 否则退回节点证书（node 角色无法发起传输，仅用于诊断连通性）。
+// loadCreds 读取 cert-dir 里的 mTLS 凭据。
+// 优先使用管理员证书（admin.crt，由 controller 首次启动生成）；否则
+// 退回节点证书（node 角色无法发起传输，仅用于诊断连通性）。
+func loadCreds(certDir string) (tls.Certificate, *x509.CertPool, error) {
 	crt, key := filepath.Join(certDir, "node.crt"), filepath.Join(certDir, "node.key")
 	if _, err := os.Stat(filepath.Join(certDir, "admin.crt")); err == nil {
 		crt, key = filepath.Join(certDir, "admin.crt"), filepath.Join(certDir, "admin.key")
 	}
 	cert, err := tls.LoadX509KeyPair(crt, key)
 	if err != nil {
-		return nil, err
+		return tls.Certificate{}, nil, err
 	}
 	rootPEM, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
 	if err != nil {
-		return nil, err
+		return tls.Certificate{}, nil, err
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(rootPEM) {
-		return nil, fmt.Errorf("ca.crt 解析失败")
+		return tls.Certificate{}, nil, fmt.Errorf("ca.crt 解析失败")
+	}
+	return cert, pool, nil
+}
+
+func newClient(controller, certDir string) (*api.Client, error) {
+	cert, pool, err := loadCreds(certDir)
+	if err != nil {
+		return nil, err
 	}
 	return &api.Client{
 		Base: controller,
@@ -247,6 +292,91 @@ func newClient(controller, certDir string) (*api.Client, error) {
 			MinVersion:   tls.VersionTLS13,
 		}}},
 	}, nil
+}
+
+// dataPlaneTLS 是**直连目标节点数据面**用的 TLS 配置：同一套凭据，
+// 根证书用于校验节点证书。用它跑 manifest 签名（BuildManifest 取
+// Certificates[0] 的 ed25519 私钥）。
+func dataPlaneTLS(certDir string) (*tls.Config, error) {
+	cert, pool, err := loadCreds(certDir)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS13,
+	}, nil
+}
+
+// runPut 实现本机直推：本地算摘要 → 控制面签授权 → 直连目标节点推送。
+//
+// 完整性：授权里带 FileSHA256/FileSize（controller 签名钉死），接收端
+// 校验 manifest 与之一致，且逐块 SHA256——与节点间传输同一套保证。
+// 权限：目标节点的 allowed-dirs 白名单照常生效。
+func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, noWait bool) error {
+	fi, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("读本机文件失败：%w", err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("%s 是目录：put 只支持单个文件（目录请先打包）", localPath)
+	}
+	sum, err := fileSHA256(localPath)
+	if err != nil {
+		return fmt.Errorf("计算摘要失败：%w", err)
+	}
+
+	var grant api.TransferGrant
+	if err := cl.Post("/v1/push", api.PushRequest{
+		Dst:       dstNode,
+		DstPath:   dstPath,
+		LocalPath: filepath.Base(localPath),
+		SHA256:    sum,
+		Size:      fi.Size(),
+		RateLimit: rateBps,
+	}, &grant); err != nil {
+		return fmt.Errorf("申请推送授权失败：%w", err)
+	}
+	fmt.Printf("已授权 %s：本机 -> %s:%s（%d 字节）\n", grant.ID, grant.Dst, grant.DstPath, fi.Size())
+
+	if noWait {
+		fmt.Println("（-nowait 对 put 无效：推送由本进程完成，必须等待）")
+	}
+
+	tlsConf, err := dataPlaneTLS(certDir)
+	if err != nil {
+		return fmt.Errorf("加载数据面凭据失败：%w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	// 直连目标节点的数据面（Hops[1] 由 controller 填好地址与 TCP 端口）
+	open := transfer.OpenerDirect(ctx, grant.Hops[1], tlsConf)
+	start := time.Now()
+	n, err := transfer.SendFile(ctx, localPath, open, tlsConf, &grant)
+	el := time.Since(start)
+	if err != nil {
+		return fmt.Errorf("推送失败：%w", err)
+	}
+	mbps := float64(n) / (1 << 20) / el.Seconds()
+	fmt.Printf("完成：%s（%d 字节，%.2fs，%.0f MB/s，SHA256 %s…）\n",
+		grant.DstPath, n, el.Seconds(), mbps, sum[:12])
+	return nil
+}
+
+// fileSHA256 流式算整文件摘要（大文件不整读进内存）。
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // splitNodePath 拆 "node-3:/data/x.iso"。

@@ -79,6 +79,49 @@ func SetTransport(t *quic.Transport) { sharedTransport = t }
 // target 发过包"这条 NAT 放行记录。dur 结束后停止。
 // 同时向映射端口 ±32 扇形喷洒（对称 NAT 的端口预测：对端出口
 // 映射端口通常在已观测映射附近递增），提高对穿成功率。
+// taskRate 是**整任务**（跨全部并行流）共享的限速器。
+//
+// 注意：不能每流各算各的——4 条流各限 2MB/s 合计就是 8MB/s，
+// 与"每任务限速"的语义不符（实测 20MB@2MB/s 本该 10 秒，实际 2.5 秒）。
+type taskRate struct {
+	mu    sync.Mutex
+	limit int64
+	sent  int64
+	start time.Time
+}
+
+// newTaskRate 总是返回非 nil：limit<=0 表示不限速，但仍累计已发字节
+// （返回给调用方报告真实吞吐；续传时"文件大小/耗时"会严重虚高）。
+func newTaskRate(limit int64) *taskRate {
+	return &taskRate{limit: limit, start: time.Now()}
+}
+
+// sent 返回累计已发字节。
+func (t *taskRate) sentBytes() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sent
+}
+
+// take 记录本次发送字节数，并按整任务平均速率补睡（limit<=0 不睡）。
+func (t *taskRate) take(n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.sent += n
+	sent := t.sent
+	limit := t.limit
+	t.mu.Unlock()
+	if limit <= 0 {
+		return
+	}
+	want := time.Duration(float64(sent) / float64(limit) * float64(time.Second))
+	if ahead := want - time.Since(t.start); ahead > 0 {
+		time.Sleep(ahead)
+	}
+}
+
 // spreadPorts 是"端口未知"时允许探测的候选偏移。之前固定扫 13 个
 // 连续附近的端口（±1,2,4,8,16,32）——形态上就是一次端口扫描，实测
 // 8 秒内打 13 个端口，在 FortiGate/云厂商的扫描检测里很容易被整 IP
@@ -303,7 +346,15 @@ func (m *Manifest) Verify(grant *api.TransferGrant, roots *x509.CertPool) error 
 	if err != nil {
 		return err
 	}
-	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, CurrentTime: time.Now()}); err != nil {
+	// KeyUsages 必须是 Any：这里校验的是"集群成员对清单的签名"，不是
+	// TLS 服务器身份。x509 默认按 ServerAuth 校验，而管理员证书只带
+	// ClientAuth → 本机直推会被误判为"证书链无效"（实测
+	// "certificate specifies an incompatible key usage"）。
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots:       roots,
+		CurrentTime: time.Now(),
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
 		return fmt.Errorf("manifest: 证书链无效: %w", err)
 	}
 	srcOK := cert.Subject.CommonName == grant.Src
@@ -365,6 +416,12 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 	if n < 1 {
 		n = 1
 	}
+	// 流的数量不能超过块的个数：小文件开 4 条流只是多付 4 次 TLS
+	// 握手，一点并行收益都没有（1MB 文件只有 1 块）。实测这是小文件
+	// 延迟的主要来源之一。
+	if chunks := int((mf.Size + ChunkSize - 1) / ChunkSize); chunks > 0 && n > chunks {
+		n = chunks
+	}
 	// 端到端加密：每 grant 一把密钥（所有流共用），发送前上报一次。
 	// 每流一把会让 controller 的单槽一次性发放互相覆盖（真机踩坑）。
 	var enc *streamCipher
@@ -381,6 +438,7 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 			return 0, fmt.Errorf("密钥上报失败: %w", err)
 		}
 	}
+	rate := newTaskRate(grant.RateLimit) // 整任务共享配额（跨全部流）
 	errCh := make(chan error, n)
 	var wg sync.WaitGroup
 	for r := 0; r < n; r++ {
@@ -401,7 +459,7 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 		wg.Add(1)
 		go func(r int, o StreamOpener) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, o, grant, mf, enc, startCh, endCh, r, n)
+			errCh <- sendShare(ctx, f, o, grant, mf, enc, startCh, endCh, r, n, rate)
 		}(r, thisOpen)
 	}
 	wg.Wait()
@@ -411,7 +469,7 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 			return 0, err
 		}
 	}
-	return mf.Size, nil
+	return rate.sentBytes(), nil
 }
 
 // OpenerDirect 返回常规模式的建流函数（拨 firstHop）。QUIC 建流
@@ -467,12 +525,12 @@ func DialSwitch(ctx context.Context, addr, proto string, tcpPort int, tlsConf *t
 
 // sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
 // 保证各连接进度均衡。流头为 grant 行 + manifest 行，然后是数据帧。
-func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
+func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, rate *taskRate) error {
 	// 连接失败/中断 → 重连重发整个份额（最多 3 次）：多流交错下
 	// 单条连接的块缺口会让收发两端同时死等，必须自愈
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if err := sendShareOnce(ctx, f, open, grant, mf, enc, startCh, endCh, r, n); err == nil {
+		if err := sendShareOnce(ctx, f, open, grant, mf, enc, startCh, endCh, r, n, rate); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -481,7 +539,7 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 	return fmt.Errorf("份额 [%d,%d) 第 %d 流 3 次尝试均失败: %w", startCh, endCh, r, lastErr)
 }
 
-func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
+func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, rate *taskRate) error {
 	tA := time.Now()
 	stream, closeConn, err := open()
 	if err != nil {
@@ -539,6 +597,7 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 			if err := WriteFrame(stream, idx, data); err != nil {
 				return err
 			}
+			rate.take(int64(len(data)))
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
@@ -1129,7 +1188,12 @@ func (g *recvGroup) loadProgress() {
 }
 
 // saveProgress 位图落盘（断点续传依据）。
+// saveProgress 必须自行加锁：多流共享同一个 recvGroup，调用点都在
+// 释放锁之后，直接遍历 g.got 会与其他流的写入并发——Go 的 map 并发
+// 读写会直接 panic（race detector 实测在 40MB 多流场景触发）。
 func (g *recvGroup) saveProgress() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	bits := make([]byte, (g.expected+7)/8)
 	for i := range g.got {
 		if i >= 0 && i/8 < int64(len(bits)) {
@@ -1214,7 +1278,11 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 		g.mu.Lock()
 		g.got[idx] = true
 		g.dirty++
-		shouldSave := g.dirty >= 8
+		// 进度落盘节奏：每 8 块（32MB）一次；但**块数少的文件必须每块
+		// 都存**——否则总块数 <8 的文件（<32MB）永远存不了进度，重启后
+		// 已收数据全丢。实测 20MB 文件传到 16MB 时中断，因为只有 5 块
+		// 而从未写过进度文件，续传退化成从头再来。
+		shouldSave := g.dirty >= 8 || g.expected <= 16
 		if shouldSave {
 			g.dirty = 0
 		}
