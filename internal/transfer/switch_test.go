@@ -468,3 +468,81 @@ func TestConcurrentTransfers(t *testing.T) {
 		t.Error(e)
 	}
 }
+
+// TestConcurrentTransfersTCP 并发 TCP 回归——真机舰队边是 TCP，
+// 之前的并发测试全走 QUIC（这就是进程内全绿真机翻车的原因嫌疑）。
+func TestConcurrentTransfersTCP(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, verify := grantKeys(t)
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpPort := raw.Addr().(*net.TCPAddr).Port
+	raw.Close()
+	_, _, dstCert, err := root.Issue("dst", true, ca.RoleNode, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{dstCert},
+		ClientCAs:    root.Pool(),
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS13,
+	}
+	tln, err := tls.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort)), serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tln.Close()
+	go ServeTCP(tln, "dst", verify, clientTLSFor(t, root, "dst"))
+
+	dir := t.TempDir()
+	var wg sync.WaitGroup
+	errs := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		payload := make([]byte, 8*1024*1024)
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatal(err)
+		}
+		src := filepath.Join(dir, fmt.Sprintf("t%d.bin", i))
+		os.WriteFile(src, payload, 0o600)
+		grant := &api.TransferGrant{
+			ID: fmt.Sprintf("xfer-conc-tcp-%d-%d", i, time.Now().UnixNano()),
+			Src: "src", Dst: "dst", Streams: 4,
+			Hops: []api.Hop{
+				{NodeID: "src"},
+				{NodeID: "dst", Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort-1)), Proto: "tcp"},
+			},
+			SrcPath: src, DstPath: filepath.Join(dir, fmt.Sprintf("o%d", i), "d.bin"),
+		}
+		sign(grant)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			if _, err := SendFile(ctx, src, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
+				errs <- fmt.Errorf("并发TCP任务失败: %w", err)
+				return
+			}
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) {
+				if _, err := os.Stat(grant.DstPath); err == nil {
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			errs <- fmt.Errorf("文件未落盘: %s", grant.DstPath)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}

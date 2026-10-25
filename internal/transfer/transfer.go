@@ -13,6 +13,7 @@
 package transfer
 
 import (
+	"log"
 	"strings"
 	"crypto/ed25519"
 	"crypto/x509"
@@ -450,11 +451,13 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 }
 
 func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
+	tA := time.Now()
 	stream, closeConn, err := open()
 	if err != nil {
 		return fmt.Errorf("建流失败: %w", err)
 	}
 	defer closeConn()
+	tB := time.Now()
 
 	gj, err := json.Marshal(grant)
 	if err != nil {
@@ -467,12 +470,15 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
+	log.Printf("[tl] %s 流%d 建流%v 写头完成", grant.ID, r, tB.Sub(tA))
 	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
 	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
 	have := map[int64]bool{}
 	if rd, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
 		rd.SetReadDeadline(time.Now().Add(3 * time.Second))
-		if line, err := readLine(stream); err == nil && strings.HasPrefix(line, "HAVE ") {
+		line, lerr := readLine(stream)
+		log.Printf("[tl] %s 流%d HAVE读取完成 err=%v", grant.ID, r, lerr)
+		if lerr == nil && strings.HasPrefix(line, "HAVE ") {
 			if bits, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, "HAVE ")); err == nil {
 				for i := 0; i*8 < len(bits); i++ {
 					for b := 0; b < 8; b++ {
