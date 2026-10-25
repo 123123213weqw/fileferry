@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"fileferry/internal/api"
@@ -410,9 +409,11 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 	// 直连目标节点的数据面（Hops[1] 由 controller 填好地址与 TCP 端口）。
 	// Proto 不在签名内，可以自由切换：先按提示试，失败再换另一种。
 	// 之前 controller 硬编码 tcp，等于直推永远用不上 QUIC。
-	// 进度显示：被墙链路上大文件可能跑几分钟，没有进度用户无法判断
-	// 是卡死还是在传（我自己实测 91 秒静默卡顿时就分不清）。
-	stopProgress := startProgress(os.Stderr, fi.Size())
+	// 进度显示 + 停滞检测共用同一份计数。
+	// 进度：被墙链路上大文件可能跑几分钟，没有进度用户无法判断是卡死
+	// 还是在传（我自己实测 91 秒静默卡顿时就分不清）。
+	prog := &progressState{}
+	stopProgress := startProgress(os.Stderr, fi.Size(), prog)
 	defer stopProgress()
 
 	protos := pickProtos(protoSel, grant.Hops[1].Proto)
@@ -421,10 +422,38 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 		lastE error
 		start = time.Now()
 	)
-	for _, pr := range protos {
+	for i, pr := range protos {
 		h := grant.Hops[1]
 		h.Proto = pr
-		n, lastE = transfer.SendFile(ctx, localPath, transfer.OpenerDirect(ctx, h, tlsConf), tlsConf, &grant)
+		prog.reset()
+		// 每种尝试用独立 ctx：看门狗取消它即切断该协议的连接；
+		// 外层 ctx 仍可用于整体超时/中断。
+		actx, acancel := context.WithCancel(ctx)
+		doneCh := make(chan struct{})
+		if fi.Size() > stallMinBytes && i+1 < len(protos) {
+			go func() {
+				t := time.NewTicker(500 * time.Millisecond)
+				defer t.Stop()
+				for {
+					select {
+					case <-doneCh:
+						return
+					case <-t.C:
+					}
+					sent, el := prog.snapshot()
+					if shouldSwitch(el, sent, fi.Size()) {
+						fmt.Fprintf(os.Stderr, "\r  %s 太慢（%.0f KB/s），切换到 %s 重试（已收部分保留）\n",
+							pr, float64(sent)/el.Seconds()/1024, protos[i+1])
+						acancel()
+						return
+					}
+				}
+			}()
+		}
+		open := cancellableOpener(actx, transfer.OpenerDirect(actx, h, tlsConf))
+		n, lastE = transfer.SendFile(actx, localPath, open, tlsConf, &grant)
+		close(doneCh)
+		acancel()
 		if lastE == nil {
 			break
 		}
@@ -637,32 +666,27 @@ func localIPTowards(base string) string {
 	return "127.0.0.1"
 }
 
-// startProgress 启动一个后台渲染协程，把"已发字节"画成单行进度。
-// 返回的函数用于停止并换行。仅在 stderr 是终端时输出，避免污染管道。
-func startProgress(w *os.File, total int64) func() {
+// startProgress 启动后台渲染协程，把进度画成单行。
+//
+// 进度计数同时供看门狗使用（见 watchdog.go）：两者必须共用同一份
+// 计数，否则判断"跑得慢"的依据和用户看到的不一致。
+// 返回的函数用于停止并换行。
+func startProgress(w *os.File, total int64, st *progressState) func() {
+	if st != nil {
+		transfer.SetProgressSink(func(n int64) { st.add(n) })
+	}
 	if total <= 0 {
-		return func() {}
-	}
-	isTTY := false
-	if st, err := w.Stat(); err == nil {
-		isTTY = st.Mode()&os.ModeCharDevice != 0
-	}
-	if !isTTY {
-		// 非终端也保留进度回调（供测试/未来用），但不打印
-		transfer.SetProgressSink(nil)
 		return func() { transfer.SetProgressSink(nil) }
 	}
-	var (
-		mu    sync.Mutex
-		sent  int64
-		done  = make(chan struct{})
-		begin = time.Now()
-	)
-	transfer.SetProgressSink(func(n int64) {
-		mu.Lock()
-		sent = n
-		mu.Unlock()
-	})
+	isTTY := false
+	if fi, err := w.Stat(); err == nil {
+		isTTY = fi.Mode()&os.ModeCharDevice != 0
+	}
+	if !isTTY {
+		// 非终端（脚本/管道）：不打印，但保留计数供看门狗使用
+		return func() { transfer.SetProgressSink(nil) }
+	}
+	done := make(chan struct{})
 	go func() {
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
@@ -672,9 +696,7 @@ func startProgress(w *os.File, total int64) func() {
 				return
 			case <-t.C:
 			}
-			mu.Lock()
-			cur := sent
-			mu.Unlock()
+			cur, el := st.snapshot()
 			pct := float64(cur) / float64(total) * 100
 			if pct > 100 {
 				pct = 100
@@ -686,10 +708,9 @@ func startProgress(w *os.File, total int64) func() {
 				fmt.Fprintf(w, "\r  已发完，等待对端校验确认…（%s）   ", humanBytes(total))
 				continue
 			}
-			el := time.Since(begin).Seconds()
 			speed := 0.0
-			if el > 0.2 {
-				speed = float64(cur) / el / (1 << 20)
+			if el.Seconds() > 0.2 {
+				speed = float64(cur) / el.Seconds() / (1 << 20)
 			}
 			fmt.Fprintf(w, "\r  %5.1f%%  %s / %s  %.1f MB/s   ",
 				pct, humanBytes(cur), humanBytes(total), speed)
