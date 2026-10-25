@@ -916,13 +916,13 @@ func probeLoop() {
 				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 				defer cancel()
-				rtt, proto, err := transfer.Probe(ctx, tg.addr, tlsConf)
+				rtt, proto, alt, err := transfer.ProbeWithAlt(ctx, tg.addr, tlsConf)
 				if err != nil {
 					log.Printf("探测 %s(%s) 失败：%v", tg.id, tg.addr, err)
 					return
 				}
 				muEdges.Lock()
-				found = append(found, api.EdgeReport{To: tg.id, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto, Addr: tg.addr})
+				found = append(found, api.EdgeReport{To: tg.id, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto, Addr: tg.addr, AltProto: alt})
 				muEdges.Unlock()
 			}(tg)
 		}

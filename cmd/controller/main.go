@@ -1129,6 +1129,10 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Enc:       true, // 端到端加密默认开启（中继/交换台只见密文）
 	}
+	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
+	if len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
+		grant.Mix = true
+	}
 	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
 	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。
 	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4

@@ -322,11 +322,26 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 	errCh := make(chan error, n)
 	var wg sync.WaitGroup
 	for r := 0; r < n; r++ {
+		// 混流：奇数流换副协议（tcp<->quic 对称推导，端口约定由
+		// DialStream 处理），叠加两种限速配额；副协议失败自然回退主协议
+		thisOpen, thisGrant := open, grant
+		if grant.Mix && r%2 == 1 && len(grant.Hops) >= 2 {
+			g2 := *grant
+			h := g2.Hops[1]
+			if h.Proto == "tcp" {
+				h.Proto = "quic"
+			} else {
+				h.Proto = "tcp"
+			}
+			g2.Hops[1] = h
+			thisOpen = OpenerDirect(ctx, h, tlsConf)
+			thisGrant = &g2
+		}
 		wg.Add(1)
-		go func(r int) {
+		go func(r int, o StreamOpener, g2 *api.TransferGrant) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, open, grant, mf, startCh, endCh, r, n)
-		}(r)
+			errCh <- sendShare(ctx, f, o, g2, mf, startCh, endCh, r, n)
+		}(r, thisOpen, thisGrant)
 	}
 	wg.Wait()
 	close(errCh)
@@ -1093,20 +1108,27 @@ func relayStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, self
 // TCP 的 RTT 不劣于 QUIC 的 1.5 倍则选 TCP——UDP 被策略限速的网络
 // 里 TCP 吞吐常有数量级优势（实测 4.5×），RTT 相近时应优选；
 // UDP 被禁则自然回退 TCP。返回往返时延与选定协议。
-func Probe(ctx context.Context, addr string, tlsConf *tls.Config) (rtt time.Duration, proto string, err error) {
+func Probe(ctx context.Context, addr string, tlsConf *tls.Config) (time.Duration, string, error) {
+	rtt, proto, _, err := ProbeWithAlt(ctx, addr, tlsConf)
+	return rtt, proto, err
+}
+
+// ProbeWithAlt 返回（胜者协议, 副协议或空, rtt, err）。两者皆通时
+// 副协议非空——混流将各流分散到两条协议通道。
+func ProbeWithAlt(ctx context.Context, addr string, tlsConf *tls.Config) (time.Duration, string, string, error) {
 	qRTT, qErr := probeOne(ctx, addr, "quic", tlsConf)
 	tRTT, tErr := probeOne(ctx, addr, "tcp", tlsConf)
 	switch {
 	case qErr != nil && tErr != nil:
-		return 0, "", tErr
+		return 0, "", "", tErr
 	case qErr != nil:
-		return tRTT, "tcp", nil
+		return tRTT, "tcp", "", nil
 	case tErr != nil:
-		return qRTT, "quic", nil
+		return qRTT, "quic", "", nil
 	case tRTT < qRTT*3/2:
-		return tRTT, "tcp", nil // RTT 接近 → TCP（吞吐优先）
+		return tRTT, "tcp", "quic", nil // RTT 接近 → TCP 主（吞吐优先），QUIC 副
 	default:
-		return qRTT, "quic", nil
+		return qRTT, "quic", "tcp", nil
 	}
 }
 

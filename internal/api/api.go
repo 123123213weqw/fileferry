@@ -29,6 +29,9 @@ type EdgeReport struct {
 	RTTms float64 `json:"rtt_ms"`
 	Proto string  `json:"proto"`
 	Addr  string  `json:"addr"`
+	// AltProto：两种协议都通时的副协议（混流用：并行流各占一条
+	// 协议通道，叠加两种限速配额）。空 = 只有一种可用。
+	AltProto string `json:"alt_proto,omitempty"`
 }
 
 // Heartbeat 是 agent 每 5 秒上报的实时负载与可达性快照，
@@ -152,6 +155,7 @@ type TransferGrant struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 	Retries    int       `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
 	Enc        bool      `json:"enc,omitempty"`    // 端到端加密（密钥经 controller 专递，不进 grant）
+	Mix        bool      `json:"mix,omitempty"`    // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
 	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
 }
 
@@ -200,7 +204,7 @@ func (g *TransferGrant) payload() []byte {
 	sb.WriteString(g.SrcPath)
 	sb.WriteByte('|')
 	sb.WriteString(g.DstPath)
-	fmt.Fprintf(&sb, "|%d|%d|%d|%v", g.Streams, g.Retries, g.ExpiresAt.Unix(), g.Enc)
+	fmt.Fprintf(&sb, "|%d|%d|%d|%v|%v", g.Streams, g.Retries, g.ExpiresAt.Unix(), g.Enc, g.Mix)
 	return []byte(sb.String())
 }
 

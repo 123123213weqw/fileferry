@@ -101,6 +101,22 @@ func (g *Graph) Addr(id api.NodeID) string {
 // LoadPct 返回节点当前负载水位（0-100），离线返回 200（评分归零）。
 func (g *Graph) LoadPct(id api.NodeID) float64 { return g.loadPct(id) }
 
+// EdgeAlt 返回该边的副协议（混流用），无则空。
+func (g *Graph) EdgeAlt(from, to api.NodeID) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n, ok := g.nodes[from]
+	if !ok || g.now().Sub(n.seen) >= HeartbeatTimeout {
+		return ""
+	}
+	for _, e := range n.hb.Edges {
+		if e.To == to {
+			return e.AltProto
+		}
+	}
+	return ""
+}
+
 // EdgeDetail 是 from→to 这条出边的细节：拨号协议与实际拨通地址
 //（打洞成功的边是公网映射）。不存在或陈旧时 ok=false。
 func (g *Graph) EdgeDetail(from, to api.NodeID) (proto, addr string, ok bool) {
