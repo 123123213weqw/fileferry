@@ -80,3 +80,28 @@ func TestGrantPayloadV2DistinguishesFields(t *testing.T) {
 		t.Fatal("篡改后仍然验签通过")
 	}
 }
+
+// 回归：磁盘水位必须参与负载评分。之前 LoadPct 只算 CPU/内存均值，
+// 磁盘快满的节点照样被选成中继与目的端，写满后传输失败。
+func TestLoadPctIncludesDisk(t *testing.T) {
+	// 健康节点：CPU 10 / 内存 20 / 磁盘余量充足 → 仍是 15
+	ok := Heartbeat{CPUPct: 10, MemPct: 20, DiskFreeBytes: 100 << 30}
+	if got := ok.LoadPct(); got != 15 {
+		t.Fatalf("健康节点负载应为 15，实际 %.1f", got)
+	}
+	// 磁盘只剩 200MB：水位应接近 90，压过 CPU/内存
+	tight := Heartbeat{CPUPct: 10, MemPct: 20, DiskFreeBytes: 200 << 20}
+	if got := tight.LoadPct(); got < 85 {
+		t.Fatalf("磁盘余量 200MB 时负载应接近 90，实际 %.1f（回归：磁盘未参与）", got)
+	}
+	// 磁盘满：应到 100，超过 MaxLoadPct=80 → 不会被选为中继
+	full := Heartbeat{DiskFreeBytes: 1}
+	if got := full.LoadPct(); got < 99 {
+		t.Fatalf("磁盘将满时负载应约 100，实际 %.1f", got)
+	}
+	// 未上报磁盘（旧 agent）时退回 CPU/内存均值，不能因此把节点判死
+	legacy := Heartbeat{CPUPct: 10, MemPct: 20}
+	if got := legacy.LoadPct(); got != 15 {
+		t.Fatalf("未上报磁盘时应退回 CPU/内存均值，实际 %.1f", got)
+	}
+}

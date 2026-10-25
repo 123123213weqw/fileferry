@@ -7,7 +7,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // 负载采集：M4「负载感知调度」的唯一数据源。之前 CPUPct/MemPct/
@@ -115,13 +114,4 @@ func memPct() float64 {
 		p = 100
 	}
 	return p
-}
-
-// diskFree 返回 path 所在文件系统的可用字节数。
-func diskFree(path string) uint64 {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return 0
-	}
-	return st.Bavail * uint64(st.Bsize)
 }

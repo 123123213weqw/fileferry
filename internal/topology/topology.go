@@ -109,6 +109,31 @@ func (g *Graph) Addr(id api.NodeID) string {
 	return n.hb.Addr
 }
 
+// bwMu/bw 保存实测边吞吐（MB/s），键为 (from,to)。
+// 由 controller 在收到 jobdone 后回填。
+var (
+	bwMu sync.RWMutex
+	bw   = map[[2]api.NodeID]float64{}
+)
+
+// SetEdgeBW 记录一条边的实测吞吐（MB/s，<=0 表示清除）。
+func SetEdgeBW(from, to api.NodeID, mbps float64) {
+	bwMu.Lock()
+	defer bwMu.Unlock()
+	if mbps <= 0 {
+		delete(bw, [2]api.NodeID{from, to})
+		return
+	}
+	bw[[2]api.NodeID{from, to}] = mbps
+}
+
+// edgeBW 返回实测吞吐（0 = 未知）。
+func edgeBW(from, to api.NodeID) float64 {
+	bwMu.RLock()
+	defer bwMu.RUnlock()
+	return bw[[2]api.NodeID{from, to}]
+}
+
 // LoadPct 返回节点当前负载水位（0-100），离线返回 200（评分归零）。
 func (g *Graph) LoadPct(id api.NodeID) float64 { return g.loadPct(id) }
 
@@ -194,7 +219,13 @@ func (g *Graph) loadPct(id api.NodeID) float64 {
 }
 
 // Path 为一次传输选链，返回从 src 到 dst 的完整节点序列（含两端，
-// 不含中继时就是 [src, dst]）。边权 = rtt × (1 + 中继负载/100)；
+// 不含中继时就是 [src, dst]）。
+//
+// 边权 = rtt × (1 + 目标负载/100) / 实测吞吐权重。
+// 第三项来自 SetEdgeBW 回填的实测吞吐（见 controller 的 jobdone），
+// 让"rtt 很短但实际很慢"的边（例如同机房但限速、或高丢包链路）
+// 不再被优先选中。没有实测值时该项为 1，退化为纯 rtt。
+//
 // 负载超过 MaxLoadPct 的节点不会被选为中继。不可达返回 nil。
 func (g *Graph) Path(src, dst api.NodeID) []api.NodeID {
 	if src == dst {
@@ -219,6 +250,16 @@ func (g *Graph) Path(src, dst api.NodeID) []api.NodeID {
 				continue
 			}
 			w := e.rttMs * (1 + g.loadPct(e.to)/100)
+			// 实测吞吐修正：100MB/s 的边权重减半，10MB/s 的边权重翻倍。
+			// 没有实测值时 bwW=1，退化为纯 rtt×负载。
+			bwW := 1.0
+			if m := edgeBW(u.id, e.to); m > 0 {
+				bwW = 50.0 / (m + 50.0) * 1.5 // m=50 → 0.75；m→0 → 1.5
+				if bwW < 0.3 {
+					bwW = 0.3
+				}
+			}
+			w *= bwW
 			if d, ok := dist[e.to]; !ok || u.d+w < d {
 				dist[e.to] = u.d + w
 				prev[e.to] = u.id

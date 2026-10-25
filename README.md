@@ -151,8 +151,9 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       监听/拨号/WHOAMI 同源）✅ 对发开洞 + 前缀探测自动建边
       真实环境验证：跨两个校园 NAT 的对等打洞被对称型 NAT 拒绝
       （双方同时行动、地址正确、失败被正确识别并回落中继）
-- [x] M4 每任务限速 / 精准负载：✅ /proc 指标采集（CPU/内存/磁盘已进心跳，边权与中继排除
-真正生效）✅ 每任务限速 ⬜ 边权调优 ⬜ 磁盘水位参与调度
+- [x] M4 精准负载 / 限速：✅ /proc 指标采集 ✅ 每任务限速 ✅ 磁盘水位参与调度
+（LoadPct 取 CPU/内存/磁盘三维最高值，余量 <2GiB 开始告警，超过 80% 不作中继）
+✅ 边权调优（实测吞吐经 EMA 平滑后真正参与选链，不再只看 rtt）
 - [x] M11 临时取件码：ff share / ff get（含加密路径，端到端实测通过）
 - [ ] M5 收尾：✅ systemd 沙箱单元（systemd/）✅ 安全自检脚本
       （scripts/security-check.sh）✅ make audit（govulncheck）

@@ -62,7 +62,33 @@ type Heartbeat struct {
 }
 
 // LoadPct 汇总负载水位，供拓扑调度作边权。
-func (h Heartbeat) LoadPct() float64 { return (h.CPUPct + h.MemPct) / 2 }
+// LoadPct 返回节点负载水位（0-100+）。
+//
+// 之前只算 CPU 与内存的均值，磁盘水位完全不参与调度——一个磁盘快满的
+// 节点照样会被选成中继与目的端，写满后传输失败。现在把"磁盘余量"当
+// 一维水位纳入：
+//
+//	diskPct = 100 - free/2GiB*100   （低于 2GiB 余量开始告警）
+//
+// 2GiB 是经验阈值：小于它时再大的文件也可能写不进去。
+func (h Heartbeat) LoadPct() float64 {
+	base := (h.CPUPct + h.MemPct) / 2
+	if h.DiskFreeBytes > 0 {
+		const reserve = 2 << 30 // 2 GiB
+		diskPct := 100.0
+		if h.DiskFreeBytes < uint64(reserve) {
+			// 余量越少越接近 100；完全没有余量时封顶 100
+			diskPct = 100 - float64(h.DiskFreeBytes)/float64(reserve)*100
+		} else {
+			diskPct = 0
+		}
+		// 取三者最大：任一维吃紧都应当降低该节点的吸引力
+		if diskPct > base {
+			return diskPct
+		}
+	}
+	return base
+}
 
 // PeerInfo 是心跳响应里下发的在线节点信息，供 agent 互相探测。
 type PeerInfo struct {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fileferry/internal/api"
 	"fileferry/internal/ca"
+	"fileferry/internal/topology"
 	"fmt"
 	"log"
 	"net"
@@ -897,9 +898,20 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 		c.jobUpdate(req.GrantID, "done")
 		if req.Bytes > 0 && req.Duration > 0 {
 			if dst := c.lookupGrantDst(req.GrantID); dst != "" {
+				mbps := float64(req.Bytes) / req.Duration / 1e6
 				c.mu.Lock()
-				c.pathBW[[2]api.NodeID{req.NodeID, dst}] = float64(req.Bytes) / req.Duration / 1e6
+				key := [2]api.NodeID{req.NodeID, dst}
+				// EMA 平滑：单次传输受缓存/调度影响抖动很大，直接覆盖会让
+				// 选路在两个中继之间来回跳。
+				if prev, ok := c.pathBW[key]; ok && prev > 0 {
+					mbps = prev*0.7 + mbps*0.3
+				}
+				c.pathBW[key] = mbps
 				c.mu.Unlock()
+				// 同步给选链算法：在此之前 Path() 只看 rtt，实测吞吐完全
+				// 没参与路由（只用于交换台/多源评分），"rtt 短但很慢"的
+				// 边仍然会被优先选中。
+				topology.SetEdgeBW(req.NodeID, dst, mbps)
 			}
 		}
 	} else {
