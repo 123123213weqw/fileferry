@@ -32,7 +32,7 @@ import (
 const usage = `用法：
   ffctl -cert-dir <dir> put  <本机文件> <dst-node>:<path>   ← 本机直推（等价 scp）
   ffctl -cert-dir <dir> get  <src-node>:<path> <本机路径>   ← 拉取到本机（等价 scp）
-  ffctl -rate <字节/秒> -streams <n> ...                      ← 可选：限速 / 并行流数
+  ffctl -rate <字节/秒> -streams <n> -proto quic|tcp ...      ← 可选：限速 / 并行流数 / 强制协议
   ffctl -cert-dir <dir> send <src-node>:<path> <dst-node>:<path>
   ffctl -cert-dir <dir> status
 
@@ -48,9 +48,20 @@ func main() {
 	streams := 0        // -streams：并行流数，0 = 由 controller 决定
 	advertise := ""     // -advertise：ffctl 接收端对外地址（NAT 后需显式给）
 	pinHash := false    // -pin：把源节点索引里的摘要钉进授权（强校验）
+	// -proto：强制数据面协议。auto（默认）= 按提示依次尝试；
+	// quic / tcp 则只试一种。高丢包链路上 QUIC 会因拥塞控制把吞吐
+	// 压到极低（实测 2% 丢包时 10MB 从 0.5s 变 25s），此时应显式选 tcp。
+	protoSel := "auto"
 	args := os.Args[1:]
 	var rest []string
 	for i := 0; i < len(args); i++ {
+		if args[i] == "-proto" {
+			if i+1 < len(args) {
+				protoSel = args[i+1]
+				i++
+			}
+			continue
+		}
 		if args[i] == "-pin" {
 			pinHash = true
 			continue
@@ -189,7 +200,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "目标格式应为 node:/path")
 			os.Exit(2)
 		}
-		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, streams, noWait); err != nil {
+		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, streams, protoSel, noWait); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -357,7 +368,7 @@ func dataPlaneTLS(certDir string) (*tls.Config, error) {
 // 完整性：授权里带 FileSHA256/FileSize（controller 签名钉死），接收端
 // 校验 manifest 与之一致，且逐块 SHA256——与节点间传输同一套保证。
 // 权限：目标节点的 allowed-dirs 白名单照常生效。
-func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, streams int, noWait bool) error {
+func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, streams int, protoSel string, noWait bool) error {
 	fi, err := os.Stat(localPath)
 	if err != nil {
 		return fmt.Errorf("读本机文件失败：%w", err)
@@ -398,7 +409,7 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 	// 直连目标节点的数据面（Hops[1] 由 controller 填好地址与 TCP 端口）。
 	// Proto 不在签名内，可以自由切换：先按提示试，失败再换另一种。
 	// 之前 controller 硬编码 tcp，等于直推永远用不上 QUIC。
-	protos := dedupProtos(grant.Hops[1].Proto, "quic", "tcp")
+	protos := pickProtos(protoSel, grant.Hops[1].Proto)
 	var (
 		n     int64
 		lastE error
@@ -618,6 +629,15 @@ func localIPTowards(base string) string {
 		return a.IP.String()
 	}
 	return "127.0.0.1"
+}
+
+// pickProtos 决定尝试顺序。auto = 提示值 → quic → tcp；
+// 显式指定时只试那一种（避免在高丢包链路上一遍遍重试 QUIC）。
+func pickProtos(sel, hint string) []string {
+	if sel == "quic" || sel == "tcp" {
+		return []string{sel}
+	}
+	return dedupProtos(hint, "quic", "tcp")
 }
 
 // dedupProtos 按顺序去重并丢掉空串（第一个通常是 controller 给的建议值）。

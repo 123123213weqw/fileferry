@@ -48,6 +48,10 @@ type Config struct {
 	// BindAddr 是数据面监听地址（默认空 = 所有接口）。多网卡主机可用它
 	// 只绑某个内网口；也用于测试里把流量引入延迟代理。
 	BindAddr string `yaml:"bind-addr"`
+	// TCPAdvertisePort 是**对外公布**的 TCP 端口（0 = 与 tcp-port 相同）。
+	// 用于数据面在 NAT / 端口转发 / 代理之后时：自己监听 tcp-port，
+	// 但对端应按这个端口拨号。
+	TCPAdvertisePort int `yaml:"tcp-advertise-port"`
 	// TCPPort 让 TCP 数据面使用固定端口（0 = data-port+1）。
 	// 被墙网络只放行 443 时，写 443 即可用纯 TCP 打通。
 	TCPPort int    `yaml:"tcp-port"`
@@ -861,6 +865,9 @@ func strconvAtoi(s string) (int, error) {
 
 // tcpPortAdvertised 返回本节点对外公布的 TCP 数据面端口。
 func tcpPortAdvertised() int {
+	if cfg.TCPAdvertisePort > 0 {
+		return cfg.TCPAdvertisePort
+	}
 	if cfg.TCPPort > 0 {
 		return cfg.TCPPort
 	}
