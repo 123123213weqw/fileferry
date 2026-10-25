@@ -3,6 +3,7 @@ package transfer
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -562,5 +563,102 @@ func TestRegressStreamsCappedByChunks(t *testing.T) {
 		if got := capStreams(c.size, 4); got != c.want {
 			t.Fatalf("size=%d 时流数应为 %d，实际 %d", c.size, c.want, got)
 		}
+	}
+}
+
+// 回归：接收端写完 HAVE 后必须清掉那个 5 秒写超时。
+//
+// 该 SetWriteDeadline 作用于连接上**之后的所有写**，包括末尾的 ACK。
+// 只要对端在 5 秒之后才把数据送完，ACK 就会 "i/o timeout" → 发送端看到
+// EOF → 文件已完整落盘却报失败并重试（实测 5MB@1MB/s 要 185 秒才失败）。
+//
+// 这里手工扮演一个"慢对端"：读完 HAVE 后停 6 秒再发帧，让接收端的
+// ACK 落在 5 秒之后。
+func TestRegressSlowPeerStillGetsAck(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, _ := grantKeys(t)
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "slow.bin")
+	payload := make([]byte, ChunkSize)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(srcPath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srcTLS := clientTLSFor(t, root, "src")
+	grant := newGrant(t, "src", "dst", filepath.Join(dir, "out", "slow.bin"))
+	grant.ID = "xfer-slowpeer"
+	sign(grant)
+	mf, err := BuildManifest(grant.ID, srcPath, srcTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	srvCh := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			srvCh <- c
+		}
+	}()
+	cli, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := <-srvCh
+	defer cli.Close()
+
+	done := make(chan struct{})
+	go func() {
+		recvAsDst(srv, grant, root.Pool())
+		srv.Close()
+		close(done)
+	}()
+
+	// 手工按线上格式发：FFJ1 + grant 行 + manifest 行
+	gj, _ := json.Marshal(grant)
+	mj, _ := json.Marshal(mf)
+	io.WriteString(cli, "FFJ1")
+	cli.Write(append(gj, '\n'))
+	cli.Write(append(mj, '\n'))
+
+	// 等接收端写 HAVE
+	cli.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 512)
+	cli.Read(buf) // 可能读到 HAVE 行；超时也无妨
+	cli.SetReadDeadline(time.Time{})
+
+	// 关键：拖过 5 秒再发数据
+	time.Sleep(6 * time.Second)
+	if err := WriteFrame(cli, 0, payload); err != nil {
+		t.Fatalf("写数据失败：%v", err)
+	}
+	if err := WriteFrame(cli, -1, nil); err != nil {
+		t.Fatalf("写哨兵失败：%v", err)
+	}
+
+	cli.SetReadDeadline(time.Now().Add(15 * time.Second))
+	ack := make([]byte, 4)
+	if _, err := io.ReadFull(cli, ack); err != nil {
+		t.Fatalf("5 秒后读 ACK 失败（回归：HAVE 阶段的写超时被残留）：%v", err)
+	}
+	if string(ack) != "ACK\n" {
+		t.Fatalf("ACK 内容异常：%q", ack)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("接收端未退出")
+	}
+	if _, err := os.Stat(grant.DstPath); err != nil {
+		t.Fatalf("文件未落盘：%v", err)
 	}
 }

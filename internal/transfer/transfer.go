@@ -977,6 +977,14 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 			w.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		}
 		fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
+		// 必须立刻清掉这个写超时：它会把**后面所有写**（尤其末尾的
+		// ACK）都限制在 5 秒内。实测限速 1MB/s 传 5MB 时，接收端写
+		// ACK 已距 HAVE 超过 5 秒 → "i/o timeout" → 对端看到 EOF →
+		// 文件其实已完整落盘却报失败，并触发 3 次无谓重试（3 分钟）。
+		// 这不是限速专属：任何耗时 >5 秒的真实链路传输都会中招。
+		if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			w.SetWriteDeadline(time.Time{})
+		}
 	}
 	if err == ErrAlreadyDone {
 		// 先 ACK 让对端收尾，再 drain 到对端关闭——否则对端仍在写数据，
@@ -1010,7 +1018,14 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		fmt.Printf("接收 %s 校验失败：%v（文件已丢弃）\n", grant.ID, g.finErr)
 		return
 	}
-	stream.Write([]byte("ACK\n"))
+	// ACK 单独给一个明确的超时，而不是继承 HAVE 阶段的 5 秒（见上）。
+	if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		w.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	}
+	if _, err := stream.Write([]byte("ACK\n")); err != nil {
+		fmt.Printf("接收完成但 ACK 写失败 %s：%v（文件已落盘）\n", grant.ID, err)
+		return
+	}
 	fmt.Printf("接收完成：%s（src=%s，%d 字节）-> %s\n", grant.ID, grant.Src, mf.Size, grant.DstPath)
 }
 
