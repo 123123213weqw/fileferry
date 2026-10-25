@@ -662,3 +662,76 @@ func TestRegressSlowPeerStillGetsAck(t *testing.T) {
 		t.Fatalf("文件未落盘：%v", err)
 	}
 }
+
+// 回归：流被截断时必须**快速**失败，不能等到 90 秒写超时 / 10 分钟 ACK。
+//
+// 被墙网络里最常见的干扰是吞掉流的中段（而不是干净关连接）。实测一次
+// 1MB 传输因此卡了 91.23 秒（≈ 90s 写超时）才报错，用户无法判断是卡死
+// 还是在慢慢传。现在帧内静默超过 frameIdleTimeout 就断开。
+func TestRegressTruncatedStreamFailsFast(t *testing.T) {
+	seq := &scriptedConn{chunks: []scriptedChunk{
+		// 一帧的**合法**开头：magic + idx + 声明 20 字节，然后戛然而止。
+		// 必须用真实 Magic，否则 ReadFrame 会以 "bad magic" 提前返回，
+		// 测试就变成假通过（我第一版就是这么错的）。
+		{data: func() []byte {
+			b := make([]byte, headerLen)
+			copy(b, Magic)
+			b[7] = 1   // idx = 1
+			b[15] = 20 // 声明 20 字节
+			return b
+		}()},
+		// 此后再无数据，也不关闭 → 模拟流被吞
+	}}
+	start := time.Now()
+	// 用一个短超时验证机制本身（生产值是 30s）
+	old := frameIdleTimeout
+	frameIdleTimeout = 300 * time.Millisecond
+	defer func() { frameIdleTimeout = old }()
+
+	_, _, err := ReadFrame(seq)
+	el := time.Since(start)
+	if err == nil {
+		t.Fatal("截断的流应返回错误")
+	}
+	if el > 3*time.Second {
+		t.Fatalf("截断流应快速失败，实际耗时 %s（回归：无限等待）", el.Round(time.Millisecond))
+	}
+}
+
+type scriptedChunk struct {
+	data []byte
+}
+
+// scriptedConn 依次吐出预置数据；数据用尽后**阻塞**（不返回 EOF），
+// 模拟"流被中间设备吞掉"而不是正常关闭。
+type scriptedConn struct {
+	chunks []scriptedChunk
+	i      int
+	dead   chan struct{}
+	dl     time.Time
+}
+
+func (s *scriptedConn) Read(p []byte) (int, error) {
+	if s.dead == nil {
+		s.dead = make(chan struct{})
+	}
+	if !s.dl.IsZero() && time.Now().After(s.dl) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	if s.i >= len(s.chunks) {
+		// 阻塞到 deadline（若有）或永久
+		if s.dl.IsZero() {
+			select {}
+		}
+		time.Sleep(time.Until(s.dl))
+		return 0, os.ErrDeadlineExceeded
+	}
+	n := copy(p, s.chunks[s.i].data)
+	s.i++
+	return n, nil
+}
+
+func (s *scriptedConn) SetReadDeadline(t time.Time) error {
+	s.dl = t
+	return nil
+}

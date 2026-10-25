@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fileferry/internal/api"
@@ -409,6 +410,11 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 	// 直连目标节点的数据面（Hops[1] 由 controller 填好地址与 TCP 端口）。
 	// Proto 不在签名内，可以自由切换：先按提示试，失败再换另一种。
 	// 之前 controller 硬编码 tcp，等于直推永远用不上 QUIC。
+	// 进度显示：被墙链路上大文件可能跑几分钟，没有进度用户无法判断
+	// 是卡死还是在传（我自己实测 91 秒静默卡顿时就分不清）。
+	stopProgress := startProgress(os.Stderr, fi.Size())
+	defer stopProgress()
+
 	protos := pickProtos(protoSel, grant.Hops[1].Proto)
 	var (
 		n     int64
@@ -629,6 +635,85 @@ func localIPTowards(base string) string {
 		return a.IP.String()
 	}
 	return "127.0.0.1"
+}
+
+// startProgress 启动一个后台渲染协程，把"已发字节"画成单行进度。
+// 返回的函数用于停止并换行。仅在 stderr 是终端时输出，避免污染管道。
+func startProgress(w *os.File, total int64) func() {
+	if total <= 0 {
+		return func() {}
+	}
+	isTTY := false
+	if st, err := w.Stat(); err == nil {
+		isTTY = st.Mode()&os.ModeCharDevice != 0
+	}
+	if !isTTY {
+		// 非终端也保留进度回调（供测试/未来用），但不打印
+		transfer.SetProgressSink(nil)
+		return func() { transfer.SetProgressSink(nil) }
+	}
+	var (
+		mu    sync.Mutex
+		sent  int64
+		done  = make(chan struct{})
+		begin = time.Now()
+	)
+	transfer.SetProgressSink(func(n int64) {
+		mu.Lock()
+		sent = n
+		mu.Unlock()
+	})
+	go func() {
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+			}
+			mu.Lock()
+			cur := sent
+			mu.Unlock()
+			pct := float64(cur) / float64(total) * 100
+			if pct > 100 {
+				pct = 100
+			}
+			if cur >= total {
+				// 数据已发完但事务未结束：在等接收端校验并回 ACK。
+				// 明确标出来，否则"100% 却还在转"看起来像卡死——
+				// 实测这里可能持续数秒（对端要落盘 + 校验全文件哈希）。
+				fmt.Fprintf(w, "\r  已发完，等待对端校验确认…（%s）   ", humanBytes(total))
+				continue
+			}
+			el := time.Since(begin).Seconds()
+			speed := 0.0
+			if el > 0.2 {
+				speed = float64(cur) / el / (1 << 20)
+			}
+			fmt.Fprintf(w, "\r  %5.1f%%  %s / %s  %.1f MB/s   ",
+				pct, humanBytes(cur), humanBytes(total), speed)
+		}
+	}()
+	return func() {
+		close(done)
+		transfer.SetProgressSink(nil)
+		fmt.Fprintln(w)
+	}
+}
+
+// humanBytes 人类可读的字节数（1024 进制）。
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // pickProtos 决定尝试顺序。auto = 提示值 → quic → tcp；

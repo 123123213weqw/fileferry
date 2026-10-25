@@ -66,9 +66,50 @@ func WriteFrame(w io.Writer, idx int64, data []byte) error {
 
 // ReadFrame 从 r 读出一帧并校验哈希，返回块号与数据。
 // 零长度帧是完成哨兵。
+// frameIdleTimeout：一帧之内多久收不到任何字节就判定流已被破坏。
+//
+// 存在的理由：被墙网络里最常见的干扰形式是**截断或吞掉流的中段**，
+// 而不是干净地关连接。此时接收端会一直等"还没到的字节"，原来只有
+// 调用方的 90 秒写超时 / 10 分钟 ACK 超时兜底——实测一次 1MB 传输
+// 因此卡了 91 秒才报失败，用户完全无法判断是卡死还是在慢慢传。
+//
+// 取 30 秒：正常链路单帧（4MB）即使 1MB/s 也只要 4 秒，30 秒静默
+// 只可能是流断了。
+//
+// 声明为 var 便于测试覆盖（生产值 30s）。
+var frameIdleTimeout = 30 * time.Second
+
+// idleReader 在每次 Read 前设置读超时，实现"帧内静默即失败"。
+type idleReader struct {
+	r  io.Reader
+	to time.Duration
+}
+
+func (ir *idleReader) Read(p []byte) (int, error) {
+	if d, ok := ir.r.(interface{ SetReadDeadline(time.Time) error }); ok && ir.to > 0 {
+		_ = d.SetReadDeadline(time.Now().Add(ir.to))
+	}
+	return ir.r.Read(p)
+}
+
+// tracef 打印数据面跟踪日志。默认关闭：`ffctl put` 是给人和脚本用的
+// 命令，默认刷这些内部时序日志会淹没真正的输出（scp 不会这么吵）。
+// 排查时设 FF_DEBUG=1 打开。
+func tracef(format string, args ...any) {
+	if os.Getenv("FF_DEBUG") == "" {
+		return
+	}
+	log.Printf(format, args...)
+}
+
 func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
+	ir := &idleReader{r: r, to: frameIdleTimeout}
+	rh := io.Reader(ir)
+	if _, ok := r.(interface{ SetReadDeadline(time.Time) error }); !ok {
+		rh = r // 不支持 deadline 的实现（测试用 buffer 等）保持原样
+	}
 	hdr := make([]byte, headerLen)
-	if _, err := io.ReadFull(r, hdr); err != nil {
+	if _, err := io.ReadFull(rh, hdr); err != nil {
 		return 0, nil, err
 	}
 	if string(hdr[:4]) != Magic {
@@ -80,11 +121,11 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 		return 0, nil, fmt.Errorf("chunk too large: %d", n)
 	}
 	data = make([]byte, n)
-	if _, err := io.ReadFull(r, data); err != nil {
+	if _, err := io.ReadFull(rh, data); err != nil {
 		return 0, nil, err
 	}
 	var sum [32]byte
-	if _, err := io.ReadFull(r, sum[:]); err != nil {
+	if _, err := io.ReadFull(rh, sum[:]); err != nil {
 		return 0, nil, err
 	}
 	if sha256.Sum256(data) != sum {
@@ -258,14 +299,14 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
-	log.Printf("[tl] %s 流%d 建流%v 写头完成", grant.ID, r, tB.Sub(tA))
+	tracef("[tl] %s 流%d 建流%v 写头完成", grant.ID, r, tB.Sub(tA))
 	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
 	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
 	have := map[int64]bool{}
 	if rd, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
 		rd.SetReadDeadline(time.Now().Add(3 * time.Second))
 		line, lerr := readLine(stream)
-		log.Printf("[tl] %s 流%d HAVE读取完成 err=%v", grant.ID, r, lerr)
+		tracef("[tl] %s 流%d HAVE读取完成 err=%v", grant.ID, r, lerr)
 		if lerr == nil && strings.HasPrefix(line, "HAVE ") {
 			if bits, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, "HAVE ")); err == nil {
 				for i := 0; i*8 < len(bits); i++ {

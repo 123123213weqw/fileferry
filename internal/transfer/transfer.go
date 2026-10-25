@@ -58,6 +58,33 @@ func SetTransport(t *quic.Transport) { sharedTransport = t }
 // target 发过包"这条 NAT 放行记录。dur 结束后停止。
 // 同时向映射端口 ±32 扇形喷洒（对称 NAT 的端口预测：对端出口
 // 映射端口通常在已观测映射附近递增），提高对穿成功率。
+// progressSink 是发送进度回调，只给 CLI 设（守护进程不设）。
+//
+// 存在的理由：被墙链路上一次大文件传输可能跑几十秒到几分钟，没有进度
+// 输出时用户无法区分"在慢慢传"和"已经卡死"——这正是我自己实测时遇到
+// 91 秒静默卡顿、只能靠猜的情况。
+var (
+	progressMu   sync.RWMutex
+	progressSink func(sent int64)
+)
+
+// SetProgressSink 注册发送进度回调（nil 取消）。回调在发送路径上同步
+// 调用，必须快速返回。
+func SetProgressSink(fn func(sent int64)) {
+	progressMu.Lock()
+	progressSink = fn
+	progressMu.Unlock()
+}
+
+func emitProgress(sent int64) {
+	progressMu.RLock()
+	fn := progressSink
+	progressMu.RUnlock()
+	if fn != nil {
+		fn(sent)
+	}
+}
+
 // taskRate 是**整任务**（跨全部并行流）共享的限速器。
 //
 // 注意：不能每流各算各的——4 条流各限 2MB/s 合计就是 8MB/s，
@@ -78,6 +105,7 @@ func (t *taskRate) take(n int64) {
 	sent := t.sent
 	limit := t.limit
 	t.mu.Unlock()
+	emitProgress(sent)
 	if limit <= 0 {
 		return
 	}
