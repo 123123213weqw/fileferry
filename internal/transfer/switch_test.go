@@ -291,3 +291,68 @@ func TestParallelStreamsTCP(t *testing.T) {
 		t.Fatalf("内容不一致：%d vs %d", len(payload), len(got))
 	}
 }
+
+// TestResumeAfterInterrupt 断点续传：第一次传一半掐断（ctx 取消），
+// 第二次新 grant 续传——接收端应跳过已收块并最终完整一致。
+func TestResumeAfterInterrupt(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, verify := grantKeys(t)
+	dstQ, stopDst := startNode(t, "dst", root, verify)
+	defer stopDst()
+
+	dir := t.TempDir()
+	payload := make([]byte, 8*1024*1024) // 2 块
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(dir, "s.bin")
+	dstPath := filepath.Join(dir, "out", "d.bin")
+	os.WriteFile(srcPath, payload, 0o600)
+
+	// 第一次：单流传输，发完第 0 块后取消（模拟断网）
+	g1 := &api.TransferGrant{
+		ID: fmt.Sprintf("xfer-cut1-%d", time.Now().UnixNano()), Src: "src", Dst: "dst", Streams: 1,
+		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+		SrcPath: srcPath, DstPath: dstPath,
+	}
+	sign(g1)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() {
+		// 第 0 块落盘后掐断：轮询进度文件出现即取消
+		for i := 0; i < 100; i++ {
+			if _, err := os.Stat(dstPath + ".ffpart"); err == nil {
+				// 等位图至少含 1 块
+				time.Sleep(150 * time.Millisecond)
+				cancel1()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	SendFile(ctx1, srcPath, OpenerDirect(ctx1, g1.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), g1) // 预期失败
+	cancel1()
+
+	// 第二次：新 grant（同目标路径+文件）续传
+	g2 := &api.TransferGrant{
+		ID: fmt.Sprintf("xfer-cut2-%d", time.Now().UnixNano()), Src: "src", Dst: "dst", Streams: 1,
+		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+		SrcPath: srcPath, DstPath: dstPath,
+	}
+	sign(g2)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	if _, err := SendFile(ctx2, srcPath, OpenerDirect(ctx2, g2.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), g2); err != nil {
+		t.Fatalf("续传失败：%v", err)
+	}
+	got := waitForFile(t, dstPath)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("续传后内容不一致：%d vs %d", len(payload), len(got))
+	}
+	// 进度文件应被清理
+	if _, err := os.Stat(dstPath + ".ffpart"); !os.IsNotExist(err) {
+		t.Fatal("完成后进度文件应清理")
+	}
+}

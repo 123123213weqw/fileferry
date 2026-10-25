@@ -100,7 +100,7 @@ func main() {
 	db.SetMaxOpenConns(1) // 串行化写，配合 busy_timeout 根除竞态
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS events(ts INTEGER, kind TEXT, node TEXT, detail TEXT)`,
-		`CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, src TEXT, dst TEXT, mode TEXT, status TEXT, grant_json TEXT, created INTEGER, updated INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, base TEXT, src TEXT, dst TEXT, mode TEXT, status TEXT, grant_json TEXT, created INTEGER, updated INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS replicas(sha TEXT, node TEXT, path TEXT, size INTEGER, mtime INTEGER, PRIMARY KEY(sha,node))`,
 		`CREATE TABLE IF NOT EXISTS revoked(node TEXT PRIMARY KEY, ts INTEGER)`,
 	} {
@@ -295,6 +295,64 @@ func main() {
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
+// autoRetry 失败任务自动重签发（同一文件，新 grant ID）：接收端按
+// 目标路径+哈希保留断点进度，新传输只补缺块。最多 3 次，防止失败
+// 风暴；重试任务沿用原路径与参数。
+func (c *controller) autoRetry(oldID string) {
+	var gj string
+	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, oldID).Scan(&gj); err != nil {
+		return
+	}
+	var g api.TransferGrant
+	if json.Unmarshal([]byte(gj), &g) != nil {
+		return
+	}
+	if g.Retries >= 3 {
+		return // 重试上限，防止失败风暴
+	}
+	if time.Now().After(g.ExpiresAt) {
+		return
+	}
+	base := retryBase(g.ID)
+	// 去重：该根任务已有在途重试就不分叉（多源各自的失败回报
+	// 都会触发 autoRetry，没有这个检查会重试风暴）
+	var inflight int
+	c.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE base=? AND status IN ('queued','sent') AND id != ?`, base, oldID).Scan(&inflight)
+	if inflight > 0 {
+		return
+	}
+	c.mu.Lock()
+	c.nextID++
+	g.Retries++
+	g.ID = fmt.Sprintf("retry-%d-%s", c.nextID, base)
+	g.ExpiresAt = time.Now().Add(30 * time.Minute)
+	g.Sign(c.signer)
+	for _, t := range g.AllSources() {
+		c.pending[t] = append(c.pending[t], g)
+	}
+	c.mu.Unlock()
+	c.jobPersist(&g)
+	log.Printf("断点续传：重签发 %s（原 %s，接收端将跳过已收块）", g.ID, oldID)
+}
+
+func retryDepth(id string) int {
+	n := 0
+	for strings.HasPrefix(id, "retry-") {
+		i := strings.Index(id, "-")
+		if i < 0 {
+			break
+		}
+		rest := id[i+1:]
+		j := strings.Index(rest, "-")
+		if j < 0 {
+			break
+		}
+		id = rest[j+1:]
+		n++
+	}
+	return n
+}
+
 // lookupGrantDst 从任务表反查目的端（吞吐回填用）。
 func (c *controller) lookupGrantDst(id string) api.NodeID {
 	var gj string
@@ -344,8 +402,21 @@ func (c *controller) event(kind, node, detail string) {
 func (c *controller) jobPersist(g *api.TransferGrant) {
 	gj, _ := json.Marshal(g)
 	// 同步写入：jobdone 的状态更新依赖此行已存在，异步会竞态丢失
-	c.db.Exec(`INSERT OR REPLACE INTO jobs(id,src,dst,mode,status,grant_json,created,updated) VALUES(?,?,?,?,?,?,?,?)`,
-		g.ID, g.Src, g.Dst, g.Mode, "queued", string(gj), time.Now().Unix(), time.Now().Unix())
+	c.db.Exec(`INSERT OR REPLACE INTO jobs(id,base,src,dst,mode,status,grant_json,created,updated) VALUES(?,?,?,?,?,?,?,?,?)`,
+		g.ID, retryBase(g.ID), g.Src, g.Dst, g.Mode, "queued", string(gj), time.Now().Unix(), time.Now().Unix())
+}
+
+// retryBase 剥掉 retry-N- 前缀取根任务 ID。
+func retryBase(id string) string {
+	for strings.HasPrefix(id, "retry-") {
+		rest := strings.TrimPrefix(id, "retry-")
+		if i := strings.Index(rest, "-"); i >= 0 {
+			id = rest[i+1:]
+		} else {
+			break
+		}
+	}
+	return id
 }
 
 func (c *controller) jobUpdate(id, status string) {
@@ -1017,6 +1088,7 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 		log.Printf("任务 %s 失败（%s）：%s", req.GrantID, req.NodeID, req.Err)
 		c.jobUpdate(req.GrantID, "failed")
 		c.event("job-fail", string(req.NodeID), req.GrantID+": "+req.Err)
+		c.autoRetry(req.GrantID) // 断点续传：失败自动重签发（网络恢复后从断点继续）
 	}
 	// TODO(M1)：结果落 SQLite
 }

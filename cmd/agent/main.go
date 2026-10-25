@@ -73,6 +73,7 @@ var (
 	punched  map[string]string // 打洞成功的对端 -> 公网映射地址
 	myPublic string            // controller 回声口告知的本机公网映射
 	running  map[string]bool   // 去重：正在执行的 grant ID
+	dueRep  []api.DoneRequest // 待补发的任务回报（断网时入队，心跳通后重发）
 
 	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
 )
@@ -347,6 +348,16 @@ func advertisedAddr() string {
 	return fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort)
 }
 
+// reportDone 发任务回报；失败（如断网）入队由心跳循环补发——
+// controller 依赖失败回报触发断点续传的重签发。
+func reportDone(req api.DoneRequest) {
+	if err := hbClient.JobDone(req); err != nil {
+		mu.Lock()
+		dueRep = append(dueRep, req)
+		mu.Unlock()
+	}
+}
+
 // certRenewLoop 证书临期自动续期：余量 <8h 时用现有证书身份向
 // controller 换新证书（同 nodeID），落盘后自我重启（exec）生效。
 func certRenewLoop() {
@@ -487,6 +498,18 @@ func heartbeatLoop() {
 		if err != nil {
 			log.Println("心跳失败：", err)
 			continue
+		}
+		mu.Lock()
+		backlog := dueRep
+		dueRep = nil
+		mu.Unlock()
+		for _, r := range backlog { // 网络恢复：补发积压的任务回报
+			if err := hbClient.JobDone(r); err != nil {
+				mu.Lock()
+				dueRep = append(dueRep, r)
+				mu.Unlock()
+				break
+			}
 		}
 		mu.Lock()
 		changed := !samePeerSet(peers, resp.Peers)
@@ -677,12 +700,10 @@ func runJob(g api.TransferGrant) {
 	sentBytes := int64(0)
 	done := func(ok bool, errStr string) {
 		d := time.Since(startTime).Seconds()
-		if err := hbClient.JobDone(api.DoneRequest{
+		reportDone(api.DoneRequest{
 			GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr,
 			Bytes: sentBytes, Duration: d,
-		}); err != nil {
-			log.Println("回报失败：", err)
-		}
+		})
 	}
 
 	sigOK := g.Verify(signPub)

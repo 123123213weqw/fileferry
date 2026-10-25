@@ -3,6 +3,7 @@
 package api
 
 import (
+	"strings"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -148,6 +149,7 @@ type TransferGrant struct {
 	Streams    int       `json:"streams"` // 每源的并行连接数：绕 per-flow 限速、填满带宽延迟积
 	RateLimit  int64     `json:"rate_limit_bps"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	Retries    int       `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
 	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
 }
 
@@ -172,12 +174,32 @@ func (g *TransferGrant) AllSources() []NodeID {
 	return out
 }
 
-// payload 返回待签名字节（不含 Sig 本身）。
+// payload 返回待签名的规范串（不含 Sig）。手工拼接而非 json.Marshal
+// 整个 struct——未来新增字段不进签名，新旧版本互验不破（曾因新增
+// Retries 字段导致新旧混编时全网验签失败）。
 func (g *TransferGrant) payload() []byte {
-	g2 := *g
-	g2.Sig = ""
-	b, _ := json.Marshal(g2)
-	return b
+	var sb strings.Builder
+	sb.WriteString("ff1|")
+	sb.WriteString(g.ID)
+	sb.WriteByte('|')
+	sb.WriteString(string(g.Src))
+	sb.WriteByte('|')
+	sb.WriteString(string(g.Dst))
+	sb.WriteByte('|')
+	sb.WriteString(g.Mode)
+	sb.WriteByte('|')
+	fmt.Fprintf(&sb, "%d|%s|%d|", g.FileSize, g.FileSHA256, g.ChunkSize)
+	for _, h := range g.Hops {
+		fmt.Fprintf(&sb, "h:%s,%s,%s;", h.NodeID, h.Addr, h.Proto)
+	}
+	for _, sp := range g.Sources {
+		fmt.Fprintf(&sb, "s:%s,%s,%s,%s,%d,%d;", sp.NodeID, sp.Addr, sp.Proto, sp.Path, sp.Start, sp.End)
+	}
+	sb.WriteString(g.SrcPath)
+	sb.WriteByte('|')
+	sb.WriteString(g.DstPath)
+	fmt.Fprintf(&sb, "|%d|%d|%d", g.Streams, g.Retries, g.ExpiresAt.Unix())
+	return []byte(sb.String())
 }
 
 func (g *TransferGrant) Sign(priv ed25519.PrivateKey) {

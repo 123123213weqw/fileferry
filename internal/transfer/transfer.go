@@ -13,6 +13,7 @@
 package transfer
 
 import (
+	"strings"
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/base64"
@@ -422,12 +423,32 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
+	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
+	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
+	have := map[int64]bool{}
+	if rd, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		rd.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if line, err := readLine(stream); err == nil && strings.HasPrefix(line, "HAVE ") {
+			if bits, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, "HAVE ")); err == nil {
+				for i := 0; i*8 < len(bits); i++ {
+					for b := 0; b < 8; b++ {
+						if bits[i]&(1<<b) != 0 {
+							have[int64(i*8+b)] = true
+						}
+					}
+				}
+			}
+		}
+	}
 
 	buf := make([]byte, ChunkSize)
 	if wd, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		wd.SetWriteDeadline(time.Now().Add(5 * time.Minute)) // 写阻塞自断，交给份额重试
 	}
 	for idx := startCh + int64(r); endCh < 0 || idx < endCh; idx += int64(n) {
+		if have[idx] {
+			continue // 断点续传：接收端已有此块
+		}
 		nread, rerr := f.ReadAt(buf, idx*ChunkSize)
 		if nread > 0 {
 			if err := WriteFrame(stream, idx, buf[:nread]); err != nil {
@@ -693,6 +714,15 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		return
 	}
 	g, err := groupFor(grant, &mf)
+	if err == nil {
+		// 断点续传握手：告知发送端已收块位图（HAVE 行），对端跳块；
+		// 旧版发送端不读此行也无碍（多写一行被当数据丢弃的风险——
+		// 发送端在写头后主动读一行，见 sendShareOnce）
+		if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			w.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		}
+		fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
+	}
 	if err == ErrAlreadyDone {
 		// 先 ACK 让对端收尾，再 drain 到对端关闭——否则对端仍在写数据，
 		// 连接一关就是 broken pipe，重试也全撞墙（多流卡死的根因）
@@ -750,6 +780,8 @@ type recvGroup struct {
 	finished  chan struct{}
 	finErr    error
 	done      bool
+	size      int64 // 文件精确字节数（进度键）
+	dirty     int   // 距上次位图落盘的新块数
 }
 
 // ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
@@ -790,6 +822,7 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 	g := &recvGroup{
 		grantID:   grant.ID,
 		wantSHA:   mf.SHA256,
+		size:      mf.Size,
 		finalPath: grant.DstPath,
 		tmp:       tmp,
 		tmpName:   tmp.Name(),
@@ -797,8 +830,95 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 		got:       map[int64]bool{},
 		finished:  make(chan struct{}),
 	}
+	g.loadProgress() // 断点续传：加载同目标文件的历史进度（位图+临时文件）
 	recvGroups[grant.ID] = g
 	return g, nil
+}
+
+// partPath 断点进度文件路径。
+func (g *recvGroup) partPath() string { return g.finalPath + ".ffpart" }
+
+// loadProgress 读取历史进度：若存在同目标同大小的进度文件，恢复
+// 位图并接管其临时文件（跳过已收块）。
+func (g *recvGroup) loadProgress() {
+	type progress struct {
+		Size    int64  `json:"size"`
+		SHA256  string `json:"sha256"`
+		TmpName string `json:"tmp"`
+		Bits    []byte `json:"bits"`
+	}
+	b, err := os.ReadFile(g.partPath())
+	if err != nil {
+		return
+	}
+	var p progress
+	if json.Unmarshal(b, &p) != nil || p.Size <= 0 || p.TmpName == "" {
+		return
+	}
+	if p.Size != g.size || p.SHA256 != g.wantSHA {
+		return // 目标变了，作废旧进度
+	}
+	// 接管旧临时文件：丢弃本次新建的，用进度里的
+	g.tmp.Close()
+	os.Remove(g.tmpName)
+	if f, err := os.OpenFile(p.TmpName, os.O_RDWR, 0o600); err == nil {
+		g.tmp = f
+		g.tmpName = p.TmpName
+	} else {
+		// 临时文件丢了但位图仍有效（重建 tmp 重新收缺块）
+		nf, err := os.CreateTemp(filepath.Dir(g.finalPath), ".ff-*")
+		if err != nil {
+			return
+		}
+		g.tmp = nf
+		g.tmpName = nf.Name()
+	}
+	for i := int64(0); i < g.expected && i/8 < int64(len(p.Bits)); i++ {
+		if p.Bits[i/8]&(1<<(i%8)) != 0 {
+			g.got[i] = true
+		}
+	}
+}
+
+// saveProgress 位图落盘（断点续传依据）。
+func (g *recvGroup) saveProgress() {
+	bits := make([]byte, (g.expected+7)/8)
+	for i := range g.got {
+		if i >= 0 && i/8 < int64(len(bits)) {
+			bits[i/8] |= 1 << (i % 8)
+		}
+	}
+	type progress struct {
+		Size    int64  `json:"size"`
+		SHA256  string `json:"sha256"`
+		TmpName string `json:"tmp"`
+		Bits    []byte `json:"bits"`
+	}
+	b, _ := json.Marshal(progress{Size: g.size, SHA256: g.wantSHA, TmpName: g.tmpName, Bits: bits})
+	os.WriteFile(g.partPath(), b, 0o600)
+}
+
+// clearProgress 进度完成或作废时清理。
+func (g *recvGroup) clearProgress() { os.Remove(g.partPath()) }
+
+// haveBits 返回当前已收块位图（发送端跳块用）。
+func (g *recvGroup) haveBits() []byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	bits := make([]byte, (g.expected+7)/8)
+	for i := range g.got {
+		if i >= 0 && i/8 < int64(len(bits)) {
+			bits[i/8] |= 1 << (i % 8)
+		}
+	}
+	return bits
+}
+
+// hasChunk 报告块是否已收。
+func (g *recvGroup) hasChunk(idx int64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.got[idx]
 }
 
 // feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
@@ -819,11 +939,19 @@ func (g *recvGroup) feed(r io.Reader) error {
 		}
 		g.mu.Lock()
 		g.got[idx] = true
+		g.dirty++
+		shouldSave := g.dirty >= 8
+		if shouldSave {
+			g.dirty = 0
+		}
 		complete := int64(len(g.got)) >= g.expected && !g.done
 		if complete {
 			g.done = true
 		}
 		g.mu.Unlock()
+		if shouldSave {
+			g.saveProgress()
+		}
 		if complete {
 			g.finalize()
 		}
@@ -836,6 +964,7 @@ func (g *recvGroup) finalize() {
 	fail := func(err error) {
 		g.tmp.Close()
 		os.Remove(g.tmpName)
+		g.clearProgress() // 内容验证失败：进度不可信，全作废
 		g.finErr = err
 		recvMu.Lock()
 		delete(recvGroups, g.grantID)
@@ -870,6 +999,7 @@ func (g *recvGroup) finalize() {
 		fail(err)
 		return
 	}
+	g.clearProgress()
 	recvMu.Lock()
 	delete(recvGroups, g.grantID)
 	completed[g.grantID] = time.Now()
@@ -971,4 +1101,20 @@ func pingPong(s Stream) (int, error) {
 		return 0, fmt.Errorf("bad pong")
 	}
 	return 5, nil
+}
+
+// readLine 从流读一行（到 \n，最长 8KB），不引入缓冲。
+func readLine(r io.Reader) (string, error) {
+	var sb []byte
+	one := make([]byte, 1)
+	for len(sb) < 8192 {
+		if _, err := io.ReadFull(r, one); err != nil {
+			return "", err
+		}
+		if one[0] == '\n' {
+			return string(sb), nil
+		}
+		sb = append(sb, one[0])
+	}
+	return "", fmt.Errorf("line too long")
 }
