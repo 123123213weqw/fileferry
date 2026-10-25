@@ -22,6 +22,21 @@ import (
 	"fileferry/internal/ca"
 )
 
+
+// waitForFile 轮询等待文件落盘（份额级 ACK 后 rename 是异步终态）。
+func waitForFile(t *testing.T, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil {
+			return b
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("文件 10s 未落盘：%s", path)
+	return nil
+}
+
 // TestSwitchTransfer 三节点交换台模式：源与目的之间没有任何直连边，
 // 各自出站拨向交换台（DERP 式）配对对接，2 流并行 8MB 逐字节一致。
 func TestSwitchTransfer(t *testing.T) {
@@ -48,7 +63,7 @@ func TestSwitchTransfer(t *testing.T) {
 	os.WriteFile(srcPath, payload, 0o600)
 
 	grant := &api.TransferGrant{
-		ID: "xfer-sw", Src: "src", Dst: "dst", Mode: "switch", Streams: 2,
+		ID: fmt.Sprintf("xfer-sw-%d", time.Now().UnixNano()), Src: "src", Dst: "dst", Mode: "switch", Streams: 2,
 		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "sw", Addr: swQ, Proto: "quic"}, {NodeID: "dst"}},
 		SrcPath: srcPath, DstPath: dstPath,
 	}
@@ -97,10 +112,8 @@ func TestSwitchTransfer(t *testing.T) {
 	}
 	wg.Wait()
 
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("目的文件未落盘：%v", err)
-	}
+	got := waitForFile(t, dstPath)
+
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("内容不一致：%d vs %d 字节", len(payload), len(got))
 	}
@@ -169,7 +182,7 @@ func TestMultiSource(t *testing.T) {
 	dstPath := filepath.Join(dir, "out", "d.bin")
 
 	grant := &api.TransferGrant{
-		ID: "xfer-ms", Src: "src1", Dst: "dst", Streams: 1,
+		ID: fmt.Sprintf("xfer-ms-%d", time.Now().UnixNano()), Src: "src1", Dst: "dst", Streams: 1,
 		Hops:    []api.Hop{{NodeID: "src1"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}, {NodeID: "dst"}},
 		SrcPath: p1, DstPath: dstPath,
 		// 块 0-1 给 src1，块 2 给 src2（10MB/4MB=3 块）
@@ -197,10 +210,8 @@ func TestMultiSource(t *testing.T) {
 	}
 	wg.Wait()
 
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("目的文件未落盘：%v", err)
-	}
+	got := waitForFile(t, dstPath)
+
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("多源汇聚不一致：%d vs %d 字节", len(payload), len(got))
 	}
@@ -274,10 +285,8 @@ func TestParallelStreamsTCP(t *testing.T) {
 	case <-time.After(45 * time.Second):
 		t.Fatal("TCP 4 流卡死（45 秒未完成）——真机问题进程内复现！")
 	}
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("目的文件未落盘：%v", err)
-	}
+	got := waitForFile(t, dstPath)
+
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("内容不一致：%d vs %d", len(payload), len(got))
 	}

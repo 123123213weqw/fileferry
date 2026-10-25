@@ -91,10 +91,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	db, err := sql.Open("sqlite", cfg.DataDir+"/ff.db")
+	// WAL + busy_timeout：多 goroutine 并发回报时写锁竞争会返回
+	// SQLITE_BUSY，静默丢失 done 终态更新（真机实测踩坑）
+	db, err := sql.Open("sqlite", cfg.DataDir+"/ff.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		log.Fatal(err)
 	}
+	db.SetMaxOpenConns(1) // 串行化写，配合 busy_timeout 根除竞态
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS events(ts INTEGER, kind TEXT, node TEXT, detail TEXT)`,
 		`CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, src TEXT, dst TEXT, mode TEXT, status TEXT, grant_json TEXT, created INTEGER, updated INTEGER)`,
@@ -340,7 +343,8 @@ func (c *controller) event(kind, node, detail string) {
 // jobPersist 任务落库与状态更新。
 func (c *controller) jobPersist(g *api.TransferGrant) {
 	gj, _ := json.Marshal(g)
-	go c.db.Exec(`INSERT OR REPLACE INTO jobs(id,src,dst,mode,status,grant_json,created,updated) VALUES(?,?,?,?,?,?,?,?)`,
+	// 同步写入：jobdone 的状态更新依赖此行已存在，异步会竞态丢失
+	c.db.Exec(`INSERT OR REPLACE INTO jobs(id,src,dst,mode,status,grant_json,created,updated) VALUES(?,?,?,?,?,?,?,?)`,
 		g.ID, g.Src, g.Dst, g.Mode, "queued", string(gj), time.Now().Unix(), time.Now().Unix())
 }
 

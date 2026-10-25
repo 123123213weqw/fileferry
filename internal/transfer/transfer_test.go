@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"fmt"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -112,7 +113,7 @@ func TestParallelStreams(t *testing.T) {
 	os.WriteFile(srcPath, payload, 0o600)
 
 	grant := &api.TransferGrant{
-		ID: "xfer-par", Src: "src", Dst: "dst", Streams: 3,
+		ID: fmt.Sprintf("xfer-par-%d", time.Now().UnixNano()), Src: "src", Dst: "dst", Streams: 3,
 		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
 		SrcPath: srcPath, DstPath: dstPath,
 	}
@@ -123,10 +124,8 @@ func TestParallelStreams(t *testing.T) {
 	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("并行发送失败：%v", err)
 	}
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("目的文件未落盘：%v", err)
-	}
+	got := waitForFile(t, dstPath)
+
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("内容不一致：源 %d 字节，目的 %d 字节", len(payload), len(got))
 	}
@@ -157,7 +156,7 @@ func TestRelayTransferQUIC(t *testing.T) {
 	}
 
 	grant := &api.TransferGrant{
-		ID:      "xfer-test",
+		ID:      fmt.Sprintf("xfer-relay-%d", time.Now().UnixNano()),
 		Src:     "src",
 		Dst:     "dst",
 		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "relay", Addr: relayQ, Proto: "quic"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
@@ -171,10 +170,8 @@ func TestRelayTransferQUIC(t *testing.T) {
 	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("经中继发送失败：%v", err)
 	}
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("目的文件未落盘：%v", err)
-	}
+	got := waitForFile(t, dstPath)
+
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("内容不一致：源 %d 字节，目的 %d 字节", len(payload), len(got))
 	}
@@ -221,7 +218,7 @@ func TestDirectTransferTCP(t *testing.T) {
 	os.WriteFile(srcPath, payload, 0o600)
 
 	grant := &api.TransferGrant{
-		ID: "xfer-tcp", Src: "src", Dst: "dst",
+		ID: fmt.Sprintf("xfer-tcp-%d", time.Now().UnixNano()), Src: "src", Dst: "dst",
 		Hops: []api.Hop{
 			{NodeID: "src"},
 			{NodeID: "dst", Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort-1)), Proto: "tcp"},
@@ -235,10 +232,8 @@ func TestDirectTransferTCP(t *testing.T) {
 	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
 		t.Fatalf("TCP 直传失败：%v", err)
 	}
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("目的文件未落盘：%v", err)
-	}
+	got := waitForFile(t, dstPath)
+
 	if !bytes.Equal(got, payload) {
 		t.Fatal("内容不一致")
 	}
