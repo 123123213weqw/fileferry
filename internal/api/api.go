@@ -262,6 +262,30 @@ func (g *TransferGrant) payload() []byte {
 	return []byte(sb.String())
 }
 
+// ValidateNodeName 校验显式配置的节点名。与 controller 的
+// NormalizeNodeName 同一套规则：任意 UTF-8，但禁止 ':'（与
+// `node:/path` 语法冲突）、'/'、控制字符、前后空白与超长。
+func ValidateNodeName(name string) error {
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("节点名首尾不能有空白")
+	}
+	if name == "" {
+		return fmt.Errorf("节点名为空")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("节点名过长（%d 字节，上限 64）", len(name))
+	}
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("节点名不能含控制字符")
+		case r == ':' || r == '/' || r == '\\':
+			return fmt.Errorf("节点名不能含 %q（与 node:/path 语法冲突）", r)
+		}
+	}
+	return nil
+}
+
 func (g *TransferGrant) Sign(priv ed25519.PrivateKey) {
 	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payloadV2()))
 }

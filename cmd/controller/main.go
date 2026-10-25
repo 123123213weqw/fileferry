@@ -416,32 +416,33 @@ func (c *controller) grantParticipants(id string) map[api.NodeID]bool {
 	return m
 }
 
-// sanitizeNodeName 规范化 agent 请求的节点名：只保留 [A-Za-z0-9._-]，
-// 长度 1..63，且必须以字母或数字开头（避免 "." ".." 之类）。
-// 不合法返回空串，调用方退回自动编号。
-func sanitizeNodeName(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || len(raw) > 63 {
-		return ""
+// NormalizeNodeName 校验节点名，规则与 api.ValidateNodeName 一致
+// （任意 UTF-8，禁止 ':' '/' 控制字符，长度 ≤64 字节）。
+//
+// 为什么单独拆一层：'：' 与 `node:/path` 语法冲突，而
+// splitNodePath 取第一个冒号，名字带冒号时 "a:b:/data/x" 会被静默
+// 解析成 node="a"、path="b:/data/x"——不报错、传到错的地方。所以
+// 这里明确拒绝而不是静默替换。X.509 CN 与 V2 签名串都能容纳 UTF-8，
+// 不构成限制（实测 "数据库-主" 可原样进 CN）。
+func NormalizeNodeName(raw string) (string, error) {
+	if err := api.ValidateNodeName(raw); err != nil {
+		return "", err
 	}
-	out := make([]rune, 0, len(raw))
-	for _, r := range raw {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
-			r == '-', r == '_', r == '.':
-			out = append(out, r)
-		default:
-			out = append(out, '-') // 主机名里的其它字符统一换成连字符
-		}
+	return raw, nil
+}
+
+// claimName 占用一个节点名（大小写不敏感去重，避免 Node-1 / node-1
+// 在舰队长里看起来像两台不同的机器却难以区分）。返回实际使用的名字。
+func (l *enrollLedger) claimName(name string) (string, bool) {
+	if l.Used == nil {
+		l.Used = map[string]bool{}
 	}
-	s := strings.Trim(string(out), ".-")
-	if s == "" {
-		return ""
+	key := strings.ToLower(name)
+	if l.Used[key] {
+		return "", false
 	}
-	if len(s) > 63 {
-		s = s[:63]
-	}
-	return s
+	l.Used[key] = true
+	return name, true
 }
 
 // normalizeDstPath 把"目标写成目录"补成具体文件名。
@@ -1033,10 +1034,11 @@ func (l *enrollLedger) claim(id string) bool {
 	if l.Used == nil {
 		l.Used = map[string]bool{}
 	}
-	if l.Used[id] {
+	key := strings.ToLower(id)
+	if l.Used[key] {
 		return false
 	}
-	l.Used[id] = true
+	l.Used[key] = true
 	return true
 }
 
@@ -1045,7 +1047,7 @@ func (l *enrollLedger) nextAutoNodeID() string {
 	for {
 		id := fmt.Sprintf("node-%d", l.NextNode)
 		l.NextNode++
-		if l.Used == nil || !l.Used[id] {
+		if l.Used == nil || !l.Used[strings.ToLower(id)] {
 			return id
 		}
 	}
@@ -1064,7 +1066,7 @@ func loadEnrollLedger(dir string) *enrollLedger {
 	}
 	// 从核销台账回填已占用 ID（老版本 ledger 没有 used 字段）
 	for _, id := range l.Burned {
-		l.Used[id] = true
+		l.Used[strings.ToLower(id)] = true
 	}
 	if l.NextNode < 1 {
 		l.NextNode = 1
@@ -1109,14 +1111,14 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or used token", http.StatusUnauthorized)
 		return
 	}
-	// 编号策略：优先使用 agent 请求的稳定名字（默认取主机名），
-	// 拿不到或不合法才退回自增编号。之前只按入网顺序编号，两台机器
-	// 并行启动谁先谁后不确定——实测后启动的 agent 拿到了 node-1，
-	// 任何写死 node-1/node-2 的脚本、README 示例在重装后全部错位。
+	// 编号策略：优先使用 agent 请求的稳定名字，拿不到才退回自增编号。
+	// 之前只按入网顺序编号，两台机器并行启动谁先谁后不确定——实测后
+	// 启动的 agent 拿到了 node-1，任何写死 node-1/node-2 的脚本在重装
+	// 后全部错位。
 	nodeID := ""
-	if name := sanitizeNodeName(req.NodeName); name != "" {
-		if c.ledger.claim(name) {
-			nodeID = name
+	if n, nerr := NormalizeNodeName(req.NodeName); nerr == nil {
+		if got, ok := c.ledger.claimName(n); ok {
+			nodeID = got
 		}
 	}
 	if nodeID == "" {

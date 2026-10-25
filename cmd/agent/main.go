@@ -315,9 +315,14 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}},
 	}}
 	// 请求一个稳定节点名：优先 node-name 配置，否则用主机名。
-	// controller 侧重名/非法才退回自增编号，重装后身份不再漂移。
+	// 显式配置时严格校验、非法直接失败——静默改名会让运维以为节点叫
+	// A 而实际叫 B。主机名不受我们控制，交给 controller 侧宽松处理。
 	wantName := cfg.NodeName
-	if wantName == "" {
+	if wantName != "" {
+		if err := api.ValidateNodeName(wantName); err != nil {
+			return nil, nil, fmt.Errorf("agent.yaml 的 node-name 非法: %w", err)
+		}
+	} else {
 		wantName = hostname
 	}
 	resp, err := cl.Enroll(api.EnrollRequest{

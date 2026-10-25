@@ -263,35 +263,52 @@ func TestRegressRevocationShipped(t *testing.T) {
 	}
 }
 
-// 回归：nodeID 优先使用请求的稳定名字，且不撞号。
+// 回归：节点名允许任意 UTF-8，但必须拒绝与 "node:/path" 语法冲突的字符。
 func TestRegressStableNodeName(t *testing.T) {
 	led := &enrollLedger{Burned: map[string]string{}, NextNode: 1, Used: map[string]bool{}}
 
-	if !led.claim("web-01") {
-		t.Fatal("首次占用应成功")
+	// —— 应当接受的名字（含中文、emoji、点、下划线）——
+	for _, want := range []string{"db1", "web.prod.example", "香港-1", "数据库-主", "node_01", "a.b-c_d", "Node-1"} {
+		got, err := NormalizeNodeName(want)
+		if err != nil {
+			t.Fatalf("%q 应被接受，实际报错：%v", want, err)
+		}
+		if got != want {
+			t.Fatalf("%q 被改成了 %q（不应静默改字）", want, got)
+		}
 	}
-	if led.claim("web-01") {
-		t.Fatal("重复占用应失败（重名）")
+
+	// —— 必须拒绝的名字 ——
+	for _, bad := range []string{
+		"a:b",                   // 与 node:/path 冲突，且 splitNodePath 会静默错位
+		"a/b",                   // 与路径分隔冲突
+		"a\\b",                  // Windows 分隔
+		"",                      // 空
+		"  x",                   // 前导空白
+		"x  ",                   // 尾随空白
+		"a\x00b",                // 控制字符
+		string(make([]byte, 0)), // 空
+		"loooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong", // >64
+	} {
+		if _, err := NormalizeNodeName(bad); err == nil {
+			t.Fatalf("%q 应被拒绝，实际通过", bad)
+		}
+	}
+
+	// —— 去重：大小写不敏感 ——
+	first, ok := led.claimName("Node-1")
+	if !ok || first != "Node-1" {
+		t.Fatalf("首次占用应成功，实际 ok=%v name=%q", ok, first)
+	}
+	if _, ok := led.claimName("node-1"); ok {
+		t.Fatal("大小写不同的同名不应被当成两台机器（回归）")
 	}
 	// 自动编号必须跳过已占用
-	if id := led.nextAutoNodeID(); id == "web-01" {
-		t.Fatal("自动编号撞上了手工名")
+	if id := led.nextAutoNodeID(); id == "Node-1" || id == "node-1" {
+		t.Fatalf("自动编号撞上了手工名：%s", id)
 	}
 	if id := led.nextAutoNodeID(); !led.claim(id) {
 		t.Fatalf("自动编号 %s 应未被占用", id)
-	}
-
-	for _, bad := range []string{"", "..", "../../etc", "  ", "-", "a b/?*"} {
-		got := sanitizeNodeName(bad)
-		if got != "" && (got == ".." || len(got) > 63) {
-			t.Fatalf("%q 未被清洗：%q", bad, got)
-		}
-	}
-	if sanitizeNodeName("") != "" {
-		t.Fatal("空名字应返回空串")
-	}
-	if got := sanitizeNodeName("a b/?*"); got == "" {
-		t.Fatal("含特殊字符但可清洗的名字不应被拒")
 	}
 }
 

@@ -155,7 +155,9 @@ func tools() []toolDef {
 		{
 			Name: "ff_send",
 			Description: "跨服务器按需传输文件（自动选路：直连/中继/交换台）。默认阻塞到完成。" +
-				"路径格式 node:/abs/path（nodeID 可先用 ff_status 查询）。",
+				"路径格式 <节点名>:/绝对路径。节点名是部署时固定的稳定名字（agent.yaml 的 node-name），" +
+				"重装/重启不变，可安全写进脚本；不确定时先用 ff_status 查（返回 node_id/hostname/addr，" +
+				"可按 hostname 或 IP 反查 node_id）。目标写目录（以 / 结尾）会自动补源文件名。",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -167,8 +169,9 @@ func tools() []toolDef {
 			},
 		},
 		{
-			Name:        "ff_status",
-			Description: "查看舰队：在线节点、主机名、CPU/内存、探测边（延迟/协议）。",
+			Name: "ff_status",
+			Description: "查看舰队：在线节点（node_id 即传输用的节点名）、主机名、CPU/内存、" +
+				"探测边（延迟/协议）。传输前用它把主机名或 IP 映射到 node_id。",
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{

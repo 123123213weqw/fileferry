@@ -165,8 +165,18 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
   显式写文件名则原样使用。
 - **落盘白名单** `allowed-dirs`：按路径分量比较并解析符号链接，`/data`
   不会放行 `/data-evil`；`inbox:` 取件标记只允许单层文件名，拒绝 `..`。
-- **节点身份**：`node-name`（缺省主机名）首次入网占用后固定，重装不漂移；
-  重名或非法字符才会退回自增的 `node-N`。
+- **节点身份**：`node-name` 首次入网占用后固定，重装/重启/换机都不漂移，
+  可以当常量写进脚本和 prompt。字符集基本不限——实测 `数据库-主`、
+  `web.prod-01` 都能直接用（X.509 CN 能原样保存 UTF-8）。唯一禁止的是
+  `:` `/` 和控制字符：`:` 会与 `node:/path` 语法冲突（`a:b:/x` 会被
+  静默解析成 node=`a`），所以显式配置非法名字时 agent **启动即失败**，
+  不会静默改名。名字大小写不敏感去重（`Node-1` 与 `node-1` 视为同名）。
+  未配置时回退主机名；重名或非法才退回自增 `node-N`。
+
+  类比 ssh：`node-name` 相当于 `~/.ssh/config` 里的 `Host db1`，
+  而 `ff_status` 里的 `hostname`/`addr` 相当于 `HostName 10.0.0.5`。
+  scp/rsync 也从不问对端「你叫什么」——名字是操作者给的稳定别名，
+  fileferry 现在同理。
 - **撤销**：`ffctl revoke` 后名单随心跳下发，数据面立即拒收/拒发该节点，
   不只是控制面拦截。
 
