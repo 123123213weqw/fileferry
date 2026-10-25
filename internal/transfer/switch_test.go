@@ -414,3 +414,57 @@ func TestEndToEndEncrypted(t *testing.T) {
 		t.Fatalf("解密后内容不一致：%d vs %d", len(payload), len(got))
 	}
 }
+
+// TestConcurrentTransfers 并发回归：5 个不同 grant 同时传到同一目的
+// ——复现压测的并发风暴（验签拒绝/broken pipe）。
+func TestConcurrentTransfers(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, verify := grantKeys(t)
+	dstQ, stopDst := startNode(t, "dst", root, verify)
+	defer stopDst()
+
+	dir := t.TempDir()
+	var wg sync.WaitGroup
+	errs := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		payload := make([]byte, 8*1024*1024)
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatal(err)
+		}
+		src := filepath.Join(dir, fmt.Sprintf("c%d.bin", i))
+		os.WriteFile(src, payload, 0o600)
+		grant := &api.TransferGrant{
+			ID: fmt.Sprintf("xfer-conc-%d-%d", i, time.Now().UnixNano()),
+			Src: "src", Dst: "dst", Streams: 4,
+			Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+			SrcPath: src, DstPath: filepath.Join(dir, fmt.Sprintf("out%d", i), "d.bin"),
+		}
+		sign(grant)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if _, err := SendFile(ctx, src, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
+				errs <- fmt.Errorf("并发任务失败: %w", err)
+				return
+			}
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				if _, err := os.Stat(grant.DstPath); err == nil {
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			errs <- fmt.Errorf("文件未落盘: %s", grant.DstPath)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}

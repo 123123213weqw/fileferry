@@ -354,24 +354,23 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 	for r := 0; r < n; r++ {
 		// 混流：奇数流换副协议（tcp<->quic 对称推导，端口约定由
 		// DialStream 处理），叠加两种限速配额；副协议失败自然回退主协议
-		thisOpen, thisGrant := open, grant
+		thisOpen := open
 		if grant.Mix && r%2 == 1 && len(grant.Hops) >= 2 {
-			g2 := *grant
-			h := g2.Hops[1]
+			h := grant.Hops[1]
 			if h.Proto == "tcp" {
 				h.Proto = "quic"
 			} else {
 				h.Proto = "tcp"
 			}
-			g2.Hops[1] = h
+			// 只换建流协议：流头（含签名）必须始终是原始 grant——
+			// 改写 Proto 后未重签的 grant 会被对端验签拒绝（并发风暴根因）
 			thisOpen = OpenerDirect(ctx, h, tlsConf)
-			thisGrant = &g2
 		}
 		wg.Add(1)
-		go func(r int, o StreamOpener, g2 *api.TransferGrant) {
+		go func(r int, o StreamOpener) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, o, g2, mf, enc, startCh, endCh, r, n)
-		}(r, thisOpen, thisGrant)
+			errCh <- sendShare(ctx, f, o, grant, mf, enc, startCh, endCh, r, n)
+		}(r, thisOpen)
 	}
 	wg.Wait()
 	close(errCh)

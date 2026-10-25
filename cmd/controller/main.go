@@ -320,8 +320,12 @@ func main() {
 // 风暴；重试任务沿用原路径与参数。
 func (c *controller) autoRetry(oldID string) {
 	var gj string
-	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, oldID).Scan(&gj); err != nil {
+	var updated int64
+	if err := c.db.QueryRow(`SELECT grant_json, updated FROM jobs WHERE id=?`, oldID).Scan(&gj, &updated); err != nil {
 		return
+	}
+	if time.Since(time.Unix(updated, 0)) > 15*time.Minute {
+		return // 陈年任务（重启恢复的历史失败回报等），不重试
 	}
 	var g api.TransferGrant
 	if json.Unmarshal([]byte(gj), &g) != nil {

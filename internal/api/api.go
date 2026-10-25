@@ -196,10 +196,11 @@ func (g *TransferGrant) payload() []byte {
 	sb.WriteByte('|')
 	fmt.Fprintf(&sb, "%d|%s|%d|", g.FileSize, g.FileSHA256, g.ChunkSize)
 	for _, h := range g.Hops {
-		fmt.Fprintf(&sb, "h:%s,%s,%s;", h.NodeID, h.Addr, h.Proto)
+		// Proto 不进签名：混流按流改写拨号协议属路由提示，非授权语义
+		fmt.Fprintf(&sb, "h:%s,%s;", h.NodeID, h.Addr)
 	}
 	for _, sp := range g.Sources {
-		fmt.Fprintf(&sb, "s:%s,%s,%s,%s,%d,%d;", sp.NodeID, sp.Addr, sp.Proto, sp.Path, sp.Start, sp.End)
+		fmt.Fprintf(&sb, "s:%s,%s,%s,%d,%d;", sp.NodeID, sp.Addr, sp.Path, sp.Start, sp.End)
 	}
 	sb.WriteString(g.SrcPath)
 	sb.WriteByte('|')

@@ -73,7 +73,7 @@ var (
 	punched  map[string]string // 打洞成功的对端 -> 公网映射地址
 	myPublic string            // controller 回声口告知的本机公网映射
 	running  map[string]bool   // 去重：正在执行的 grant ID
-	dueRep  []api.DoneRequest // 待补发的任务回报（断网时入队，心跳通后重发）
+	dueRep  []dueReport        // 待补发的任务回报（带时效，陈年丢弃）
 
 	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
 )
@@ -342,7 +342,13 @@ func loadSignPub() error {
 // verifyGrant 在数据面本地验签：签名有效、未过期。身份匹配由各
 // 路径自查：接收端查 Dst==selfID，中继查在路径上，交换台查参与方。
 func verifyGrant(g *api.TransferGrant) bool {
-	return g.Verify(signPub) && time.Now().Before(g.ExpiresAt)
+	ok := g.Verify(signPub)
+	exp := time.Now().Before(g.ExpiresAt)
+	if !ok || !exp {
+		log.Printf("[verify] 拒绝 %s：签名%v 过期%v（stream=%d retries=%d hops=%d src=%q dst=%q exp=%s）",
+			g.ID, ok, exp, g.Streams, g.Retries, len(g.Hops), g.Src, g.Dst, g.ExpiresAt.Format(time.RFC3339))
+	}
+	return ok && exp
 }
 
 // advertisedAddr 返回对外广播的数据面地址：优先显式配置，
@@ -354,12 +360,20 @@ func advertisedAddr() string {
 	return fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort)
 }
 
+// dueReport 带时效的积压回报：陈年失败回报被补发会触发 controller
+// 的 autoRetry 风暴（压测实锤）——超期直接丢弃。
+type dueReport struct {
+	req api.DoneRequest
+	at  time.Time
+}
+
 // reportDone 发任务回报；失败（如断网）入队由心跳循环补发——
-// controller 依赖失败回报触发断点续传的重签发。
+// controller 依赖失败回报触发断点续传的重签发。积压超过 10 分钟
+// 视为陈旧丢弃（那时 controller 早已按超时处理或任务已无意义）。
 func reportDone(req api.DoneRequest) {
 	if err := hbClient.JobDone(req); err != nil {
 		mu.Lock()
-		dueRep = append(dueRep, req)
+		dueRep = append(dueRep, dueReport{req: req, at: time.Now()})
 		mu.Unlock()
 	}
 }
@@ -515,8 +529,11 @@ func heartbeatLoop() {
 		backlog := dueRep
 		dueRep = nil
 		mu.Unlock()
-		for _, r := range backlog { // 网络恢复：补发积压的任务回报
-			if err := hbClient.JobDone(r); err != nil {
+		for _, r := range backlog { // 网络恢复：补发新鲜积压，丢弃陈年
+			if time.Since(r.at) > 10*time.Minute {
+				continue
+			}
+			if err := hbClient.JobDone(r.req); err != nil {
 				mu.Lock()
 				dueRep = append(dueRep, r)
 				mu.Unlock()
