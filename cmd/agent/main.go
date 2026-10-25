@@ -9,11 +9,11 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -55,6 +55,9 @@ type Config struct {
 	// 并上报文件索引（后台算哈希，mtime 不变不重算）。空 = 用第一
 	// 个 allowed-dir；再为空则不参与多源。
 	ShareDir string `yaml:"share-dir"`
+	// NodeName 请求的稳定节点名（缺省取主机名）。同名的第一次入网
+	// 占用该名字，之后的入网/重装沿用同一身份。
+	NodeName string `yaml:"node-name"`
 }
 
 var (
@@ -67,15 +70,20 @@ var (
 	signPub  ed25519.PublicKey // grant 验签公钥
 	udpConn  *sniffConn        // 数据面共享 socket（监听+拨号+打洞+WHOAMI）
 
-	mu      sync.Mutex
-	peers    []api.PeerInfo   // 最近一次心跳响应下发的在线节点
-	edges    []api.EdgeReport // 最近一轮探测的可达边
+	mu       sync.Mutex
+	peers    []api.PeerInfo    // 最近一次心跳响应下发的在线节点
+	edges    []api.EdgeReport  // 最近一轮探测的可达边
 	punched  map[string]string // 打洞成功的对端 -> 公网映射地址
 	myPublic string            // controller 回声口告知的本机公网映射
 	running  map[string]bool   // 去重：正在执行的 grant ID
-	dueRep  []dueReport        // 待补发的任务回报（带时效，陈年丢弃）
+	dueRep   []dueReport       // 待补发的任务回报（带时效，陈年丢弃）
 
 	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
+
+	cpuSamplerGlobal cpuSampler // CPU 占用率需要两次采样求差
+
+	revokedMu  sync.Mutex
+	revokedIDs = map[api.NodeID]bool{} // controller 下发的撤销名单（数据面自保）
 )
 
 // sniffConn 在数据面 UDP socket 外截流 WHOAMI 回复，其余包交给 QUIC。
@@ -84,22 +92,49 @@ type sniffConn struct {
 	whoamiCh chan []byte
 }
 
+// sniff 判断一个数据包是不是 controller 的 WHOAMI 回声，是则投进
+// whoamiCh 并返回 true（该包不应再交给 QUIC）。
+func (c *sniffConn) sniff(p []byte) bool {
+	if len(p) < 6 || string(p[:6]) != "FFWHO1" {
+		return false
+	}
+	b := make([]byte, len(p))
+	copy(b, p)
+	select {
+	case c.whoamiCh <- b:
+	default:
+	}
+	return true
+}
+
 func (c *sniffConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	for {
 		n, addr, err := c.UDPConn.ReadFromUDP(p)
 		if err != nil {
 			return n, addr, err
 		}
-		if n >= 6 && string(p[:6]) == "FFWHO1" {
-			b := make([]byte, n)
-			copy(b, p[:n])
-			select {
-			case c.whoamiCh <- b:
-			default:
-			}
+		if c.sniff(p[:n]) {
 			continue // 不交给 QUIC
 		}
 		return n, addr, err
+	}
+}
+
+// ReadMsgUDP 必须显式实现：sniffConn 内嵌 *net.UDPConn，ReadMsgUDP 会被
+// 提升，于是它满足 quic-go 的 OOBCapablePacketConn，quic-go 会**直接
+// 调用 ReadMsgUDP** 而完全绕过上面的 ReadFrom——WHOAMI 回声因此被当成
+// QUIC 垃圾包丢弃，myPublic 永远为空（每个 agent 每 25s 刷一行超时）。
+// 这里显式覆盖，既保留 ECN/批量读优化，又让嗅探真正生效。
+func (c *sniffConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
+	for {
+		n, oobn, flags, addr, err = c.UDPConn.ReadMsgUDP(b, oob)
+		if err != nil {
+			return
+		}
+		if c.sniff(b[:n]) {
+			continue
+		}
+		return
 	}
 }
 
@@ -142,18 +177,21 @@ func run(cfgPath string) error {
 	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
 		return hbClient.GetKeypass(grantID)
 	})
+	transfer.SetInboxRoot(cfg.DataDir)
 	if len(cfg.AllowedDirs) > 0 {
-		transfer.SetPathGuard(func(p string) bool {
-			for _, dir := range cfg.AllowedDirs {
-				if strings.HasPrefix(p, dir) {
-					return true
-				}
-			}
-			return false
-		})
+		guard, gerr := transfer.NewPathGuard(cfg.AllowedDirs)
+		if gerr != nil {
+			return gerr
+		}
+		transfer.SetPathGuard(guard)
 		log.Printf("路径白名单：%v", cfg.AllowedDirs)
 	}
-	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}}
+	// 给控制面请求设总超时：之前没有 Timeout，TCP 半开时心跳 goroutine
+	// 会永久阻塞——节点被判离线且永远不会自愈（连重连都不做）。
+	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{
+		Timeout:   20 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConf, IdleConnTimeout: 60 * time.Second},
+	}}
 	running = map[string]bool{}
 	punched = map[string]string{}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
@@ -162,13 +200,10 @@ func run(cfgPath string) error {
 		go indexLoop()
 	}
 
-	// 2. 心跳 / 探测 / WHOAMI 保活 / 证书续期
-	go heartbeatLoop()
-	go probeLoop()
-	go whoamiLoop()
-	go certRenewLoop()
-
-	// 3. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）
+	// 2. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）。
+	//    必须**先**把 udpConn 建好再起后台循环——whoamiLoop/tryPunch
+	//    都直接用 udpConn；之前先起 goroutine 后赋值，启动瞬间是 nil，
+	//    实测 30 次启动有 19 次 nil 解引用 panic（约 63%）。
 	serverTLS := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		ClientCAs:    rootPool,
@@ -193,11 +228,11 @@ func run(cfgPath string) error {
 	tr := &quic.Transport{Conn: udpConn}
 	transfer.SetTransport(tr)
 	ln, err := tr.Listen(serverTLS, &quic.Config{
-		MaxIdleTimeout:                  30 * time.Second,
-		InitialStreamReceiveWindow:      8 << 20,
-		MaxStreamReceiveWindow:          16 << 20,
-		InitialConnectionReceiveWindow:  16 << 20,
-		MaxConnectionReceiveWindow:      32 << 20,
+		MaxIdleTimeout:                 30 * time.Second,
+		InitialStreamReceiveWindow:     8 << 20,
+		MaxStreamReceiveWindow:         16 << 20,
+		InitialConnectionReceiveWindow: 16 << 20,
+		MaxConnectionReceiveWindow:     32 << 20,
 	})
 	if err != nil {
 		return err
@@ -210,6 +245,13 @@ func run(cfgPath string) error {
 	} else {
 		defer tcpLn.Close()
 	}
+
+	// 3. 后台循环：心跳 / 探测 / WHOAMI 保活 / 证书续期。
+	//    放在数据面就绪之后，保证它们用到的 udpConn 一定非 nil。
+	go heartbeatLoop()
+	go probeLoop()
+	go whoamiLoop()
+	go certRenewLoop()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -272,10 +314,17 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}},
 	}}
+	// 请求一个稳定节点名：优先 node-name 配置，否则用主机名。
+	// controller 侧重名/非法才退回自增编号，重装后身份不再漂移。
+	wantName := cfg.NodeName
+	if wantName == "" {
+		wantName = hostname
+	}
 	resp, err := cl.Enroll(api.EnrollRequest{
 		Token:    cfg.EnrollToken,
 		Hostname: hostname,
 		Addr:     advertisedAddr(),
+		NodeName: wantName,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("enroll: %w", err)
@@ -341,7 +390,30 @@ func loadSignPub() error {
 
 // verifyGrant 在数据面本地验签：签名有效、未过期。身份匹配由各
 // 路径自查：接收端查 Dst==selfID，中继查在路径上，交换台查参与方。
+// isRevoked 报告节点是否已被 controller 撤销。
+func isRevoked(id api.NodeID) bool {
+	revokedMu.Lock()
+	defer revokedMu.Unlock()
+	return revokedIDs[id]
+}
+
 func verifyGrant(g *api.TransferGrant) bool {
+	if isRevoked(g.Src) || isRevoked(g.Dst) {
+		log.Printf("[verify] 拒绝 %s：参与方已撤销（src=%q dst=%q）", g.ID, g.Src, g.Dst)
+		return false
+	}
+	for _, sp := range g.Sources {
+		if isRevoked(sp.NodeID) {
+			log.Printf("[verify] 拒绝 %s：源 %q 已撤销", g.ID, sp.NodeID)
+			return false
+		}
+	}
+	for _, h := range g.Hops {
+		if isRevoked(h.NodeID) {
+			log.Printf("[verify] 拒绝 %s：路径节点 %q 已撤销", g.ID, h.NodeID)
+			return false
+		}
+	}
 	ok := g.Verify(signPub)
 	exp := time.Now().Before(g.ExpiresAt)
 	if !ok || !exp {
@@ -509,15 +581,22 @@ func heartbeatLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for range t.C {
+		cpu := cpuSamplerGlobal.pct()
+		mem := memPct()
+		free := diskFree(cfg.DataDir)
 		mu.Lock()
+		active := len(running)
 		hb := api.Heartbeat{
-			NodeID:   nodeID,
-			Hostname: hostname,
-			Addr:     advertisedAddr(),
-			Public:   myPublic,
-			Edges:    edges,
-			TS:       time.Now(),
-			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
+			NodeID:        nodeID,
+			Hostname:      hostname,
+			Addr:          advertisedAddr(),
+			Public:        myPublic,
+			Edges:         edges,
+			TS:            time.Now(),
+			CPUPct:        cpu,
+			MemPct:        mem,
+			DiskFreeBytes: free,
+			ActiveXfers:   active,
 		}
 		mu.Unlock()
 		resp, err := hbClient.Heartbeat(hb)
@@ -529,13 +608,15 @@ func heartbeatLoop() {
 		backlog := dueRep
 		dueRep = nil
 		mu.Unlock()
-		for _, r := range backlog { // 网络恢复：补发新鲜积压，丢弃陈年
+		for i, r := range backlog { // 网络恢复：补发新鲜积压，丢弃陈年
 			if time.Since(r.at) > 10*time.Minute {
 				continue
 			}
 			if err := hbClient.JobDone(r.req); err != nil {
+				// 只把当前一条放回会让后面未发的整段凭空消失
+				// （之前 break 之前没有把 backlog[i+1:] 收回来）。
 				mu.Lock()
-				dueRep = append(dueRep, r)
+				dueRep = append(append([]dueReport{}, backlog[i:]...), dueRep...)
 				mu.Unlock()
 				break
 			}
@@ -544,6 +625,15 @@ func heartbeatLoop() {
 		changed := !samePeerSet(peers, resp.Peers)
 		peers = resp.Peers
 		mu.Unlock()
+		if resp.Revoked != nil { // 全量替换
+			revokedMu.Lock()
+			fresh := make(map[api.NodeID]bool, len(resp.Revoked))
+			for _, id := range resp.Revoked {
+				fresh[id] = true
+			}
+			revokedIDs = fresh
+			revokedMu.Unlock()
+		}
 		if changed {
 			select {
 			case probeNow <- struct{}{}:
@@ -589,6 +679,9 @@ func whoamiLoop() {
 	t := time.NewTicker(25 * time.Second)
 	defer t.Stop()
 	send := func() {
+		if udpConn == nil { // 防御：数据面尚未就绪
+			return
+		}
 		pkt, err := nat.Build(nodeID, nodeCert, time.Now())
 		if err != nil {
 			return
@@ -596,6 +689,15 @@ func whoamiLoop() {
 		raddr, err := net.ResolveUDPAddr("udp", echoAddr)
 		if err != nil {
 			return
+		}
+		// 丢弃上一轮遗留的回声，避免读到陈旧的公网映射
+	drain:
+		for {
+			select {
+			case <-udpConn.whoamiCh:
+			default:
+				break drain
+			}
 		}
 		if _, err := udpConn.WriteTo(pkt, raddr); err != nil {
 			log.Println("WHOAMI 发送失败：", err)
@@ -665,6 +767,9 @@ func tryPunch(d api.PunchDirective) {
 	}
 	mu.Unlock()
 
+	if udpConn == nil { // 防御：数据面尚未就绪
+		return
+	}
 	go transfer.SendOpeners(udpConn, d.Addr, 8*time.Second)
 	targets := []string{d.Addr}
 	if d.Private != "" && d.Private != d.Addr {
@@ -745,8 +850,14 @@ func runJob(g api.TransferGrant) {
 	}
 	// 取件落盘映射：inbox: 前缀 → 本机 data-dir/inbox/（安全：不能让
 	// 远端指定任意本机路径）
+	// 注意：inbox: 映射只在接收端做（transfer.groupFor）。源端绝不能
+	// 改写 DstPath——grant 是要原样转发给目的端验签的。
 	if strings.HasPrefix(g.DstPath, "inbox:") {
-		g.DstPath = filepath.Join(cfg.DataDir, "inbox", strings.TrimPrefix(g.DstPath, "inbox:"))
+		if _, err := transfer.SafeInboxPath(cfg.DataDir, g.DstPath); err != nil {
+			log.Printf("[trace] 任务 %s 被拒：%v", g.ID, err)
+			done(false, err.Error())
+			return
+		}
 	}
 	log.Printf("[trace] 任务 %s 开始执行：sources=%d mode=%q", g.ID, len(g.Sources), g.Mode)
 	timeout := time.Until(g.ExpiresAt)
