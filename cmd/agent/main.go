@@ -726,6 +726,11 @@ func runJob(g api.TransferGrant) {
 		done(false, "grant 验签失败或已过期")
 		return
 	}
+	// 取件落盘映射：inbox: 前缀 → 本机 data-dir/inbox/（安全：不能让
+	// 远端指定任意本机路径）
+	if strings.HasPrefix(g.DstPath, "inbox:") {
+		g.DstPath = filepath.Join(cfg.DataDir, "inbox", strings.TrimPrefix(g.DstPath, "inbox:"))
+	}
 	log.Printf("[trace] 任务 %s 开始执行：sources=%d mode=%q", g.ID, len(g.Sources), g.Mode)
 	timeout := time.Until(g.ExpiresAt)
 	if timeout > 30*time.Minute {

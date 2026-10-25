@@ -5,6 +5,7 @@
 package main
 
 import (
+	"strconv"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -149,6 +150,39 @@ func main() {
 			fmt.Printf("%-8s %-20s cpu=%3.0f%% mem=%3.0f%% 负载传输=%d 出边=[%s]\n",
 				h.NodeID, h.Hostname, h.CPUPct, h.MemPct, h.ActiveXfers, strings.Join(edges, " "))
 		}
+	case "share":
+		if len(rest) != 2 {
+			fmt.Fprintln(os.Stderr, "用法: ffctl share <node>:<path> [ttl分钟]")
+			os.Exit(2)
+		}
+		ttl := 10
+		if len(rest) == 3 {
+			if n, err := strconv.Atoi(rest[2]); err == nil {
+				ttl = n
+			}
+		}
+		node, path, ok := splitNodePath(rest[1])
+		if !ok {
+			fmt.Fprintln(os.Stderr, "格式 node:/path")
+			os.Exit(2)
+		}
+		var resp map[string]any
+		if err := cl.Post("/v1/share", map[string]any{"src": node, "path": path, "ttl_min": ttl}, &resp); err != nil {
+			fmt.Fprintln(os.Stderr, "分享失败：", err)
+			os.Exit(1)
+		}
+		fmt.Printf("取件码：%v（%v 分钟内有效，最多 %v 次）\n目标机执行：ff get %v\n", resp["code"], resp["expires_in_min"], resp["max_uses"], resp["code"])
+	case "get":
+		if len(rest) != 2 {
+			fmt.Fprintln(os.Stderr, "用法: ffctl get <取件码>")
+			os.Exit(2)
+		}
+		var g api.TransferGrant
+		if err := cl.Post("/v1/get", map[string]string{"code": rest[1]}, &g); err != nil {
+			fmt.Fprintln(os.Stderr, "取件失败：", err)
+			os.Exit(1)
+		}
+		fmt.Printf("已受理：%s -> 本机 %s（%s）\n", g.Src, g.DstPath, g.ID)
 	case "revoke":
 		if len(rest) != 2 {
 			fmt.Fprintln(os.Stderr, "用法: ffctl revoke <node-id>")

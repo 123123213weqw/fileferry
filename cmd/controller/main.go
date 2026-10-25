@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +63,15 @@ type controller struct {
 	indexCache map[api.NodeID][]api.IndexEntry    // 各节点最近索引（查源文件哈希/大小）
 	revoked    map[api.NodeID]bool                // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
 	keypass    map[string]string                  // grantID -> 密钥材料（端到端加密专递，一次性）
+	shares     map[string]*shareEntry             // 取件码 hash -> 分享（M11 临时取件）
+}
+
+// shareEntry 临时取件：短时效 + 次数限制的定向取文件授权。
+type shareEntry struct {
+	Src   api.NodeID
+	Path  string
+	Exp   time.Time
+	Uses  int
 }
 
 type pubEntry struct {
@@ -126,6 +136,7 @@ func main() {
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		revoked:      map[api.NodeID]bool{},
 		keypass:      map[string]string{},
+		shares:       map[string]*shareEntry{},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
@@ -282,6 +293,8 @@ func main() {
 	mux.HandleFunc("POST /v1/revoke", c.handleRevoke)
 	mux.HandleFunc("POST /v1/keypass", c.handleKeypassPost)
 	mux.HandleFunc("GET /v1/keypass", c.handleKeypassGet)
+	mux.HandleFunc("POST /v1/share", c.handleShare)
+	mux.HandleFunc("POST /v1/get", c.handleGet)
 
 	tlsCfg := rootCA.ServerTLS(tls.Certificate{})
 	tlsCfg.Certificates = nil // 交由 GetCertificate 动态提供（有静态列表时 TLS 不走回调）
@@ -512,6 +525,130 @@ func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
 	c.event("renew", nodeID, "")
 	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
 }
+
+// handleShare：仅 admin。生成临时取件码：{src, path, ttl_min}。
+// 台账只存哈希；过期/用尽自动作废。
+func (c *controller) handleShare(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
+		return
+	}
+	var req struct {
+		Src    api.NodeID `json:"src"`
+		Path   string     `json:"path"`
+		TTLMin int        `json:"ttl_min"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Src == "" || req.Path == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.TTLMin <= 0 || req.TTLMin > 24*60 {
+		req.TTLMin = 10
+	}
+	tok, err := ca.NewEnrollToken() // 复用随机码生成器（前缀 ff_enroll_，做分享够用）
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	code := "ff_get_" + tok[len("ff_enroll_"):]
+	c.mu.Lock()
+	c.shares[api.TokenHash(code)] = &shareEntry{Src: req.Src, Path: req.Path, Exp: time.Now().Add(time.Duration(req.TTLMin) * time.Minute), Uses: 3}
+	c.mu.Unlock()
+	c.event("share", string(req.Src), req.Path)
+	json.NewEncoder(w).Encode(map[string]any{"code": code, "expires_in_min": req.TTLMin, "max_uses": 3})
+}
+
+// handleGet：node 角色。凭码取文件：生成"存件节点 → 请求节点"的
+// 定向 grant，落盘限定请求节点收件目录。
+func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
+	if len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	dst := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
+	var req struct {
+		Code string `json:"code"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Code == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !c.limiter.allow("get:"+string(dst), 3) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	c.mu.Lock()
+	se, ok := c.shares[api.TokenHash(req.Code)]
+	if !ok || time.Now().After(se.Exp) {
+		delete(c.shares, api.TokenHash(req.Code))
+		c.mu.Unlock()
+		http.Error(w, "invalid or expired code", http.StatusUnauthorized)
+		return
+	}
+	se.Uses--
+	if se.Uses <= 0 {
+		defer delete(c.shares, api.TokenHash(req.Code))
+	}
+	c.mu.Unlock()
+	if dst == se.Src {
+		http.Error(w, "source cannot fetch itself", http.StatusBadRequest)
+		return
+	}
+	// 组 grant：源=存件节点，目的=取件节点
+	if _, _, ok := c.graph.EdgeDetail(dst, se.Src); !ok {
+		_, _, ok2 := c.graph.EdgeDetail(se.Src, dst)
+		if !ok2 {
+			http.Error(w, "no path to source", http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	path := c.graph.Path(dst, se.Src)
+	if path == nil || len(path) < 2 {
+		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
+		return
+	}
+	hops := make([]api.Hop, 0, len(path))
+	for i, id := range path {
+		hop := api.Hop{NodeID: id}
+		if i > 0 {
+			proto, addr, _ := c.graph.EdgeDetail(path[i-1], id)
+			hop.Addr, hop.Proto = addr, proto
+			if hop.Addr == "" {
+				hop.Addr = c.graph.Addr(id)
+			}
+			if hop.Proto == "" {
+				hop.Proto = "quic"
+			}
+		}
+		hops = append(hops, hop)
+	}
+	name := filepath.Base(se.Path)
+	c.mu.Lock()
+	c.nextID++
+	id := c.nextID
+	c.mu.Unlock()
+	grant := api.TransferGrant{
+		ID:        fmt.Sprintf("get-%d", id),
+		Src:       se.Src,
+		Dst:       dst,
+		Hops:      hops,
+		SrcPath:   se.Path,
+		DstPath:   filepath.Join(shareInbox(dst), name),
+		ChunkSize: 4 << 20,
+		Streams:   2,
+		Enc:       true,
+		ExpiresAt: time.Now().Add(30 * time.Minute),
+	}
+	grant.Sign(c.signer)
+	c.mu.Lock()
+	c.pending[grant.Src] = append(c.pending[grant.Src], grant)
+	c.mu.Unlock()
+	c.jobPersist(&grant)
+	c.event("get", string(dst), se.Path)
+	json.NewEncoder(w).Encode(grant)
+}
+
+// shareInbox 取件落盘目录标记：agent 侧映射到其 data-dir/inbox。
+func shareInbox(node api.NodeID) string { return "inbox:" }
 
 // handleKeypassPost：源端上报端到端加密密钥材料（验证其为任务源端）。
 // 密钥只在 controller 内存停留至目的端取走（一次性）。
