@@ -27,7 +27,7 @@ import (
 
 const usage = `用法：
   ffctl -cert-dir <dir> put  <本机文件> <dst-node>:<path>   ← 本机直推（等价 scp）
-  ffctl -rate <字节/秒> ...                                   ← 可选：限速
+  ffctl -rate <字节/秒> -streams <n> ...                      ← 可选：限速 / 并行流数
   ffctl -cert-dir <dir> send <src-node>:<path> <dst-node>:<path>
   ffctl -cert-dir <dir> status
 
@@ -40,9 +40,19 @@ func main() {
 	jsonOut := false
 	noWait := false
 	rateBps := int64(0) // -rate：限速（字节/秒），0 = 不限
+	streams := 0        // -streams：并行流数，0 = 由 controller 决定
 	args := os.Args[1:]
 	var rest []string
 	for i := 0; i < len(args); i++ {
+		if args[i] == "-streams" {
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(args[i+1]); err == nil {
+					streams = n
+				}
+				i++
+			}
+			continue
+		}
 		if args[i] == "-rate" {
 			if i+1 < len(args) {
 				if n, err := strconv.ParseInt(args[i+1], 10, 64); err == nil {
@@ -161,7 +171,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "目标格式应为 node:/path")
 			os.Exit(2)
 		}
-		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, noWait); err != nil {
+		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, streams, noWait); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -314,7 +324,7 @@ func dataPlaneTLS(certDir string) (*tls.Config, error) {
 // 完整性：授权里带 FileSHA256/FileSize（controller 签名钉死），接收端
 // 校验 manifest 与之一致，且逐块 SHA256——与节点间传输同一套保证。
 // 权限：目标节点的 allowed-dirs 白名单照常生效。
-func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, noWait bool) error {
+func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, streams int, noWait bool) error {
 	fi, err := os.Stat(localPath)
 	if err != nil {
 		return fmt.Errorf("读本机文件失败：%w", err)
@@ -335,6 +345,7 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 		SHA256:    sum,
 		Size:      fi.Size(),
 		RateLimit: rateBps,
+		Streams:   streams,
 	}, &grant); err != nil {
 		return fmt.Errorf("申请推送授权失败：%w", err)
 	}
@@ -351,18 +362,48 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// 直连目标节点的数据面（Hops[1] 由 controller 填好地址与 TCP 端口）
-	open := transfer.OpenerDirect(ctx, grant.Hops[1], tlsConf)
-	start := time.Now()
-	n, err := transfer.SendFile(ctx, localPath, open, tlsConf, &grant)
+	// 直连目标节点的数据面（Hops[1] 由 controller 填好地址与 TCP 端口）。
+	// Proto 不在签名内，可以自由切换：先按提示试，失败再换另一种。
+	// 之前 controller 硬编码 tcp，等于直推永远用不上 QUIC。
+	protos := dedupProtos(grant.Hops[1].Proto, "quic", "tcp")
+	var (
+		n     int64
+		lastE error
+		start = time.Now()
+	)
+	for _, pr := range protos {
+		h := grant.Hops[1]
+		h.Proto = pr
+		n, lastE = transfer.SendFile(ctx, localPath, transfer.OpenerDirect(ctx, h, tlsConf), tlsConf, &grant)
+		if lastE == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
 	el := time.Since(start)
-	if err != nil {
-		return fmt.Errorf("推送失败：%w", err)
+	if lastE != nil {
+		return fmt.Errorf("推送失败（%v 均不可用）：%w", protos, lastE)
 	}
 	mbps := float64(n) / (1 << 20) / el.Seconds()
 	fmt.Printf("完成：%s（%d 字节，%.2fs，%.0f MB/s，SHA256 %s…）\n",
 		grant.DstPath, n, el.Seconds(), mbps, sum[:12])
 	return nil
+}
+
+// dedupProtos 按顺序去重并丢掉空串（第一个通常是 controller 给的建议值）。
+func dedupProtos(in ...string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 // fileSHA256 流式算整文件摘要（大文件不整读进内存）。

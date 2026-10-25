@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,9 @@ type Config struct {
 	Controller  string `yaml:"controller"`
 	EnrollToken string `yaml:"enroll-token"`
 	DataPort    int    `yaml:"data-port"`
+	// BindAddr 是数据面监听地址（默认空 = 所有接口）。多网卡主机可用它
+	// 只绑某个内网口；也用于测试里把流量引入延迟代理。
+	BindAddr string `yaml:"bind-addr"`
 	// TCPPort 让 TCP 数据面使用固定端口（0 = data-port+1）。
 	// 被墙网络只放行 443 时，写 443 即可用纯 TCP 打通。
 	TCPPort int    `yaml:"tcp-port"`
@@ -286,7 +290,7 @@ func run(cfgPath string) error {
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		MinVersion:   tls.VersionTLS13,
 	}
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", cfg.DataPort))
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.DataPort)))
 	if err != nil {
 		return err
 	}
@@ -322,7 +326,7 @@ func run(cfgPath string) error {
 	if cfg.TCPPort > 0 && cfg.TCPPort == cfg.DataPort {
 		log.Printf("⚠ tcp-port(%d) 与 data-port 相同：UDP 与 TCP 抢同一端口号，请改开", cfg.TCPPort)
 	}
-	tcpLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", tcpPort), serverTLS)
+	tcpLn, err := tls.Listen("tcp", net.JoinHostPort(cfg.BindAddr, strconv.Itoa(tcpPort)), serverTLS)
 	if err != nil {
 		log.Printf("TCP 回退监听失败（仅 QUIC 可用）：%v", err)
 	} else {

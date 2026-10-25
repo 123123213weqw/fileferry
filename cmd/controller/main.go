@@ -440,6 +440,18 @@ const (
 	grantTTL = 30 * time.Minute
 )
 
+// pushProto 给出优先拨号协议：有探测边就用探测结果，否则默认 quic。
+func pushProto(c *controller, id api.NodeID) string {
+	for _, hb := range c.graph.Snapshot() {
+		for _, e := range hb.Edges {
+			if e.To == id && e.Proto != "" {
+				return e.Proto
+			}
+		}
+	}
+	return "quic"
+}
+
 // handlePush：本机(管理员) → 远端节点 直推。仅 admin。
 //
 // 设计要点：controller 只签授权 + 给出目标拨号地址，**数据不经过
@@ -504,9 +516,12 @@ func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 		Hops: []api.Hop{
 			{NodeID: caller}, // 本机不是舰队节点，仅占位（签名覆盖）
 			{
-				NodeID:  req.Dst,
-				Addr:    addr,
-				Proto:   "tcp",
+				NodeID: req.Dst,
+				Addr:   addr,
+				// Proto 只给"优先尝试"的提示（不进签名，见 api.payloadV2），
+				// 客户端失败时会自动换另一种协议。之前这里硬编码 "tcp"，
+				// 等于本机直推永远用不上 QUIC。
+				Proto:   pushProto(c, req.Dst),
 				TCPPort: c.graph.TCPPort(req.Dst),
 			},
 		},

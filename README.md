@@ -99,6 +99,7 @@ controller: https://<controller地址>:9443
 enroll-token: ff_enroll_一次性令牌
 data-port: 7800            # 数据面 UDP 端口（TCP 回退默认用 7801）
 # tcp-port: 443            # 被墙网络只放行 443 时：把 TCP 数据面固定到 443
+# bind-addr: 10.0.0.5      # 多网卡主机只绑某个内网口（默认所有接口）
 data-dir: /home/me/ff
 node-name: ff-node-a       # 稳定节点名（缺省用主机名），重装后身份不变
 allowed-dirs:              # 落盘白名单：源/目的路径都必须在列表内
@@ -182,6 +183,24 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 loopback 没有网络 RTT，fileferry 的 mTLS 握手与 controller 往返成了固定开销，
 所以小文件不占优。它换来的是：不需要 sshd、能穿透只放 443 的网络、断点续传、
 多流并行（高 RTT 链路上差距会拉大）。
+
+### 真实 RTT 下的实测（不是 loopback）
+
+loopback 没有传播时延，测不出长肥管道上的问题。用双向延迟代理注入 RTT 后
+（`put` 100MB，每轮清空目标、逐次校验 SHA256）：
+
+| RTT | 流数=1 | 流数=2 | 流数=4 | 流数=8 |
+|---|---|---|---|---|
+| 40 ms | 1.15 s（87 MB/s） | 1.01 s（99 MB/s） | 1.04 s | 1.04 s |
+| 无延迟 | 0.21 s（476 MB/s） | — | — | — |
+
+结论要直说：**40ms RTT 下单流就已经跑到 87MB/s，多流只提升约 14%**
+（QUIC 的流控窗口足够大，所以"多流叠配额"的收益不大）。它的价值更多
+体现在高丢包/限速/单流被中间设备干扰的场景，而不是干净链路的带宽。
+
+> 说明：同一 RTT 下 **rsync 的对照数没能拿到**。我写的 TCP 延迟代理会让
+> rsync 的分块协议卡死（120s 超时），这是代理缺陷而非 rsync 的问题，
+> 所以不引用该数据。可比的只有 loopback 那组（见上）。
 
 ### 慢链路收尾（P0，已修）
 
