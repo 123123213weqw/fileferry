@@ -75,7 +75,7 @@ func TestSwitchTransfer(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			stream, closeConn, err := DialSwitch(ctx, swQ, "quic", clientTLSFor(t, root, "dst"), grant)
+			stream, closeConn, err := DialSwitch(ctx, swQ, "quic", 0, clientTLSFor(t, root, "dst"), grant)
 			if err != nil {
 				t.Errorf("目的端接入交换台失败：%v", err)
 				return

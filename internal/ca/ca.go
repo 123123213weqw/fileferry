@@ -205,6 +205,5 @@ func NewEnrollToken() (string, error) {
 	return "ff_enroll_" + hex.EncodeToString(b), nil
 }
 
-func (c *CA) RootPEM() []byte             { return c.rootPEM }
-func (c *CA) Pool() *x509.CertPool        { return c.pool }
-func (c *CA) RootCert() *x509.Certificate { return c.rootCert }
+func (c *CA) RootPEM() []byte      { return c.rootPEM }
+func (c *CA) Pool() *x509.CertPool { return c.pool }

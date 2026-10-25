@@ -59,6 +59,8 @@ type controller struct {
 	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
 	ledger       *enrollLedger                       // 持久化核销台账
 	limiter      *rateLimiter
+	wakeMu       sync.Mutex
+	wake         map[api.NodeID]chan struct{} // 长轮询：有待办任务时唤醒挂住的心跳
 
 	replicas   map[string]map[api.NodeID]string // sha256 -> nodeID -> path（M8 多源副本索引）
 	pathBW     map[[2]api.NodeID]float64        // 实测路径吞吐 MB/s（jobdone 回填）
@@ -140,6 +142,7 @@ func main() {
 		nextID:       time.Now().Unix(),
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
+		wake:         map[api.NodeID]chan struct{}{},
 		replicas:     map[string]map[api.NodeID]string{},
 		pathBW:       map[[2]api.NodeID]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
@@ -370,28 +373,11 @@ func (c *controller) autoRetry(oldID string) {
 	g.Sign(c.signer)
 	for _, t := range g.AllSources() {
 		c.pending[t] = append(c.pending[t], g)
+		c.notifyPending(t)
 	}
 	c.mu.Unlock()
 	c.jobPersist(&g)
 	log.Printf("断点续传：重签发 %s（原 %s，接收端将跳过已收块）", g.ID, oldID)
-}
-
-func retryDepth(id string) int {
-	n := 0
-	for strings.HasPrefix(id, "retry-") {
-		i := strings.Index(id, "-")
-		if i < 0 {
-			break
-		}
-		rest := id[i+1:]
-		j := strings.Index(rest, "-")
-		if j < 0 {
-			break
-		}
-		id = rest[j+1:]
-		n++
-	}
-	return n
 }
 
 // grantParticipants 返回该 grant 的全部合法参与方（源、目的、各分片源）。
@@ -740,7 +726,7 @@ func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	hops := make([]api.Hop, 0, len(path))
 	for i, id := range path {
-		hop := api.Hop{NodeID: id}
+		hop := api.Hop{NodeID: id, TCPPort: c.graph.TCPPort(id)}
 		if i > 0 {
 			proto, addr, _ := c.graph.EdgeDetail(path[i-1], id)
 			hop.Addr, hop.Proto = addr, proto
@@ -773,6 +759,7 @@ func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	grant.Sign(c.signer)
 	c.mu.Lock()
 	c.pending[grant.Src] = append(c.pending[grant.Src], grant)
+	c.notifyPending(grant.Src)
 	c.mu.Unlock()
 	c.jobPersist(&grant)
 	c.event("get", string(dst), se.Path)
@@ -1182,6 +1169,16 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Unlock()
 	c.graph.Apply(hb)
+	// 长轮询：没有待办任务时先挂住，一有任务立刻返回。
+	// 没有这一步，`ffctl send` 必须等下一次心跳（5s）才被投递——
+	// 实测 200MB 传输的 6s 里有 5s 纯粹在等心跳。
+	if hb.WaitMS > 0 {
+		d := time.Duration(hb.WaitMS) * time.Millisecond
+		if d > 15*time.Second {
+			d = 15 * time.Second // 上限：必须小于 topology.HeartbeatTimeout(20s)
+		}
+		c.awaitPending(hb.NodeID, d)
+	}
 	c.mu.Lock()
 	jobs := c.pending[hb.NodeID]
 	delete(c.pending, hb.NodeID)
@@ -1229,6 +1226,54 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		c.requeueJobs(hb.NodeID, jobs)
 		log.Printf("心跳响应写失败（%s）：%d 条任务已放回队列", hb.NodeID, len(jobs))
 		return
+	}
+}
+
+// notifyPending 唤醒正在长轮询该节点的心跳请求（有待办任务了）。
+func (c *controller) notifyPending(id api.NodeID) {
+	c.wakeMu.Lock()
+	if ch, ok := c.wake[id]; ok {
+		close(ch)
+		delete(c.wake, id)
+	}
+	c.wakeMu.Unlock()
+}
+
+// awaitPending 在最多 d 内等待该节点出现待办任务。
+// 返回 true 表示已有任务（或被唤醒）。
+//
+// 顺序很重要：**先注册唤醒通道，再复查一次队列**。反过来的话存在
+// 丢唤醒竞态——任务恰好落在"查完队列、还没注册"之间时 notifyPending
+// 找不到通道，心跳会白等到超时（实测表现为延迟随机变成 5~8 秒）。
+func (c *controller) awaitPending(id api.NodeID, d time.Duration) bool {
+	c.wakeMu.Lock()
+	ch, ok := c.wake[id]
+	if !ok {
+		ch = make(chan struct{})
+		c.wake[id] = ch
+	}
+	c.wakeMu.Unlock()
+
+	// 注册之后再查一次：若这期间已入队，直接返回，不进入等待
+	c.mu.Lock()
+	n := len(c.pending[id])
+	c.mu.Unlock()
+	if n > 0 {
+		return true
+	}
+
+	tm := time.NewTimer(d)
+	defer tm.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-tm.C:
+		c.wakeMu.Lock()
+		if cur, exists := c.wake[id]; exists && cur == ch {
+			delete(c.wake, id) // 超时回收，避免 map 泄漏
+		}
+		c.wakeMu.Unlock()
+		return false
 	}
 }
 
@@ -1313,7 +1358,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	// 的实际值**（打洞边=公网映射，直连边=广播地址；谁探测的谁去拨）
 	hops := make([]api.Hop, 0, len(path))
 	for i, id := range path {
-		hop := api.Hop{NodeID: id}
+		hop := api.Hop{NodeID: id, TCPPort: c.graph.TCPPort(id)}
 		if i > 0 {
 			if proto, addr, ok := c.graph.EdgeDetail(path[i-1], id); ok && addr != "" {
 				hop.Addr = addr
@@ -1372,6 +1417,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	for _, t := range targets {
 		c.pending[t] = append(c.pending[t], grant) // 每个源各收一份，各取自己的区间
+		c.notifyPending(t)
 	}
 	npend := len(c.pending[req.Src])
 	c.mu.Unlock()
@@ -1467,6 +1513,7 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 		}
 		g.Sources = append(g.Sources, api.SourceSpec{
 			NodeID: cd.id, Addr: cd.addr, Proto: cd.proto, Path: cd.path, Start: cursor, End: end,
+			TCPPort: c.graph.TCPPort(cd.id),
 		})
 		cursor = end
 		if cursor >= totalChunks {
@@ -1604,6 +1651,8 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 	c.mu.Lock()
 	c.pending[req.Src] = append(c.pending[req.Src], grant) // 源端：发送
 	c.pending[req.Dst] = append(c.pending[req.Dst], grant) // 目的端：出站接入交换台
+	c.notifyPending(req.Src)
+	c.notifyPending(req.Dst)
 	c.mu.Unlock()
 	log.Printf("交换台模式：%s -> %s 经 %s 对接", req.Src, req.Dst, best)
 	c.jobPersist(&grant)

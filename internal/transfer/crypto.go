@@ -4,6 +4,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"fmt"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -82,9 +83,22 @@ func cipherForGrant(grantID string) (*streamCipher, error) {
 	if keyFetcher == nil {
 		return nil, fmt.Errorf("未配置密钥获取")
 	}
-	mat, err := keyFetcher(grantID)
-	if err != nil {
-		return nil, err
+	// 密钥由源端在开始发送前上报给 controller，接收端可能先到一步。
+	// 之前一遇 404 就整组失败（靠上层重试碰运气），实测日志里会出现
+	// "建组失败：取密钥失败: 404 Not Found"。这里短暂重试，把"先到一步"
+	// 变成正常等待而不是失败。
+	var mat []byte
+	var err error
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mat, err = keyFetcher(grantID)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("等待源端上报密钥超时: %w", err)
+		}
+		time.Sleep(150 * time.Millisecond)
 	}
 	if len(mat) != chacha20poly1305.KeySize+7 {
 		return nil, fmt.Errorf("密钥材料长度异常")

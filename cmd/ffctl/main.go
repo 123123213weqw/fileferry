@@ -106,8 +106,15 @@ func main() {
 		// 默认等待完成：轮询任务状态，退出码反映结果（agent/脚本友好）
 		fmt.Println("；等待完成…")
 		deadline := time.Now().Add(10 * time.Minute)
+		// 自适应轮询：小文件应当"立刻就回"，长传输再退到 1s 一次。
+		// 之前固定 2s，意味着任何一次 send 至少多等 2 秒——scp 是立即
+		// 结束的，这条延迟直接决定"用起来像不像 scp"。
+		interval := 100 * time.Millisecond
 		for time.Now().Before(deadline) {
-			time.Sleep(2 * time.Second)
+			time.Sleep(interval)
+			if interval < time.Second {
+				interval *= 2
+			}
 			jobs, err := cl.Jobs(grant.ID)
 			if err != nil || len(jobs) == 0 {
 				continue

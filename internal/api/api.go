@@ -25,10 +25,11 @@ type NodeID = string
 // 对端的公网 NAT 映射，直连边是对端广播的地址，controller 构建
 // 传输路径时以此为准（谁探测的谁去拨）。
 type EdgeReport struct {
-	To    NodeID  `json:"to"`
-	RTTms float64 `json:"rtt_ms"`
-	Proto string  `json:"proto"`
-	Addr  string  `json:"addr"`
+	To      NodeID  `json:"to"`
+	RTTms   float64 `json:"rtt_ms"`
+	Proto   string  `json:"proto"`
+	Addr    string  `json:"addr"`
+	TCPPort int     `json:"tcp_port,omitempty"`
 	// AltProto：两种协议都通时的副协议（混流用：并行流各占一条
 	// 协议通道，叠加两种限速配额）。空 = 只有一种可用。
 	AltProto string `json:"alt_proto,omitempty"`
@@ -39,9 +40,18 @@ type EdgeReport struct {
 // UDP 回声口得知的自身公网 NAT 映射（agent 不自行声称，controller
 // 回填校验），供打洞配对用。
 type Heartbeat struct {
-	NodeID        NodeID       `json:"node_id"`
-	Hostname      string       `json:"hostname"`
-	Addr          string       `json:"addr"` // 数据面地址 host:port（QUIC）
+	NodeID   NodeID `json:"node_id"`
+	Hostname string `json:"hostname"`
+	Addr     string `json:"addr"` // 数据面地址 host:port（QUIC）
+	// TCPPort 是本节点 TCP 数据面的实际端口（0 = 未上报，按 addr 端口+1
+	// 推断）。被墙网络里 TCP 常被挪到 443，各节点端口未必相同，所以必须
+	// 由节点自己上报，不能靠全局约定。
+	TCPPort int `json:"tcp_port,omitempty"`
+	// WaitMS 让控制面做长轮询：没有待办任务时不要立刻返回，而是挂住
+	// 最多这么多毫秒，一有任务就马上回。没有长轮询时，`ffctl send`
+	// 必须等下一次心跳（5s）才会被投递——实测 200MB 传输总耗时 6s，
+	// 其中 5s 纯粹是在等心跳。scp 是立即开始的，这里必须对齐。
+	WaitMS        int          `json:"wait_ms,omitempty"`
 	Public        string       `json:"public,omitempty"`
 	CPUPct        float64      `json:"cpu_pct"`
 	MemPct        float64      `json:"mem_pct"`
@@ -59,6 +69,8 @@ func (h Heartbeat) LoadPct() float64 { return (h.CPUPct + h.MemPct) / 2 }
 type PeerInfo struct {
 	ID   NodeID `json:"id"`
 	Addr string `json:"addr"` // 数据面地址 host:port（QUIC）
+	// TCPPort 是该节点 TCP 数据面的实际端口（0 = 用 Addr 端口+1）。
+	TCPPort int `json:"tcp_port,omitempty"`
 }
 
 // PunchDirective 是 controller 随心跳下发的打洞指令：对端 Peer 的
@@ -135,6 +147,8 @@ type Hop struct {
 	NodeID NodeID `json:"node_id"`
 	Addr   string `json:"addr"`
 	Proto  string `json:"proto"`
+	// TCPPort 是该跳 TCP 数据面的实际端口（0 = 用 Addr 端口+1）。
+	TCPPort int `json:"tcp_port,omitempty"`
 }
 
 type TransferGrant struct {
@@ -175,6 +189,8 @@ type SourceSpec struct {
 	Path   string `json:"path"`  // 该源本地的文件路径（各副本路径可不同）
 	Start  int64  `json:"start"` // 起始块号（含）
 	End    int64  `json:"end"`   // 结束块号（不含）
+	// TCPPort 是该副本节点 TCP 数据面的实际端口（0 = Addr 端口+1）。
+	TCPPort int `json:"tcp_port,omitempty"`
 }
 
 // AllSources 返回参与发送的全部节点 ID（含主源）。

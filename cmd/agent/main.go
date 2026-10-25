@@ -44,7 +44,10 @@ type Config struct {
 	Controller  string `yaml:"controller"`
 	EnrollToken string `yaml:"enroll-token"`
 	DataPort    int    `yaml:"data-port"`
-	DataDir     string `yaml:"data-dir"`
+	// TCPPort 让 TCP 数据面使用固定端口（0 = data-port+1）。
+	// 被墙网络只放行 443 时，写 443 即可用纯 TCP 打通。
+	TCPPort int    `yaml:"tcp-port"`
+	DataDir string `yaml:"data-dir"`
 	// Advertise 显式声明对外的数据面地址（host:port）。controller 与
 	// agent 同机时自动探测会得到 127.0.0.1，公网机必须手工指定。
 	Advertise string `yaml:"advertise"`
@@ -84,7 +87,69 @@ var (
 
 	revokedMu  sync.Mutex
 	revokedIDs = map[api.NodeID]bool{} // controller 下发的撤销名单（数据面自保）
+
+	// probeFail 记录每个对端的连续探测失败次数与下次允许时间。
+	// 之前每 30s 无差别重试所有 peer：对端宕机时，一台死节点会让其余
+	// 所有节点每 30s 各发 2 次失败连接（QUIC+TCP）并各写一行日志，
+	// 在对端/IDS 看来就是分布式端口扫描。现在指数退避 + 状态变化才记
+	// 日志。
+	probeFailMu sync.Mutex
+	probeFail   = map[api.NodeID]*peerBackoff{}
 )
+
+// peerBackoff 单个对端的退避状态。
+type peerBackoff struct {
+	fails int
+	next  time.Time
+}
+
+// probeBackoff 返回该 peer 允许下次探测的等待时长（0 = 立即可探）。
+func probeBackoff(fails int) time.Duration {
+	if fails <= 0 {
+		return 0
+	}
+	d := 30 * time.Second
+	for i := 1; i < fails && d < 5*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
+// allowProbe 判断该 peer 现在是否可以探测。
+func allowProbe(id api.NodeID) bool {
+	probeFailMu.Lock()
+	defer probeFailMu.Unlock()
+	b, ok := probeFail[id]
+	if !ok {
+		return true
+	}
+	return !time.Now().Before(b.next)
+}
+
+// markProbe 记录一次探测结果：成功清零，失败累加并排下次时间。
+// 返回 true 表示"状态发生了变化"，调用方据此决定是否打日志。
+func markProbe(id api.NodeID, ok bool) bool {
+	probeFailMu.Lock()
+	defer probeFailMu.Unlock()
+	if ok {
+		if _, had := probeFail[id]; had {
+			delete(probeFail, id)
+			return true // 从失败恢复：值得记一行
+		}
+		return false
+	}
+	b, had := probeFail[id]
+	if !had {
+		b = &peerBackoff{}
+		probeFail[id] = b
+	}
+	b.fails++
+	b.next = time.Now().Add(probeBackoff(b.fails))
+	return b.fails == 1 // 只在"第一次失败"时记日志
+}
 
 // sniffConn 在数据面 UDP socket 外截流 WHOAMI 回复，其余包交给 QUIC。
 type sniffConn struct {
@@ -189,11 +254,22 @@ func run(cfgPath string) error {
 	// 给控制面请求设总超时：之前没有 Timeout，TCP 半开时心跳 goroutine
 	// 会永久阻塞——节点被判离线且永远不会自愈（连重连都不做）。
 	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{
-		Timeout:   20 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsConf, IdleConnTimeout: 60 * time.Second},
+		// 必须大于长轮询等待（8s）+ RTT，否则心跳会自己超时
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConf, IdleConnTimeout: 90 * time.Second},
 	}}
 	running = map[string]bool{}
 	punched = map[string]string{}
+	if cfg.TCPPort > 0 {
+		// 被墙网络只放行 443 时用这条：UDP(QUIC) 通常被干扰，走纯 TCP。
+		// 注意：tcp-port 是**全网统一**的端口（如同 ssh 全网用 22），
+		// 各节点必须配成同一个值，否则会把对端地址拨到自己身上。
+		log.Printf("数据面：UDP %d（QUIC）/ TCP %d（固定端口，需全网一致）",
+			cfg.DataPort, cfg.TCPPort)
+	} else {
+		log.Printf("数据面：UDP %d（QUIC）/ TCP %d（默认 data-port+1）",
+			cfg.DataPort, cfg.DataPort+1)
+	}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
 
 	if shareDir() != "" {
@@ -239,7 +315,14 @@ func run(cfgPath string) error {
 	}
 	defer ln.Close()
 	defer rawUDP.Close()
-	tcpLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", cfg.DataPort+1), serverTLS)
+	tcpPort := cfg.DataPort + 1
+	if cfg.TCPPort > 0 {
+		tcpPort = cfg.TCPPort
+	}
+	if cfg.TCPPort > 0 && cfg.TCPPort == cfg.DataPort {
+		log.Printf("⚠ tcp-port(%d) 与 data-port 相同：UDP 与 TCP 抢同一端口号，请改开", cfg.TCPPort)
+	}
+	tcpLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", tcpPort), serverTLS)
 	if err != nil {
 		log.Printf("TCP 回退监听失败（仅 QUIC 可用）：%v", err)
 	} else {
@@ -583,9 +666,12 @@ func indexLoop() {
 }
 
 func heartbeatLoop() {
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for range t.C {
+	// 长轮询链：每次心跳都会在控制面挂住最多 8 秒（WaitMS）。返回后
+	// 若这次明显是"挂满了才回"（没有任务），立刻续下一次轮询，而不是
+	// 等 5 秒 ticker——否则任务恰好落在两次轮询之间时，投递延迟会随机
+	// 变成 5 秒（实测 4MB 传输偶发 4.7s，正常应为 0.1s）。
+	// 只有心跳失败（快速返回）时才退到 5 秒间隔，避免把控制面打爆。
+	for {
 		cpu := cpuSamplerGlobal.pct()
 		mem := memPct()
 		free := diskFree(cfg.DataDir)
@@ -595,6 +681,7 @@ func heartbeatLoop() {
 			NodeID:        nodeID,
 			Hostname:      hostname,
 			Addr:          advertisedAddr(),
+			TCPPort:       tcpPortAdvertised(),
 			Public:        myPublic,
 			Edges:         edges,
 			TS:            time.Now(),
@@ -602,11 +689,18 @@ func heartbeatLoop() {
 			MemPct:        mem,
 			DiskFreeBytes: free,
 			ActiveXfers:   active,
+			// 长轮询：有任务立刻回，避免每条命令白等一次心跳。
+			// 必须明显小于 topology.HeartbeatTimeout（20s），否则节点会
+			// 在两次心跳之间被判离线。
+			WaitMS: 8000,
 		}
 		mu.Unlock()
+		hbStart := time.Now()
 		resp, err := hbClient.Heartbeat(hb)
 		if err != nil {
 			log.Println("心跳失败：", err)
+			// 失败后必须退让，否则会成为紧循环
+			time.Sleep(3 * time.Second)
 			continue
 		}
 		mu.Lock()
@@ -651,6 +745,13 @@ func heartbeatLoop() {
 		for _, d := range resp.Punches {
 			log.Printf("收到打洞指令：对端 %s（%s）", d.Peer, d.Addr)
 			go tryPunch(d)
+		}
+		// 只有"什么也没收到且快速返回"（429 限速/异常）才退让；正常
+		// 情况（长轮询挂满才回，或刚收到任务）都立即续下一次轮询，
+		// 保证任意时刻都有一条心跳挂在控制面等着接任务。
+		if len(resp.Jobs) == 0 && len(resp.Punches) == 0 &&
+			time.Since(hbStart) < time.Second {
+			time.Sleep(1500 * time.Millisecond)
 		}
 	}
 }
@@ -754,11 +855,24 @@ func strconvAtoi(s string) (int, error) {
 	return n, nil
 }
 
-func hostOf(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
+// tcpPortAdvertised 返回本节点对外公布的 TCP 数据面端口。
+func tcpPortAdvertised() int {
+	if cfg.TCPPort > 0 {
+		return cfg.TCPPort
 	}
-	return hostport
+	return cfg.DataPort + 1
+}
+
+// peerTCPPort 返回对端上报的 TCP 数据面端口（0 = 未上报/未知）。
+func peerTCPPort(id api.NodeID) int {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range peers {
+		if p.ID == id {
+			return p.TCPPort
+		}
+	}
+	return 0
 }
 
 // tryPunch 执行一次打洞：向对方公网映射持续发开洞包（本 socket 的
@@ -775,15 +889,19 @@ func tryPunch(d api.PunchDirective) {
 	if udpConn == nil { // 防御：数据面尚未就绪
 		return
 	}
-	go transfer.SendOpeners(udpConn, d.Addr, 8*time.Second)
+	// d.Addr 来自 controller 的 WHOAMI 观测，是对方的**精确公网映射**：
+	// 只打这一个端口（exact=true），不扩散。
+	go transfer.SendOpeners(udpConn, d.Addr, 8*time.Second, true)
 	targets := []string{d.Addr}
 	if d.Private != "" && d.Private != d.Addr {
+		// 内网广播地址的端口只是猜测，此时才允许少量扩散。
+		go transfer.SendOpeners(udpConn, d.Private, 8*time.Second, false)
 		targets = append(targets, d.Private)
 	}
 	for i := 0; i < 10; i++ {
 		for _, tgt := range targets {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			rtt, _, err := transfer.Probe(ctx, tgt, tlsConf)
+			rtt, _, err := transfer.Probe(ctx, tgt, peerTCPPort(d.Peer), tlsConf)
 			cancel()
 			if err == nil {
 				mu.Lock()
@@ -879,6 +997,7 @@ func runJob(g api.TransferGrant) {
 	// 发全文件。找不到自己的分片则忽略（这份 grant 是发给别的源的）。
 	var startCh, endCh int64 = 0, -1
 	var hopAddr, hopProto, sendPath string
+	var hopTCP int
 	sendPath = g.SrcPath
 	via := ""
 	switch {
@@ -889,13 +1008,14 @@ func runJob(g api.TransferGrant) {
 		}
 		startCh, endCh = g.Sources[mineIdx].Start, g.Sources[mineIdx].End
 		hopAddr, hopProto = g.Sources[mineIdx].Addr, g.Sources[mineIdx].Proto
+		hopTCP = g.Sources[mineIdx].TCPPort
 		sendPath = g.Sources[mineIdx].Path // 各副本本地路径不同
 		via = fmt.Sprintf("（多源分片 [%d,%d)）", startCh, endCh)
 	case g.Mode == "switch":
-		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
+		hopAddr, hopProto, hopTCP = g.Hops[1].Addr, g.Hops[1].Proto, g.Hops[1].TCPPort
 		via = fmt.Sprintf("（经 %s 交换台对接）", g.Hops[1].NodeID)
 	default:
-		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
+		hopAddr, hopProto, hopTCP = g.Hops[1].Addr, g.Hops[1].Proto, g.Hops[1].TCPPort
 		if len(g.Hops) > 2 {
 			ids := make([]string, 0, len(g.Hops)-2)
 			for _, h := range g.Hops[1 : len(g.Hops)-1] {
@@ -914,7 +1034,7 @@ func runJob(g api.TransferGrant) {
 	if g.Mode == "switch" {
 		open = transfer.OpenerSwitch(ctx, g.Hops[1], tlsConf, &g)
 	} else {
-		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto}
+		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto, TCPPort: hopTCP}
 		open = transfer.OpenerDirect(ctx, hop, tlsConf)
 	}
 	sentBytes, err := transfer.SendFileRange(ctx, sendPath, open, tlsConf, &g, startCh, endCh)
@@ -980,7 +1100,7 @@ func runSwitchRecv(g api.TransferGrant) {
 
 // switchRecvShare 接入交换台并按标准 FFJ1 逻辑接收一个连接份额。
 func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
-	stream, closeConn, err := transfer.DialSwitch(ctx, g.Hops[1].Addr, g.Hops[1].Proto, tlsConf, &g)
+	stream, closeConn, err := transfer.DialSwitch(ctx, g.Hops[1].Addr, g.Hops[1].Proto, g.Hops[1].TCPPort, tlsConf, &g)
 	if err != nil {
 		return err
 	}
@@ -1018,11 +1138,13 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
 func probeLoop() {
 	runRound := func() {
 		type target struct {
-			id   api.NodeID
-			addr string
+			id      api.NodeID
+			addr    string
+			tcpPort int
 		}
 		mu.Lock()
 		byID := make(map[api.NodeID]string, len(peers)+len(punched))
+		portOf := make(map[api.NodeID]int, len(peers))
 		for id, addr := range punched {
 			byID[id] = addr // 打洞地址优先（已知可通）
 		}
@@ -1031,11 +1153,12 @@ func probeLoop() {
 				if _, ok := byID[p.ID]; !ok {
 					byID[p.ID] = p.Addr
 				}
+				portOf[p.ID] = p.TCPPort
 			}
 		}
 		targets := make([]target, 0, len(byID))
 		for id, addr := range byID {
-			targets = append(targets, target{id, addr})
+			targets = append(targets, target{id, addr, portOf[id]})
 		}
 		mu.Unlock()
 		var (
@@ -1044,15 +1167,26 @@ func probeLoop() {
 			found   []api.EdgeReport
 		)
 		for _, tg := range targets {
+			if !allowProbe(tg.id) {
+				continue // 仍在退避期：本轮跳过，不再捶打对端
+			}
 			wg.Add(1)
 			go func(tg target) {
 				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 				defer cancel()
-				rtt, proto, alt, err := transfer.ProbeWithAlt(ctx, tg.addr, tlsConf)
+				rtt, proto, alt, err := transfer.ProbeWithAlt(ctx, tg.addr, tg.tcpPort, tlsConf)
 				if err != nil {
-					log.Printf("探测 %s(%s) 失败：%v", tg.id, tg.addr, err)
+					// 只在状态变化时打日志：之前对端宕机时每 30s 一行，
+					// 一台死节点一天刷 2880 行，既淹没有用信息，也容易
+					// 被 fail2ban 的自定义 jail 当成攻击源。
+					if markProbe(tg.id, false) {
+						log.Printf("探测 %s(%s) 失败（转入退避）：%v", tg.id, tg.addr, err)
+					}
 					return
+				}
+				if markProbe(tg.id, true) {
+					log.Printf("探测 %s 恢复", tg.id)
 				}
 				muEdges.Lock()
 				found = append(found, api.EdgeReport{To: tg.id, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto, Addr: tg.addr, AltProto: alt})

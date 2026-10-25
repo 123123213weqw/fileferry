@@ -79,14 +79,24 @@ func SetTransport(t *quic.Transport) { sharedTransport = t }
 // target 发过包"这条 NAT 放行记录。dur 结束后停止。
 // 同时向映射端口 ±32 扇形喷洒（对称 NAT 的端口预测：对端出口
 // 映射端口通常在已观测映射附近递增），提高对穿成功率。
-func SendOpeners(udp net.PacketConn, target string, dur time.Duration) {
+// spreadPorts 是"端口未知"时允许探测的候选偏移。之前固定扫 13 个
+// 连续附近的端口（±1,2,4,8,16,32）——形态上就是一次端口扫描，实测
+// 8 秒内打 13 个端口，在 FortiGate/云厂商的扫描检测里很容易被整 IP
+// 隔离（连带把 SSH 一起封掉）。现在只有在对端端口未知时才退化为
+// 这 3 个最可能的偏移。
+var spreadPorts = []int{-1, 1, -2}
+
+// SendOpeners 向 target 持续发开洞包。
+// exact=true 表示 target 是该 socket 的**已知公网映射**（WHOAMI 观测
+// 值），此时只打这一个端口，不做任何扩散。
+func SendOpeners(udp net.PacketConn, target string, dur time.Duration, exact bool) {
 	addr, err := net.ResolveUDPAddr("udp", target)
 	if err != nil {
 		return
 	}
 	spray := []*net.UDPAddr{addr}
-	if port := addr.Port; port > 33 && port < 65500 {
-		for _, d := range []int{-32, -16, -8, -4, -2, -1, 1, 2, 4, 8, 16, 32} {
+	if port := addr.Port; !exact && port > 33 && port < 65500 {
+		for _, d := range spreadPorts {
 			if p := port + d; p > 0 && p < 65536 {
 				a2 := *addr
 				a2.Port = p
@@ -105,20 +115,30 @@ func SendOpeners(udp net.PacketConn, target string, dur time.Duration) {
 
 // DialStream 按协议拨到 addr 并打开一条流。返回的 closer 关闭底层
 // 连接（QUIC conn / TCP conn），流本身的写侧由调用者按需半关闭。
-func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (Stream, func(), error) {
+// DialStream 建立一条数据面流。tcpPort 是该**目标节点** TCP 数据面的
+// 实际端口（来自对端心跳上报）；0 时退回全局覆盖或 Addr 端口+1。
+func DialStream(ctx context.Context, addr, proto string, tcpPort int, tlsConf *tls.Config) (Stream, func(), error) {
 	switch proto {
 	case "tcp":
 		host, portStr, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, nil, err
 		}
-		// TCP 端口约定 = 数据面 UDP 端口 + 1
+		// TCP 端口：默认取数据面 UDP 端口 + 1；设置了 tcpPortOverride
+		// 时一律用它。被墙网络里通常只放行 443，而 UDP(QUIC) 往往被
+		// 干扰，此时把 TCP 数据面挪到 443 是唯一能通的办法。
 		port, err := strconv.Atoi(portStr)
 		if err != nil {
 			return nil, nil, err
 		}
+		if tcpPort <= 0 {
+			// 没有对端上报的端口时退回默认约定：数据面 UDP 端口 + 1。
+			// 绝不回退到"本机自己的端口"——那会把对端地址拨到自己身上
+			// （实测会报"拒绝中继：不在路径上"）。
+			tcpPort = port + 1
+		}
 		d := net.Dialer{Timeout: 5 * time.Second}
-		conn, err := tls.DialWithDialer(&d, "tcp", net.JoinHostPort(host, strconv.Itoa(port+1)), tlsConf)
+		conn, err := tls.DialWithDialer(&d, "tcp", net.JoinHostPort(host, strconv.Itoa(tcpPort)), tlsConf)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -399,11 +419,11 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 // 有 30 秒竞态窗口，拨号层兜底比取消任务友好。
 func OpenerDirect(ctx context.Context, firstHop api.Hop, tlsConf *tls.Config) StreamOpener {
 	return func() (Stream, func(), error) {
-		s, closeFn, err := DialStream(ctx, firstHop.Addr, firstHop.Proto, tlsConf)
+		s, closeFn, err := DialStream(ctx, firstHop.Addr, firstHop.Proto, firstHop.TCPPort, tlsConf)
 		if err == nil || firstHop.Proto != "quic" {
 			return s, closeFn, err
 		}
-		return DialStream(ctx, firstHop.Addr, "tcp", tlsConf)
+		return DialStream(ctx, firstHop.Addr, "tcp", firstHop.TCPPort, tlsConf)
 	}
 }
 
@@ -411,13 +431,13 @@ func OpenerDirect(ctx context.Context, firstHop api.Hop, tlsConf *tls.Config) St
 // FFSW 配对握手，返回的流在协议上与直连流完全同构。
 func OpenerSwitch(ctx context.Context, sw api.Hop, tlsConf *tls.Config, grant *api.TransferGrant) StreamOpener {
 	return func() (Stream, func(), error) {
-		return DialSwitch(ctx, sw.Addr, sw.Proto, tlsConf, grant)
+		return DialSwitch(ctx, sw.Addr, sw.Proto, sw.TCPPort, tlsConf, grant)
 	}
 }
 
 // DialSwitch 出站拨向交换台，发送 FFSW + grant 完成配对，等 OK。
-func DialSwitch(ctx context.Context, addr, proto string, tlsConf *tls.Config, grant *api.TransferGrant) (Stream, func(), error) {
-	stream, closeConn, err := DialStream(ctx, addr, proto, tlsConf)
+func DialSwitch(ctx context.Context, addr, proto string, tcpPort int, tlsConf *tls.Config, grant *api.TransferGrant) (Stream, func(), error) {
+	stream, closeConn, err := DialStream(ctx, addr, proto, tcpPort, tlsConf)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1278,7 +1298,7 @@ func relayStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, self
 	next := grant.Hops[pos+1]
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ns, closeNext, err := DialStream(ctx, next.Addr, next.Proto, tlsConf)
+	ns, closeNext, err := DialStream(ctx, next.Addr, next.Proto, next.TCPPort, tlsConf)
 	if err != nil {
 		fmt.Printf("中继 %s 拨下一跳 %s(%s) 失败：%v\n", grant.ID, next.NodeID, next.Addr, err)
 		return
@@ -1313,16 +1333,18 @@ func relayStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, self
 // TCP 的 RTT 不劣于 QUIC 的 1.5 倍则选 TCP——UDP 被策略限速的网络
 // 里 TCP 吞吐常有数量级优势（实测 4.5×），RTT 相近时应优选；
 // UDP 被禁则自然回退 TCP。返回往返时延与选定协议。
-func Probe(ctx context.Context, addr string, tlsConf *tls.Config) (time.Duration, string, error) {
-	rtt, proto, _, err := ProbeWithAlt(ctx, addr, tlsConf)
+func Probe(ctx context.Context, addr string, tcpPort int, tlsConf *tls.Config) (time.Duration, string, error) {
+	rtt, proto, _, err := ProbeWithAlt(ctx, addr, tcpPort, tlsConf)
 	return rtt, proto, err
 }
 
 // ProbeWithAlt 返回（胜者协议, 副协议或空, rtt, err）。两者皆通时
 // 副协议非空——混流将各流分散到两条协议通道。
-func ProbeWithAlt(ctx context.Context, addr string, tlsConf *tls.Config) (time.Duration, string, string, error) {
-	qRTT, qErr := probeOne(ctx, addr, "quic", tlsConf)
-	tRTT, tErr := probeOne(ctx, addr, "tcp", tlsConf)
+// ProbeWithAlt 探测一条边。tcpPort 是**对端**上报的 TCP 数据面端口
+// （0 = 用 addr 端口+1），被墙网络里各节点端口可能不同。
+func ProbeWithAlt(ctx context.Context, addr string, tcpPort int, tlsConf *tls.Config) (time.Duration, string, string, error) {
+	qRTT, qErr := probeOne(ctx, addr, "quic", tcpPort, tlsConf)
+	tRTT, tErr := probeOne(ctx, addr, "tcp", tcpPort, tlsConf)
 	switch {
 	case qErr != nil && tErr != nil:
 		return 0, "", "", tErr
@@ -1337,9 +1359,9 @@ func ProbeWithAlt(ctx context.Context, addr string, tlsConf *tls.Config) (time.D
 	}
 }
 
-func probeOne(ctx context.Context, addr, proto string, tlsConf *tls.Config) (time.Duration, error) {
+func probeOne(ctx context.Context, addr, proto string, tcpPort int, tlsConf *tls.Config) (time.Duration, error) {
 	start := time.Now()
-	s, closeConn, err := DialStream(ctx, addr, proto, tlsConf)
+	s, closeConn, err := DialStream(ctx, addr, proto, tcpPort, tlsConf)
 	if err != nil {
 		return 0, err
 	}

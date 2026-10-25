@@ -81,13 +81,24 @@ func (g *Graph) Peers() []api.PeerInfo {
 	var out []api.PeerInfo
 	for id, n := range g.nodes {
 		if g.now().Sub(n.seen) < HeartbeatTimeout {
-			out = append(out, api.PeerInfo{ID: id, Addr: n.hb.Addr})
+			out = append(out, api.PeerInfo{ID: id, Addr: n.hb.Addr, TCPPort: n.hb.TCPPort})
 		}
 	}
 	return out
 }
 
 // Addr 返回在线节点的数据面地址，离线返回空串。
+// TCPPort 返回该节点上报的 TCP 数据面端口（0 = 未上报）。
+func (g *Graph) TCPPort(id api.NodeID) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n, ok := g.nodes[id]
+	if !ok || g.now().Sub(n.seen) >= HeartbeatTimeout {
+		return 0
+	}
+	return n.hb.TCPPort
+}
+
 func (g *Graph) Addr(id api.NodeID) string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

@@ -97,7 +97,8 @@ ff status          # 新节点应在 10 秒内出现并开始探测建边
 ```yaml
 controller: https://<controller地址>:9443
 enroll-token: ff_enroll_一次性令牌
-data-port: 7800            # 数据面 UDP 端口（TCP 回退自动用 7801）
+data-port: 7800            # 数据面 UDP 端口（TCP 回退默认用 7801）
+# tcp-port: 443            # 被墙网络只放行 443 时：把 TCP 数据面固定到 443
 data-dir: /home/me/ff
 node-name: ff-node-a       # 稳定节点名（缺省用主机名），重装后身份不变
 allowed-dirs:              # 落盘白名单：源/目的路径都必须在列表内
@@ -158,6 +159,51 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       ✅ 认证清单 manifest（源端签名 文件哈希+大小，唯一块计数判定
       完成 + 全文件验哈希——防重放、防恶意中继篡改内容）
       ✅ 回声口限速 ✅ 密钥离机 + 备份
+
+## 网络受限 / 被墙时怎么用
+
+数据面有两条腿：**QUIC(UDP)** 与 **TCP**。探测时会同时试两条，谁通用谁，
+所以只要 TCP 能出去就能传。但国内网络里 UDP 常被干扰、非标准端口常被封，
+这时按下面两条改：
+
+```yaml
+# agent.yaml
+data-port: 7800     # UDP 仍绑着，不通就自动跳过
+tcp-port: 443       # TCP 数据面固定到 443（默认是 data-port+1）
+```
+
+- `tcp-port` 由**每个节点自己上报**，通过心跳同步给全网（`PeerInfo.TCPPort`
+  / `Hop.TCPPort`），所以各节点端口可以不同，也可以相同。
+- 端口不写死：`ffctl status` 能看到每台节点的 `tcp_port`。
+- 实测（同机 loopback，UDP 被指向死端口、只剩 TCP）：
+
+| 文件 | 耗时 | 吞吐 |
+|---|---|---|
+| 100 KB | 0.12 s | — |
+| 4 MB | 0.12 s | 34 MB/s |
+| 200 MB | 0.31 s | 647 MB/s |
+
+三条命令就能验证：
+
+```bash
+ffctl status                      # 看边是不是 tcp、各节点 tcp_port
+ffctl send a:/tmp/big b:/tmp/     # 传
+ffctl jobs                        # 查状态
+```
+
+### 不会被 fail2ban / 防火墙当成扫描
+
+早期版本有两处会导致**整个 IP 被封（连带 SSH 一起断）**：
+
+1. 打洞时对同一主机的 13 个连续端口发包（实测 8 秒 13 个端口）——这就是
+   水平端口扫描的特征。现在已知对端公网映射时**只打 1 个端口**，只有地址
+   是猜测时才退化为 3 个候选。
+2. 探测无退避：对端宕机时每 30 秒无差别重试所有 peer，且每次都记日志。
+   现在失败后指数退避（30s → 1m → 2m → 4m → 5m 封顶），日志只在状态
+   变化时打一行。
+
+回归测试里对这两点有断言（`TestRegressSendOpenersExact`、
+`TestRegressProbeBackoff`）。
 
 ## 路径与身份约定
 

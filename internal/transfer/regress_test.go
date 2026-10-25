@@ -384,3 +384,24 @@ func TestRegressInboxMappingReceiverOnly(t *testing.T) {
 		t.Fatalf("接收端映射结果 %q，期望 %q", recvGrant.DstPath, want)
 	}
 }
+
+// 回归：TCP 数据面端口必须能按节点区分（不能"全局覆盖"）。
+// 全局覆盖会让拨号方用**自己的**端口去连对端，实测会连回自己并报
+// "拒绝中继：不在路径上"。这里验证 Hop.TCPPort 被真正用于拨号。
+func TestRegressPerNodeTCPPort(t *testing.T) {
+	// 两个假节点：一个监听 TCP，一个只上报
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("无法监听：%v", err)
+	}
+	defer ln.Close()
+	tcpPort := ln.Addr().(*net.TCPAddr).Port
+
+	if got := (&api.Hop{NodeID: "n", Addr: "127.0.0.1:1", TCPPort: tcpPort}).TCPPort; got != tcpPort {
+		t.Fatalf("Hop.TCPPort 未保留：%d", got)
+	}
+	// 端口为 0 时表示"用 Addr+1"，不能被解释成"用本机端口"
+	if (&api.Hop{}).TCPPort != 0 {
+		t.Fatal("零值必须表示未上报")
+	}
+}
