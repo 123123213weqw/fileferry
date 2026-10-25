@@ -107,11 +107,11 @@ func ParseAndVerify(data []byte, pool *x509.CertPool, now time.Time) (nodeID str
 // 每个来源 IP 限速（默认 5 次/秒）：WHOAMI 验证含证书链解析，
 // 不限速会被 UDP 洪水打成 CPU DoS。
 type EchoServer struct {
-	conn  *net.UDPConn
-	pool  *x509.CertPool
-	cb    func(nodeID, publicAddr string)
-	mu    sync.Mutex
-	seen  map[string][]time.Time
+	conn *net.UDPConn
+	pool *x509.CertPool
+	cb   func(nodeID, publicAddr string)
+	mu   sync.Mutex
+	seen map[string][]time.Time
 }
 
 func NewEchoServer(port int, pool *x509.CertPool, cb func(nodeID, public string)) (*EchoServer, error) {

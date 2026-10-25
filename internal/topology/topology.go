@@ -118,7 +118,7 @@ func (g *Graph) EdgeAlt(from, to api.NodeID) string {
 }
 
 // EdgeDetail 是 from→to 这条出边的细节：拨号协议与实际拨通地址
-//（打洞成功的边是公网映射）。不存在或陈旧时 ok=false。
+// （打洞成功的边是公网映射）。不存在或陈旧时 ok=false。
 func (g *Graph) EdgeDetail(from, to api.NodeID) (proto, addr string, ok bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -238,10 +238,10 @@ type pqItem struct {
 
 type nodePQ []*pqItem
 
-func (q nodePQ) Len() int            { return len(q) }
-func (q nodePQ) Less(i, j int) bool  { return q[i].d < q[j].d }
-func (q nodePQ) Swap(i, j int)       { q[i], q[j] = q[j], q[i] }
-func (q *nodePQ) Push(x any)         { *q = append(*q, x.(*pqItem)) }
+func (q nodePQ) Len() int           { return len(q) }
+func (q nodePQ) Less(i, j int) bool { return q[i].d < q[j].d }
+func (q nodePQ) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+func (q *nodePQ) Push(x any)        { *q = append(*q, x.(*pqItem)) }
 func (q *nodePQ) Pop() any {
 	old := *q
 	n := len(old)

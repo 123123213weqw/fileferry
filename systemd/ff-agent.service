@@ -3,19 +3,29 @@ Description=fileferry agent
 After=network-online.target
 
 [Service]
-# 专用低权限用户运行；按部署机器调整路径与用户
-User=wzu
-ExecStart=/home/wzu/fileferry/bin/ff-agent -config /home/wzu/ff-agent-v100/agent.yaml
+# 专用低权限用户运行；部署时按实际用户/路径调整（或用
+# systemd/install.sh 自动生成）。
+User=ff
+ExecStart=/opt/fileferry/ff-agent -config /etc/ff/agent.yaml
 Restart=always
 RestartSec=3
+# 收紧沙箱：只读系统、私有 tmp、禁止提权。
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
+PrivateDevices=true
 ProtectKernelTunables=true
+ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadWritePaths=/home/wzu/ff-agent-v100
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# 只有数据目录与配置目录可写
+ReadWritePaths=/var/lib/ff
+ReadOnlyPaths=/etc/ff
 
 [Install]
 WantedBy=multi-user.target

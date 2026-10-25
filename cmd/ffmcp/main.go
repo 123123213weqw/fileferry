@@ -3,13 +3,15 @@
 // 等 MCP 客户端把"跨机传文件/看舰队拓扑"当原生工具调用。
 //
 // 配置（环境变量）：
-//   FF_CERT_DIR    管理员证书目录（admin.crt/admin.key/ca.crt）
-//   FF_CONTROLLER  controller 地址（默认 https://127.0.0.1:8443）
+//
+//	FF_CERT_DIR    管理员证书目录（admin.crt/admin.key/ca.crt）
+//	FF_CONTROLLER  controller 地址（默认 https://127.0.0.1:8443）
 //
 // 客户端接入示例（ZCode / Claude Desktop 的 mcpServers 配置）：
-//   {"fileferry": {"command": "/path/to/ffmcp",
-//                  "env": {"FF_CERT_DIR": "/home/me/ff-admin",
-//                          "FF_CONTROLLER": "https://1.2.3.4:9443"}}}
+//
+//	{"fileferry": {"command": "/path/to/ffmcp",
+//	               "env": {"FF_CERT_DIR": "/home/me/ff-admin",
+//	                       "FF_CONTROLLER": "https://1.2.3.4:9443"}}}
 //
 // 工具：ff_send / ff_status / ff_jobs / ff_token
 package main

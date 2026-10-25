@@ -3,15 +3,27 @@ Description=fileferry controller
 After=network-online.target
 
 [Service]
-User=xs
-ExecStart=/home/xs/ffctl/ff-controller -config /home/xs/ffctl/ctl.yaml
+# 专用低权限用户运行；部署时按实际用户/路径调整。
+User=ff
+ExecStart=/opt/fileferry/ff-controller -config /etc/ff/ctl.yaml
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/home/xs/ffctl
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# data-dir 里放 CA 根私钥与签名私钥，只有 controller 可写
+ReadWritePaths=/var/lib/ffctl
+ReadOnlyPaths=/etc/ff
 
 [Install]
 WantedBy=multi-user.target

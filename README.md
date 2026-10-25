@@ -99,6 +99,7 @@ controller: https://<controller地址>:9443
 enroll-token: ff_enroll_一次性令牌
 data-port: 7800            # 数据面 UDP 端口（TCP 回退自动用 7801）
 data-dir: /home/me/ff
+node-name: ff-node-a       # 稳定节点名（缺省用主机名），重装后身份不变
 allowed-dirs:              # 落盘白名单：源/目的路径都必须在列表内
   - /home/me/ff
 advertise: 1.2.3.4:7800    # 仅公网机/与 controller 同机时需要
@@ -132,11 +133,11 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       交换台按 grant 行别配对两条现成连接后双向管道——NAT 不构成
       障碍。真实环境验证：V100 ↔ node5 跨两个校园 NAT 传输 50MB，
       sha256 一致，52s 完成
-- [ ] M1 信任与观测（大部分完成）：✅ CA/enrollment/心跳 ✅ status 展示
+- [x] M1 信任与观测：✅ CA/enrollment/心跳 ✅ status 展示
       ✅ 探测回填可达边 ✅ 证书自动续期（/v1/renew + 自我重启）
       ✅ SQLite 审计与任务持久化（重启恢复队列）✅ API 限速
-      ✅ 落盘路径白名单 ⬜ /proc 指标采集
-- [ ] M2 直连传输（基础可用）：✅ grant 签发与两端验签 ✅ 分块传输
+      ✅ 落盘路径白名单 ✅ /proc 指标采集（CPU/内存/磁盘，Linux）
+- [x] M2 直连传输：✅ grant 签发与两端验签 ✅ 分块传输
       + 逐块校验 + 原子落盘 ✅ 完成回报 ⬜ 限速 ⬜ 断点续传接线
 - [ ] M3 复杂网络（核心已落地）：✅ TCP 回退（探测 QUIC 失败自动
       降级，端口约定 +1） ✅ 中继链数据面（grant 逐跳路径 + 验签 +
@@ -147,7 +148,9 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       监听/拨号/WHOAMI 同源）✅ 对发开洞 + 前缀探测自动建边
       真实环境验证：跨两个校园 NAT 的对等打洞被对称型 NAT 拒绝
       （双方同时行动、地址正确、失败被正确识别并回落中继）
-- [ ] M4 精准负载：⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
+- [ ] M4 精准负载：✅ /proc 指标采集（CPU/内存/磁盘已进心跳，边权与中继排除
+真正生效）⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
+- [x] M11 临时取件码：ff share / ff get（含加密路径，端到端实测通过）
 - [ ] M5 收尾：✅ systemd 沙箱单元（systemd/）✅ 安全自检脚本
       （scripts/security-check.sh）✅ make audit（govulncheck）
       ⬜ ffctl 管理令牌 ⬜ 部署打包 ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
@@ -155,6 +158,17 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       ✅ 认证清单 manifest（源端签名 文件哈希+大小，唯一块计数判定
       完成 + 全文件验哈希——防重放、防恶意中继篡改内容）
       ✅ 回声口限速 ✅ 密钥离机 + 备份
+
+## 路径与身份约定
+
+- **目标写成目录**：`node-2:/data/` 或已存在的目录，接收端自动补源文件名；
+  显式写文件名则原样使用。
+- **落盘白名单** `allowed-dirs`：按路径分量比较并解析符号链接，`/data`
+  不会放行 `/data-evil`；`inbox:` 取件标记只允许单层文件名，拒绝 `..`。
+- **节点身份**：`node-name`（缺省主机名）首次入网占用后固定，重装不漂移；
+  重名或非法字符才会退回自增的 `node-N`。
+- **撤销**：`ffctl revoke` 后名单随心跳下发，数据面立即拒收/拒发该节点，
+  不只是控制面拦截。
 
 ## 协议
 

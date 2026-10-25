@@ -1,12 +1,12 @@
 package transfer
 
 import (
-	"fmt"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"

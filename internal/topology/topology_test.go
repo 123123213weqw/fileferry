@@ -62,7 +62,7 @@ func TestStaleNodeExcluded(t *testing.T) {
 	g.now = func() time.Time { return cur }
 	g.Apply(hb("a", 10, api.EdgeReport{To: "b", RTTms: 5}))
 	g.Apply(hb("b", 10))
-	cur = cur.Add(2 * time.Minute) // 两人都超时
+	cur = cur.Add(2 * time.Minute)                          // 两人都超时
 	g.Apply(hb("a", 10, api.EdgeReport{To: "b", RTTms: 5})) // 只有 a 续了心跳
 	if p := g.Path("a", "b"); p != nil {
 		t.Fatalf("离线节点应从图中消失，得到 %v", p)
