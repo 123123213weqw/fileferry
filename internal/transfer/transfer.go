@@ -862,6 +862,11 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 	}
 	recvMu.Lock()
 	defer recvMu.Unlock()
+	for k, t := range completed { // 陈年条目卫生清扫
+		if time.Since(t) > 2*time.Hour {
+			delete(completed, k)
+		}
+	}
 	if t, ok := completed[grant.ID]; ok && time.Since(t) < 2*time.Hour {
 		// 文件已完整落盘：不是攻击，是发送端重试流晚到。回 ACK 让
 		// 对端成功收尾（"文件到达但任务报失败"的收尾问题）。
