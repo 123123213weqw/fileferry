@@ -57,12 +57,13 @@ type controller struct {
 	wakeMu       sync.Mutex
 	wake         map[api.NodeID]chan struct{} // 长轮询：有待办任务时唤醒挂住的心跳
 
-	replicas   map[string]map[api.NodeID]string // sha256 -> nodeID -> path（M8 多源副本索引）
-	pathBW     map[[2]api.NodeID]float64        // 实测路径吞吐 MB/s（jobdone 回填）
-	indexCache map[api.NodeID][]api.IndexEntry  // 各节点最近索引（查源文件哈希/大小）
-	revoked    map[api.NodeID]bool              // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
-	keypass    map[string]keyEntry              // grantID -> 密钥材料（端到端加密专递，一次性）
-	shares     map[string]*shareEntry           // 取件码 hash -> 分享（M11 临时取件）
+	replicas   map[string]map[api.NodeID]string     // sha256 -> nodeID -> path（M8 多源副本索引）
+	pathBW     map[[2]api.NodeID]float64            // 实测路径吞吐 MB/s（jobdone 回填）
+	protoBW    map[[2]api.NodeID]map[string]float64 // 每条边每种协议的实测吞吐
+	indexCache map[api.NodeID][]api.IndexEntry      // 各节点最近索引（查源文件哈希/大小）
+	revoked    map[api.NodeID]bool                  // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
+	keypass    map[string]keyEntry                  // grantID -> 密钥材料（端到端加密专递，一次性）
+	shares     map[string]*shareEntry               // 取件码 hash -> 分享（M11 临时取件）
 }
 
 // keyEntry 是待到取密钥材料及其落库时间（用于过期清扫：源端上报了
@@ -140,6 +141,7 @@ func main() {
 		wake:         map[api.NodeID]chan struct{}{},
 		replicas:     map[string]map[api.NodeID]string{},
 		pathBW:       map[[2]api.NodeID]float64{},
+		protoBW:      map[[2]api.NodeID]map[string]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		revoked:      map[api.NodeID]bool{},
 		keypass:      map[string]keyEntry{},
@@ -439,15 +441,30 @@ const (
 
 // handlePullCert：给 ffctl 签发一张**可作 TLS 服务器**的短时效传输证书。
 // 仅 admin。管理员证书只带 ClientAuth，无法在 pull 场景里充当服务端。
+// pushProto 给出优先拨号协议：先看该边有没有"实测更快"的协议记录，
+// 再看探测结果，都没有则默认 quic。
+//
+// 之前只用探测结果，而探测只测握手 RTT，看不出 QUIC 在高丢包下的稳态
+// 吞吐塌陷（实测 2% 丢包慢 60 倍），于是每次都挑慢的那条。
 func pushProto(c *controller, id api.NodeID) string {
+	hint := ""
 	for _, hb := range c.graph.Snapshot() {
 		for _, e := range hb.Edges {
 			if e.To == id && e.Proto != "" {
-				return e.Proto
+				hint = e.Proto
+				break
 			}
 		}
+		if hint != "" {
+			break
+		}
 	}
-	return "quic"
+	if hint == "" {
+		hint = "quic"
+	}
+	// 按"对端 → 本机"这条边学到的实测结果修正；caller 是本机管理员，
+	// 不算节点，所以 from 用空串（等价"没有源端记录"）。
+	return c.bestProto("", id, hint)
 }
 
 // handlePush：本机(管理员) → 远端节点 直推。仅 admin。

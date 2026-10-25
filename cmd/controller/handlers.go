@@ -139,6 +139,45 @@ func (c *controller) handlePull(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(g)
 }
 
+// recordProtoBW 用一次实测更新"边 + 协议"的吞吐（EMA 平滑）。
+func (c *controller) recordProtoBW(from, to api.NodeID, proto string, mbps float64) {
+	if proto == "" || mbps <= 0 {
+		return
+	}
+	key := [2]api.NodeID{from, to}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.protoBW == nil { // 防御：写 nil map 会 panic
+		c.protoBW = map[[2]api.NodeID]map[string]float64{}
+	}
+	m, ok := c.protoBW[key]
+	if !ok {
+		m = map[string]float64{}
+		c.protoBW[key] = m
+	}
+	if prev, exists := m[proto]; exists && prev > 0 {
+		mbps = prev*0.6 + mbps*0.4
+	}
+	m[proto] = mbps
+}
+
+// bestProto 返回该边**实测最好**的协议（没数据时返回 fallback）。
+//
+// 这是"从经验里学"：第一条传输仍按探测结果走；一旦某条边被证明某种
+// 协议快得多（典型：丢包链路上 tcp 比 quic 快 60 倍），后续就走它。
+func (c *controller) bestProto(from, to api.NodeID, fallback string) string {
+	c.mu.Lock()
+	m := c.protoBW[[2]api.NodeID{from, to}]
+	best, bestV := fallback, 0.0
+	for p, v := range m {
+		if v > bestV {
+			best, bestV = p, v
+		}
+	}
+	c.mu.Unlock()
+	return best
+}
+
 // pushProto 给出优先拨号协议：有探测边就用探测结果，否则默认 quic。
 func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, ca.RoleAdmin) {
@@ -188,6 +227,11 @@ func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 		streams = 8
 	}
 
+	// 注意：pushProto 内部会取 c.mu，必须在**进入锁区之前**求值。
+	// 否则同一 goroutine 二次加锁 → 自死锁（实测表现：controller 卡死，
+	// 所有心跳超时，整个集群失联）。
+	proto := pushProto(c, req.Dst)
+
 	c.mu.Lock()
 	c.nextID++
 	g := api.TransferGrant{
@@ -203,7 +247,7 @@ func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 				// Proto 只给"优先尝试"的提示（不进签名，见 api.payloadV2），
 				// 客户端失败时会自动换另一种协议。之前这里硬编码 "tcp"，
 				// 等于本机直推永远用不上 QUIC。
-				Proto:   pushProto(c, req.Dst),
+				Proto:   proto,
 				TCPPort: c.graph.TCPPort(req.Dst),
 			},
 		},
@@ -908,6 +952,8 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 				}
 				c.pathBW[key] = mbps
 				c.mu.Unlock()
+				// 按协议分开记：QUIC 与 TCP 在同一条边上可能差 60 倍
+				c.recordProtoBW(req.NodeID, dst, req.Proto, mbps)
 				// 同步给选链算法：在此之前 Path() 只看 rtt，实测吞吐完全
 				// 没参与路由（只用于交换台/多源评分），"rtt 短但很慢"的
 				// 边仍然会被优先选中。

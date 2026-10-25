@@ -229,6 +229,14 @@ ffctl -proto quic ...                            # 强制 QUIC
 ffctl put ...                                    # 默认 auto：按提示依次尝试
 ```
 
+**已做的缓解：controller 会按「边 + 协议」记录实测吞吐**（`DoneRequest.Proto`
+→ `protoBW`，EMA 平滑），下次给同一条边签发授权时优先用实测更快的协议。
+也就是说：**第一条传输仍可能踩坑，但不会反复踩**。
+
+**做不到的部分（上游限制）**：quic-go v0.64.1 只内置 Cubic，且硬编码在
+`internal/ackhandler` 里，`quic.Config` 没有暴露拥塞控制算法——换成 BBR
+必须 fork 上游。所以"QUIC 在丢包下不塌陷"这件事在本仓库内无法根治。
+
 > **测量边界（必须说明）**：上表 rsync 那一列走的是"延迟 0、丢包 0"的
 > TCP 代理路径——我的 TCP 丢包代理在 5% 丢包时会把 rsync 的高延迟传输拖到
 > 超时，拿不到可比数据。所以「TCP 在同丢包下不塌陷」这一点是**推断**

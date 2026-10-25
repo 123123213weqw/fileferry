@@ -151,6 +151,11 @@ type DoneRequest struct {
 	Err      string  `json:"err,omitempty"`
 	Bytes    int64   `json:"bytes,omitempty"`
 	Duration float64 `json:"duration_s,omitempty"`
+	// Proto 是这条数据实际走的协议（"quic"/"tcp"）。controller 据此
+	// 记录"每条边每种协议的实测吞吐"，用于后续选路——QUIC 在高丢包
+	// 链路上会被基于丢包的拥塞控制压塌（实测 2% 丢包时慢 60 倍），
+	// 只有按协议分开记才能学出"这条边该用 tcp"。
+	Proto string `json:"proto,omitempty"`
 }
 
 // PullEndpoint 是 ffctl 作为**数据面接收端**所需的凭据。

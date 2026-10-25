@@ -81,6 +81,7 @@ func newTestController(t *testing.T) *controller {
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
 		replicas:     map[string]map[api.NodeID]string{},
 		pathBW:       map[[2]api.NodeID]float64{},
+		protoBW:      map[[2]api.NodeID]map[string]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		revoked:      map[api.NodeID]bool{},
 		keypass:      map[string]keyEntry{},
@@ -403,5 +404,92 @@ func TestRegressPullGrant(t *testing.T) {
 	}
 	if g2.FileSHA256 != "deadbeef" || g2.FileSize != 123 {
 		t.Fatalf("PinHash 时应带上索引摘要，实际 %q/%d", g2.FileSHA256, g2.FileSize)
+	}
+}
+
+// 回归：pushProto 内部会取 c.mu，若在锁区里调用就会自死锁
+// （实测表现：controller 卡死、所有心跳超时、整个集群失联）。
+func TestRegressPushNoDeadlock(t *testing.T) {
+	c := newTestController(t)
+	c.graph.Apply(api.Heartbeat{
+		NodeID: "n1", Hostname: "h", Addr: "10.0.0.9:17800", TCPPort: 18400, TS: time.Now(),
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			r := httptest.NewRequest("POST", "/v1/push", bytes.NewReader(mustJSONBody(t, api.PushRequest{
+				Dst: "n1", DstPath: "/tmp/x.bin", LocalPath: "x.bin",
+				SHA256: "aa", Size: 1,
+			})))
+			r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{
+				{Subject: pkix.Name{CommonName: "admin", OrganizationalUnit: []string{"admin"}}},
+			}}
+			c.handlePush(&recWriter{}, r)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handlePush 卡住（回归：pushProto 在锁区内调用导致自死锁）")
+	}
+}
+
+func mustJSONBody(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// 回归：controller 必须能从实测中学会"这条边该用哪个协议"。
+//
+// 背景：QUIC 在高丢包链路上会被基于丢包的拥塞控制压塌（实测 2% 丢包时
+// 10MB 从 0.5s 变 25~30s，TCP 只要 0.04s）。探测只测握手 RTT，看不出
+// 稳态吞吐差异，所以必须按协议分开记实测吞吐并据此选路。
+func TestRegressProtoLearning(t *testing.T) {
+	c := newTestController(t)
+	c.graph.Apply(api.Heartbeat{
+		NodeID: "peer", Hostname: "h", Addr: "10.0.0.9:17800", TCPPort: 18400, TS: time.Now(),
+	})
+
+	// 没有实测数据时：按探测结果（这里没边，落到默认 quic）
+	if got := c.bestProto("", "peer", "quic"); got != "quic" {
+		t.Fatalf("无数据时应回落默认：%s", got)
+	}
+
+	// 记录：quic 在这条边上只有 0.33 MB/s，tcp 有 250 MB/s
+	c.recordProtoBW("peer", "peer", "quic", 0.33)
+	c.recordProtoBW("peer", "peer", "tcp", 250)
+
+	// 现在要求选路给出 tcp
+	if got := c.bestProto("peer", "peer", "quic"); got != "tcp" {
+		t.Fatalf("学到 tcp 更快后应选 tcp，实际 %s（回归：未按协议学习）", got)
+	}
+
+	// 反向：如果 quic 后来变快（网络恢复），应能切回 quic
+	c.recordProtoBW("peer", "peer", "quic", 400)
+	c.recordProtoBW("peer", "peer", "quic", 400)
+	c.recordProtoBW("peer", "peer", "quic", 400)
+	if got := c.bestProto("peer", "peer", "tcp"); got != "quic" {
+		t.Fatalf("quic 变快后应切回 quic，实际 %s", got)
+	}
+
+	// EMA 平滑：单次跳变不应完全覆盖历史（避免选路抖动）
+	c2 := newTestController(t)
+	c2.recordProtoBW("a", "b", "quic", 1000)
+	c2.recordProtoBW("a", "b", "quic", 1)
+	got := c2.protoBW[[2]api.NodeID{"a", "b"}]["quic"]
+	if got < 300 {
+		t.Fatalf("EMA 应保留历史趋势，一次骤降后不该直接到 1，实际 %.1f", got)
+	}
+
+	// proto 为空或吞吐非正数时不应污染记录
+	c2.recordProtoBW("a", "b", "", 100)
+	c2.recordProtoBW("a", "b", "tcp", 0)
+	if _, ok := c2.protoBW[[2]api.NodeID{"a", "b"}]["tcp"]; ok {
+		t.Fatal("非正吞吐不应被记录")
 	}
 }

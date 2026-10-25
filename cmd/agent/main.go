@@ -966,11 +966,13 @@ func runJob(g api.TransferGrant) {
 
 	startTime := time.Now()
 	sentBytes := int64(0)
+	usedProto := "" // 本次实际使用的数据面协议，随 jobdone 上报
 	done := func(ok bool, errStr string) {
 		d := time.Since(startTime).Seconds()
 		reportDone(api.DoneRequest{
 			GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr,
 			Bytes: sentBytes, Duration: d,
+			Proto: usedProto, // 实际走的协议（OpenerDirect 只会失败时回退）
 		})
 	}
 
@@ -1046,6 +1048,7 @@ func runJob(g api.TransferGrant) {
 		open = transfer.OpenerSwitch(ctx, g.Hops[1], tlsConf, &g)
 	} else {
 		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto, TCPPort: hopTCP}
+		usedProto = hopProto
 		open = transfer.OpenerDirect(ctx, hop, tlsConf)
 	}
 	sentBytes, err := transfer.SendFileRange(ctx, sendPath, open, tlsConf, &g, startCh, endCh)
