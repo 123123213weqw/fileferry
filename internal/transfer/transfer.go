@@ -75,15 +75,29 @@ func SetTransport(t *quic.Transport) { sharedTransport = t }
 // SendOpeners 从指定 UDP socket 向 target 周期发送开洞包。
 // 包内容无意义（对端 QUIC 视为垃圾丢弃），意义仅在"本 socket 向
 // target 发过包"这条 NAT 放行记录。dur 结束后停止。
+// 同时向映射端口 ±32 扇形喷洒（对称 NAT 的端口预测：对端出口
+// 映射端口通常在已观测映射附近递增），提高对穿成功率。
 func SendOpeners(udp net.PacketConn, target string, dur time.Duration) {
 	addr, err := net.ResolveUDPAddr("udp", target)
 	if err != nil {
 		return
 	}
+	spray := []*net.UDPAddr{addr}
+	if port := addr.Port; port > 33 && port < 65500 {
+		for _, d := range []int{-32, -16, -8, -4, -2, -1, 1, 2, 4, 8, 16, 32} {
+			if p := port + d; p > 0 && p < 65536 {
+				a2 := *addr
+				a2.Port = p
+				spray = append(spray, &a2)
+			}
+		}
+	}
 	deadline := time.Now().Add(dur)
 	for time.Now().Before(deadline) {
-		udp.WriteTo([]byte("FFOPEN\n"), addr)
-		time.Sleep(200 * time.Millisecond)
+		for _, a := range spray {
+			udp.WriteTo([]byte("FFOPEN\n"), a)
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
