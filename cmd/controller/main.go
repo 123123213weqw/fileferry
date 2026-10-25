@@ -8,6 +8,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -49,30 +50,37 @@ type controller struct {
 	graph   *topology.Graph
 	db      *sql.DB
 
-	mu           sync.Mutex
-	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
-	nextID       int64 // 初始化为 Unix 秒，重启后天然错开、永不重复
+	mu      sync.Mutex
+	pending map[api.NodeID][]api.TransferGrant // 源节点待执行任务
+	nextID  int64                              // 初始化为 Unix 秒，重启后天然错开、永不重复
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
 	punchTried   map[[2]api.NodeID]time.Time
 	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
-	ledger       *enrollLedger                        // 持久化核销台账
+	ledger       *enrollLedger                       // 持久化核销台账
 	limiter      *rateLimiter
 
-	replicas   map[string]map[api.NodeID]string   // sha256 -> nodeID -> path（M8 多源副本索引）
-	pathBW     map[[2]api.NodeID]float64          // 实测路径吞吐 MB/s（jobdone 回填）
-	indexCache map[api.NodeID][]api.IndexEntry    // 各节点最近索引（查源文件哈希/大小）
-	revoked    map[api.NodeID]bool                // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
-	keypass    map[string]string                  // grantID -> 密钥材料（端到端加密专递，一次性）
-	shares     map[string]*shareEntry             // 取件码 hash -> 分享（M11 临时取件）
+	replicas   map[string]map[api.NodeID]string // sha256 -> nodeID -> path（M8 多源副本索引）
+	pathBW     map[[2]api.NodeID]float64        // 实测路径吞吐 MB/s（jobdone 回填）
+	indexCache map[api.NodeID][]api.IndexEntry  // 各节点最近索引（查源文件哈希/大小）
+	revoked    map[api.NodeID]bool              // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
+	keypass    map[string]keyEntry              // grantID -> 密钥材料（端到端加密专递，一次性）
+	shares     map[string]*shareEntry           // 取件码 hash -> 分享（M11 临时取件）
+}
+
+// keyEntry 是待到取密钥材料及其落库时间（用于过期清扫：源端上报了
+// 但目的端始终没来取的任务，之前会永久驻留 map）。
+type keyEntry struct {
+	key string
+	at  time.Time
 }
 
 // shareEntry 临时取件：短时效 + 次数限制的定向取文件授权。
 type shareEntry struct {
-	Src   api.NodeID
-	Path  string
-	Exp   time.Time
-	Uses  int
+	Src  api.NodeID
+	Path string
+	Exp  time.Time
+	Uses int
 }
 
 type pubEntry struct {
@@ -136,7 +144,7 @@ func main() {
 		pathBW:       map[[2]api.NodeID]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		revoked:      map[api.NodeID]bool{},
-		keypass:      map[string]string{},
+		keypass:      map[string]keyEntry{},
 		shares:       map[string]*shareEntry{},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
@@ -306,10 +314,19 @@ func main() {
 		defer selfMu.Unlock()
 		return &selfCert, nil
 	}
+	// 请求体上限：最大的合法请求是节点索引上报（每文件一条），
+	// 16 MiB 足够；超过直接 413，避免未认证连接把内存吃穿。
 	srv := &http.Server{
 		Addr:      cfg.Listen,
-		Handler:   mux,
+		Handler:   http.MaxBytesHandler(mux, 16<<20),
 		TLSConfig: tlsCfg,
+		// 控制面不能被慢连接拖死：之前没设任何超时，未认证的慢速
+		// 请求头 + 大 JSON 就能占满连接与内存。
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 	log.Printf("controller 监听 %s（数据目录 %s，自身证书自动续期已启用）", cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
@@ -375,6 +392,77 @@ func retryDepth(id string) int {
 		n++
 	}
 	return n
+}
+
+// grantParticipants 返回该 grant 的全部合法参与方（源、目的、各分片源）。
+// 任务表里查不到时返回 nil——表示"无从校验"，由调用方决定放行（兼容
+// 重启恢复期间的窗口）还是拒绝。
+func (c *controller) grantParticipants(id string) map[api.NodeID]bool {
+	var gj string
+	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, id).Scan(&gj); err != nil {
+		return nil
+	}
+	var g api.TransferGrant
+	if json.Unmarshal([]byte(gj), &g) != nil {
+		return nil
+	}
+	m := map[api.NodeID]bool{g.Src: true, g.Dst: true}
+	for _, sp := range g.Sources {
+		m[sp.NodeID] = true
+	}
+	for _, h := range g.Hops { // 中继也要能回报（失败时用于换链）
+		m[h.NodeID] = true
+	}
+	return m
+}
+
+// sanitizeNodeName 规范化 agent 请求的节点名：只保留 [A-Za-z0-9._-]，
+// 长度 1..63，且必须以字母或数字开头（避免 "." ".." 之类）。
+// 不合法返回空串，调用方退回自动编号。
+func sanitizeNodeName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 63 {
+		return ""
+	}
+	out := make([]rune, 0, len(raw))
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			out = append(out, r)
+		default:
+			out = append(out, '-') // 主机名里的其它字符统一换成连字符
+		}
+	}
+	s := strings.Trim(string(out), ".-")
+	if s == "" {
+		return ""
+	}
+	if len(s) > 63 {
+		s = s[:63]
+	}
+	return s
+}
+
+// normalizeDstPath 把"目标写成目录"补成具体文件名。
+// README 与历史用法都是 `ffctl send node-1:/data/big.iso node-2:/data/`，
+// 而接收端直接 os.Rename(tmp, DstPath)，目录目标必然报
+// "rename ...: file exists"（实测 16 MiB 全传完后失败并重试 3 轮）。
+// controller 看不到对端文件系统，只能按末尾分隔符判断；
+// 接收端另有"已存在且是目录"的兜底。
+func normalizeDstPath(dst, srcPath string) string {
+	if dst == "" {
+		return dst
+	}
+	if strings.HasSuffix(dst, "/") || strings.HasSuffix(dst, "\\") ||
+		strings.HasSuffix(dst, string(filepath.Separator)) {
+		base := filepath.Base(srcPath)
+		if base == "" || base == "." || base == string(filepath.Separator) {
+			return dst
+		}
+		return filepath.Join(dst, base)
+	}
+	return dst
 }
 
 // lookupGrantSrc 从任务表反查源端（密钥上报校验用）。
@@ -462,14 +550,32 @@ func (c *controller) jobUpdate(id, status string) {
 
 // rateLimiter 每身份滑动窗口限速（防合法证书节点刷爆 controller）。
 type rateLimiter struct {
-	mu   sync.Mutex
-	seen map[string][]time.Time
+	mu    sync.Mutex
+	seen  map[string][]time.Time
+	calls uint64
 }
 
 func (l *rateLimiter) allow(key string, perSec int) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// 每 1k 次调用做一次全局清扫：之前空列表的 key 永不回收，
+	// 公网扫端口每个 SourceIP:port 留一条，map 无界增长。
+	if l.calls++; l.calls%1024 == 0 {
+		for k, v := range l.seen {
+			if len(v) == 0 || now.Sub(v[len(v)-1]) > 2*time.Second {
+				delete(l.seen, k)
+			}
+		}
+	}
+	if len(l.seen) > 100000 { // 兜底上限，防清扫跟不上时的内存膨胀
+		for k := range l.seen {
+			delete(l.seen, k)
+			if len(l.seen) <= 50000 {
+				break
+			}
+		}
+	}
 	list := l.seen[key]
 	kept := list[:0]
 	for _, t := range list {
@@ -483,6 +589,17 @@ func (l *rateLimiter) allow(key string, perSec int) bool {
 	}
 	l.seen[key] = append(kept, now)
 	return true
+}
+
+// clientIP 取限速用的客户端标识。enroll 之前没有证书，只能用 IP——
+// 之前用 r.RemoteAddr（含临时端口），换条连接就换一个桶，限速形同
+// 虚设（实测坏 token 连发：401 401 429 429 429 429 401 401 429 429）。
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // handleRenew：节点证书临期续期。身份由现有 mTLS 证书证明，
@@ -558,7 +675,13 @@ func (c *controller) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	code := "ff_get_" + tok[len("ff_enroll_"):]
 	c.mu.Lock()
-	c.shares[api.TokenHash(code)] = &shareEntry{Src: req.Src, Path: req.Path, Exp: time.Now().Add(time.Duration(req.TTLMin) * time.Minute), Uses: 3}
+	now := time.Now()
+	for k, v := range c.shares { // 过期清扫：没人访问的码之前会永久驻留
+		if now.After(v.Exp) {
+			delete(c.shares, k)
+		}
+	}
+	c.shares[api.TokenHash(code)] = &shareEntry{Src: req.Src, Path: req.Path, Exp: now.Add(time.Duration(req.TTLMin) * time.Minute), Uses: 3}
 	c.mu.Unlock()
 	c.event("share", string(req.Src), req.Path)
 	json.NewEncoder(w).Encode(map[string]any{"code": code, "expires_in_min": req.TTLMin, "max_uses": 3})
@@ -591,24 +714,25 @@ func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or expired code", http.StatusUnauthorized)
 		return
 	}
-	se.Uses--
-	if se.Uses <= 0 {
-		defer delete(c.shares, api.TokenHash(req.Code))
-	}
 	c.mu.Unlock()
+	// 身份校验必须在扣次数之前：之前 se.Uses-- 在自取检查之前，
+	// 源端误用自己的码会白烧一次（一共只有 3 次）。
 	if dst == se.Src {
 		http.Error(w, "source cannot fetch itself", http.StatusBadRequest)
 		return
 	}
-	// 组 grant：源=存件节点，目的=取件节点
-	if _, _, ok := c.graph.EdgeDetail(dst, se.Src); !ok {
-		_, _, ok2 := c.graph.EdgeDetail(se.Src, dst)
-		if !ok2 {
-			http.Error(w, "no path to source", http.StatusUnprocessableEntity)
-			return
-		}
+	c.mu.Lock()
+	se.Uses--
+	if se.Uses <= 0 {
+		delete(c.shares, api.TokenHash(req.Code))
 	}
-	path := c.graph.Path(dst, se.Src)
+	c.mu.Unlock()
+	// 组 grant：源=存件节点，目的=取件节点。
+	// 路径方向必须与数据流一致（se.Src → dst）。之前写成
+	// Path(dst, se.Src)，把 hop 顺序整个倒置：源端按 Hops[1] 拨号时
+	// 拨的是**自己**的地址，连回自己后被中继逻辑判成"不在路径上"，
+	// 于是 ff get 永远失败（一直被误认为密钥问题）。
+	path := c.graph.Path(se.Src, dst)
 	if path == nil || len(path) < 2 {
 		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
 		return
@@ -685,7 +809,13 @@ func (c *controller) handleKeypassPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.mu.Lock()
-	c.keypass[req.GrantID] = req.KeyB64
+	now := time.Now()
+	for k, v := range c.keypass { // 过期清扫：陈旧密钥材料不驻留
+		if now.Sub(v.at) > 2*time.Hour {
+			delete(c.keypass, k)
+		}
+	}
+	c.keypass[req.GrantID] = keyEntry{key: req.KeyB64, at: now}
 	c.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
@@ -703,9 +833,10 @@ func (c *controller) handleKeypassGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.mu.Lock()
-	k, ok := c.keypass[id]
+	e, ok := c.keypass[id]
 	delete(c.keypass, id) // 一次性
 	c.mu.Unlock()
+	k := e.key
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -894,6 +1025,30 @@ func signPubPEM(pub ed25519.PublicKey) string {
 type enrollLedger struct {
 	Burned   map[string]string `json:"burned"`    // tokenHash -> nodeID
 	NextNode int               `json:"next_node"` // 下一节点编号
+	Used     map[string]bool   `json:"used"`      // 已占用的 nodeID（防撞号）
+}
+
+// claim 占用一个 nodeID：返回 false 表示已被别人占用。
+func (l *enrollLedger) claim(id string) bool {
+	if l.Used == nil {
+		l.Used = map[string]bool{}
+	}
+	if l.Used[id] {
+		return false
+	}
+	l.Used[id] = true
+	return true
+}
+
+// nextAutoNodeID 取下一个未被占用的 node-N。
+func (l *enrollLedger) nextAutoNodeID() string {
+	for {
+		id := fmt.Sprintf("node-%d", l.NextNode)
+		l.NextNode++
+		if l.Used == nil || !l.Used[id] {
+			return id
+		}
+	}
 }
 
 func loadEnrollLedger(dir string) *enrollLedger {
@@ -903,6 +1058,13 @@ func loadEnrollLedger(dir string) *enrollLedger {
 	}
 	if l.Burned == nil {
 		l.Burned = map[string]string{}
+	}
+	if l.Used == nil {
+		l.Used = map[string]bool{}
+	}
+	// 从核销台账回填已占用 ID（老版本 ledger 没有 used 字段）
+	for _, id := range l.Burned {
+		l.Used[id] = true
 	}
 	if l.NextNode < 1 {
 		l.NextNode = 1
@@ -922,7 +1084,7 @@ func (l *enrollLedger) save(dir string) {
 // 核销即废且**跨重启持久**；节点编号单调递增，绝不复用。
 // 无证书也可访问（ServerTLS 用 VerifyClientCertIfGiven 放行）。
 func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	if !c.limiter.allow("enroll:"+r.RemoteAddr, 2) {
+	if !c.limiter.allow("enroll:"+clientIP(r), 2) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -933,8 +1095,11 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Lock()
 	valid := false
+	// 常量时间比较：逐个比对时用 subtle，避免按字节提前返回泄漏前缀
+	// 信息（时间侧信道）。
 	for _, t := range c.cfg.EnrollTokens {
-		if _, burned := c.ledger.Burned[api.TokenHash(t)]; t == req.Token && !burned {
+		if _, burned := c.ledger.Burned[api.TokenHash(t)]; !burned &&
+			subtle.ConstantTimeCompare([]byte(t), []byte(req.Token)) == 1 {
 			valid = true
 			break
 		}
@@ -944,8 +1109,20 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or used token", http.StatusUnauthorized)
 		return
 	}
-	nodeID := fmt.Sprintf("node-%d", c.ledger.NextNode)
-	c.ledger.NextNode++
+	// 编号策略：优先使用 agent 请求的稳定名字（默认取主机名），
+	// 拿不到或不合法才退回自增编号。之前只按入网顺序编号，两台机器
+	// 并行启动谁先谁后不确定——实测后启动的 agent 拿到了 node-1，
+	// 任何写死 node-1/node-2 的脚本、README 示例在重装后全部错位。
+	nodeID := ""
+	if name := sanitizeNodeName(req.NodeName); name != "" {
+		if c.ledger.claim(name) {
+			nodeID = name
+		}
+	}
+	if nodeID == "" {
+		nodeID = c.ledger.nextAutoNodeID()
+		c.ledger.claim(nodeID)
+	}
 	c.ledger.Burned[api.TokenHash(req.Token)] = nodeID
 	c.ledger.save(c.cfg.DataDir)
 	c.mu.Unlock()
@@ -1024,11 +1201,43 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(c.pendingPunch, hb.NodeID)
 	c.mu.Unlock()
-	json.NewEncoder(w).Encode(api.HeartbeatResponse{
+	// 先序列化、再写：响应写失败（客户端断线 / NAT 超时 / 中间设备 RST）
+	// 时必须把任务放回队列，否则它已经从 pending 摘除、又没送到，
+	// 只能等到 controller 重启由 rehydrate 捞回——任务凭空消失。
+	c.mu.Lock()
+	var revokedIDs []api.NodeID
+	for id, v := range c.revoked {
+		if v {
+			revokedIDs = append(revokedIDs, id)
+		}
+	}
+	c.mu.Unlock()
+	buf, merr := json.Marshal(api.HeartbeatResponse{
 		Jobs:    jobs,
 		Peers:   c.graph.Peers(),
 		Punches: directives,
+		Revoked: revokedIDs,
 	})
+	if merr != nil {
+		c.requeueJobs(hb.NodeID, jobs)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	if _, werr := w.Write(buf); werr != nil {
+		c.requeueJobs(hb.NodeID, jobs)
+		log.Printf("心跳响应写失败（%s）：%d 条任务已放回队列", hb.NodeID, len(jobs))
+		return
+	}
+}
+
+// requeueJobs 把没送达的任务放回该节点的待投递队列（保持原顺序在前）。
+func (c *controller) requeueJobs(id api.NodeID, jobs []api.TransferGrant) {
+	if len(jobs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	c.pending[id] = append(append([]api.TransferGrant{}, jobs...), c.pending[id]...)
+	c.mu.Unlock()
 }
 
 // pickPunches 挑选打洞配对：双方都有新鲜公网映射、互相都没有直连边、
@@ -1129,7 +1338,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		Hops:      hops,
 		Relays:    path[1 : len(path)-1],
 		SrcPath:   req.SrcPath,
-		DstPath:   req.DstPath,
+		DstPath:   normalizeDstPath(req.DstPath, req.SrcPath),
 		ChunkSize: 4 << 20,
 		Streams:   4, // TODO(M4)：按路径质量与负载动态定
 		RateLimit: req.RateLimit,
@@ -1296,6 +1505,14 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
 		return
 	}
+	// 必须是这个 grant 的参与方：之前任何已入网节点只要猜到 grant ID
+	// （xfer-<Unix秒>，可枚举）就能把别人的任务标成 done/failed、
+	// 污染 pathBW 调度权重、并触发 autoRetry 重试风暴。
+	if parts := c.grantParticipants(req.GrantID); len(parts) > 0 && !parts[req.NodeID] {
+		c.event("forbidden", string(req.NodeID), "jobdone "+req.GrantID)
+		http.Error(w, "not a participant of this grant", http.StatusForbidden)
+		return
+	}
 	if req.OK {
 		log.Printf("任务 %s 完成（%s）", req.GrantID, req.NodeID)
 		c.jobUpdate(req.GrantID, "done")
@@ -1375,7 +1592,7 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 		Mode:      "switch",
 		Hops:      []api.Hop{{NodeID: req.Src}, {NodeID: best, Addr: addr, Proto: proto}, {NodeID: req.Dst}},
 		SrcPath:   req.SrcPath,
-		DstPath:   req.DstPath,
+		DstPath:   normalizeDstPath(req.DstPath, req.SrcPath),
 		ChunkSize: 4 << 20,
 		Streams:   4,
 		RateLimit: req.RateLimit,

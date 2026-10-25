@@ -5,7 +5,6 @@
 package main
 
 import (
-	"strconv"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -13,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -234,7 +234,7 @@ func newClient(controller, certDir string) (*api.Client, error) {
 	}
 	return &api.Client{
 		Base: controller,
-		HC: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		HC: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			RootCAs:      pool,
 			MinVersion:   tls.VersionTLS13,
