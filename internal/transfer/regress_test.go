@@ -735,3 +735,72 @@ func (s *scriptedConn) SetReadDeadline(t time.Time) error {
 	s.dl = t
 	return nil
 }
+
+// 回归：进度/限速必须按"实际写出的字节"平滑累计，不能整块跳变。
+//
+// 背景：一帧是 4MB，300KB/s 链路上一次 Write 阻塞 13 秒。按 Write 调用
+// 计数会让前 13 秒进度恒为 0，停滞检测打出 "quic 太慢（0 KB/s）"，
+// 而实际上链路在稳定按 300KB/s 推进。
+func TestRegressProgressSmoothDuringSlowWrite(t *testing.T) {
+	// 模拟一个"每次 Write 耗时 40ms"的慢流
+	slow := &slowWriter{perWrite: 40 * time.Millisecond}
+	rt := newTaskRate(0) // 不限速，只观察计数
+	cw := &countingWriter{w: slow, rate: rt}
+
+	var seen []int64
+	var mu sync.Mutex
+	SetProgressSink(func(n int64) {
+		mu.Lock()
+		seen = append(seen, n)
+		mu.Unlock()
+	})
+	defer SetProgressSink(nil)
+
+	// 一次 Write 4MB（= 一帧），应被切成多片分别计数
+	data := make([]byte, 4<<20)
+	start := time.Now()
+	if _, err := cw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	el := time.Since(start)
+
+	mu.Lock()
+	n := len(seen)
+	last := int64(0)
+	if n > 0 {
+		last = seen[n-1]
+	}
+	mu.Unlock()
+
+	// 4MB / 64KB = 64 片
+	if n < 32 {
+		t.Fatalf("应分片计数（≥32 次），实际只有 %d 次（回归：整块计数导致进度跳跃）", n)
+	}
+	if last != int64(len(data)) {
+		t.Fatalf("最终计数应等于总字节数，实际 %d", last)
+	}
+	// 单调递增
+	for i := 1; i < n; i++ {
+		if seen[i] <= seen[i-1] {
+			t.Fatalf("计数应单调递增：第 %d 项 %d 未超过前一项 %d", i, seen[i], seen[i-1])
+		}
+	}
+	// 中途就应该有计数（不是等到最后才跳）
+	mid := seen[n/2]
+	if mid <= 0 || mid >= int64(len(data)) {
+		t.Fatalf("中途计数应在 (0, 总长) 之间，实际 %d", mid)
+	}
+	_ = el
+}
+
+// slowWriter 每次 Write 消耗固定时间，模拟慢链路。
+type slowWriter struct {
+	perWrite time.Duration
+	n        int
+}
+
+func (s *slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(s.perWrite)
+	s.n += len(p)
+	return len(p), nil
+}

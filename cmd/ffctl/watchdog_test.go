@@ -115,3 +115,48 @@ func TestProgressStateResetsPerAttempt(t *testing.T) {
 }
 
 var _ = errors.New
+
+// 回归：必须能区分"慢"和"卡住"。
+//
+// QUIC 流控窗口 16MB：小于窗口的文件瞬间塞满窗口、进度到 100%，之后
+// 全靠等 ACK。此时平均速率看起来不低（早期高速），但 isStalled 能发现
+// "已经很久没有进展"。
+func TestIsStalled(t *testing.T) {
+	const total = 16 << 20
+	if isStalled(time.Second, 0, total) {
+		t.Error("刚过 1 秒不算卡住")
+	}
+	if !isStalled(stallWarmup*2, 0, total) {
+		t.Error("长时间零进展应判为卡住")
+	}
+	// 已传完（在等 ACK）不算"卡住"——由 90s/10min 超时兜底
+	if isStalled(time.Hour, total, total) {
+		t.Error("已发完不应判为卡住")
+	}
+	// 总大小未知不判断
+	if isStalled(time.Hour, 0, 0) {
+		t.Error("总大小未知不判断")
+	}
+}
+
+// sinceAdvance 必须随计数增长而刷新。
+func TestProgressSinceAdvance(t *testing.T) {
+	p := &progressState{}
+	p.reset()
+	time.Sleep(120 * time.Millisecond)
+	if d := p.sinceAdvance(); d < 100*time.Millisecond {
+		t.Fatalf("无进展时 sinceAdvance 应增长，实际 %v", d)
+	}
+	p.add(1024)
+	if d := p.sinceAdvance(); d > 60*time.Millisecond {
+		t.Fatalf("有进展后 sinceAdvance 应重置，实际 %v", d)
+	}
+	// add(0) 不应刷新时间
+	before := p.sinceAdvance()
+	time.Sleep(60 * time.Millisecond)
+	p.add(0)
+	after := p.sinceAdvance()
+	if after <= before {
+		t.Fatalf("add(0) 不应刷新进展时间：before=%v after=%v", before, after)
+	}
+}

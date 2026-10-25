@@ -32,6 +32,20 @@ const (
 )
 
 // shouldSwitch 判断是否应放弃当前协议。纯函数，便于测试。
+//
+// 一个重要的能力边界（实测确认，别指望它更多）：
+//
+//	QUIC 的流控窗口是 16MB。发送端的 Write 只要数据进了 quic-go 的缓冲
+//	就返回，**不反映链路速度**。所以：
+//	  - 文件 ≤ 窗口：数据瞬间塞满窗口，进度直接到 100%，之后只是等 ACK。
+//	    此时 sent>=total，本函数按设计返回 false——它检测不到"活着但很慢"。
+//	  - 文件 > 窗口：窗口填满后 Write 开始阻塞，进度才会跟随链路，
+//	    这时低速率能被检出。
+//
+//	实测：16MB 文件经 300KB/s 限速链路跑了 53.9s，看门狗没有触发；
+//	而连接完全不通（进度恒为 0）时 6 秒就触发了。
+//
+// 也就是说它主要防"假活"（连接建立但推不动），不是万能的慢速检测。
 func shouldSwitch(elapsed time.Duration, sent, total int64) bool {
 	if total <= 0 || elapsed < stallWarmup {
 		return false
@@ -41,6 +55,18 @@ func shouldSwitch(elapsed time.Duration, sent, total int64) bool {
 		return false
 	}
 	return float64(sent)/elapsed.Seconds() < float64(stallMinBPS)
+}
+
+// isStalled 判断"完全没有进展"：距上次进展超过 stallWarmup 且尚未传完。
+//
+// 与 shouldSwitch 互补：shouldSwitch 看平均速率，这里看"是否还在动"。
+// 流控窗口填满后 Write 会阻塞，此时 sent 不再增长，isStalled 能捕获；
+// 而平均速率可能因早期的高速而仍然很高。
+func isStalled(sinceProgress time.Duration, sent, total int64) bool {
+	if total <= 0 || sent >= total {
+		return false
+	}
+	return sinceProgress >= stallWarmup
 }
 
 // cancellableOpener 包装 StreamOpener：ctx 取消时主动关掉底层连接。
@@ -86,14 +112,33 @@ func cancellableOpener(ctx context.Context, inner transfer.StreamOpener) transfe
 type progressState struct {
 	sent  atomic.Int64
 	start atomic.Int64 // UnixNano
+	// lastAdvance 是最近一次"计数增长"的时间（UnixNano），用于判断停滞。
+	lastAdvance atomic.Int64
 }
 
 func (p *progressState) reset() {
+	now := time.Now().UnixNano()
 	p.sent.Store(0)
-	p.start.Store(time.Now().UnixNano())
+	p.start.Store(now)
+	p.lastAdvance.Store(now)
 }
 
-func (p *progressState) add(n int64) { p.sent.Add(n) }
+func (p *progressState) add(n int64) {
+	if n <= 0 {
+		return
+	}
+	p.sent.Add(n)
+	p.lastAdvance.Store(time.Now().UnixNano())
+}
+
+// sinceAdvance 返回距上次计数增长的时间。
+func (p *progressState) sinceAdvance() time.Duration {
+	t := p.lastAdvance.Load()
+	if t == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, t))
+}
 
 // snapshot 返回本次尝试已发字节与已用时间。
 func (p *progressState) snapshot() (sent int64, elapsed time.Duration) {

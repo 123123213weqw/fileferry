@@ -441,9 +441,16 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 					case <-t.C:
 					}
 					sent, el := prog.snapshot()
+					// 两种判据：平均速率过低，或"完全不再推进"
 					if shouldSwitch(el, sent, fi.Size()) {
 						fmt.Fprintf(os.Stderr, "\r  %s 太慢（%.0f KB/s），切换到 %s 重试（已收部分保留）\n",
 							pr, float64(sent)/el.Seconds()/1024, protos[i+1])
+						acancel()
+						return
+					}
+					if isStalled(prog.sinceAdvance(), sent, fi.Size()) {
+						fmt.Fprintf(os.Stderr, "\r  %s 卡住 %s 无进展，切换到 %s 重试（已收部分保留）\n",
+							pr, stallWarmup, protos[i+1])
 						acancel()
 						return
 					}
@@ -703,9 +710,19 @@ func startProgress(w *os.File, total int64, st *progressState) func() {
 			}
 			if cur >= total {
 				// 数据已发完但事务未结束：在等接收端校验并回 ACK。
-				// 明确标出来，否则"100% 却还在转"看起来像卡死——
-				// 实测这里可能持续数秒（对端要落盘 + 校验全文件哈希）。
-				fmt.Fprintf(w, "\r  已发完，等待对端校验确认…（%s）   ", humanBytes(total))
+				//
+				// 这里可能**长时间**等待：QUIC 流控窗口 16MB，小于窗口的
+				// 文件会瞬间塞满窗口（进度直接到 100%），之后全部时间都在
+				// 等 ACK。实测 16MB 经 300KB/s 链路在此停了 54 秒。
+				// 所以除了标明状态，还要显示已等待时长——否则和"卡死"
+				// 无法区分。
+				waited := el.Round(time.Second)
+				hint := ""
+				if el > 10*time.Second {
+					hint = "，链路可能较慢（可试 -proto tcp）"
+				}
+				fmt.Fprintf(w, "\r  已发完，等待对端校验确认…（%s，已等 %s%s）   ",
+					humanBytes(total), waited, hint)
 				continue
 			}
 			speed := 0.0

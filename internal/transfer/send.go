@@ -279,6 +279,48 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 	return fmt.Errorf("份额 [%d,%d) 第 %d 流 3 次尝试均失败: %w", startCh, endCh, r, lastErr)
 }
 
+// progressWriteSlice 是进度/限速的计数粒度。
+//
+// 为什么不直接按 Write 调用计数：一帧数据是 4MB，底层一次 Write 就是
+// 4MB；在 300KB/s 的链路上这一写要阻塞 13 秒，期间计数不会动。于是
+// 进度条按 20% 跳变，停滞检测更会把"300KB/s 稳定推进"误判成
+// "0 KB/s 完全没动"（实测日志确实是这么打的）。
+//
+// 切成 64KB 后，任务限速与进度都按真实写入量平滑推进。TCP/QUIC 的流
+// 都是字节流，分片写不改变线格式。
+const progressWriteSlice = 64 << 10
+
+// countingWriter 把**实际写出去的字节**累加进限速器与进度回调。
+type countingWriter struct {
+	w    io.Writer
+	rate *taskRate
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > progressWriteSlice {
+			chunk = chunk[:progressWriteSlice]
+		}
+		n, err := c.w.Write(chunk)
+		if n > 0 {
+			total += n
+			if c.rate != nil {
+				c.rate.take(int64(n))
+			}
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return total, nil
+}
+
 func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, rate *taskRate) error {
 	tA := time.Now()
 	stream, closeConn, err := open()
@@ -334,10 +376,17 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 			if enc != nil {
 				data = enc.seal(idx, data) // 端到端加密：帧哈希对密文（传输完整性），manifest 对明文
 			}
-			if err := WriteFrame(stream, idx, data); err != nil {
+			// 用逐次写入计数的流包装：进度与限速按"实际写出去的字节"
+			// 累计，而不是按整块。
+			//
+			// 为什么必须这样：块大小 4MB，在 300KB/s 的慢链路上一块要写
+			// 13 秒。按块计数的话，前 6 秒进度是 0、进度条按 20% 跳，
+			// 停滞检测也会把"正在稳定慢传"误判成"完全没动"（实测日志
+			// 打出 "quic 太慢（0 KB/s）"，其实是 300KB/s 在稳定推进）。
+			cw := &countingWriter{w: stream, rate: rate}
+			if err := WriteFrame(cw, idx, data); err != nil {
 				return err
 			}
-			rate.take(int64(len(data)))
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
