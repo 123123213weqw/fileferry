@@ -647,7 +647,17 @@ func runJob(g api.TransferGrant) {
 		runSwitchRecv(g)
 		return
 	}
-	if g.Src != nodeID {
+	// 身份检查：主源（Src）或多源分片源（Sources 含本机）都接受——
+	// 副源也是任务的主人，不能在多源分片检查之前丢弃（M8 集成顺序 bug）
+	mineIdx := -1
+	for i, sp := range g.Sources {
+		if sp.NodeID == nodeID {
+			mineIdx = i
+			break
+		}
+	}
+	if g.Src != nodeID && mineIdx < 0 {
+		log.Printf("[trace] 忽略任务 %s：既非 Src(%s) 也非分片源", g.ID, g.Src)
 		return
 	}
 	mu.Lock()
@@ -675,14 +685,15 @@ func runJob(g api.TransferGrant) {
 		}
 	}
 
-	if !g.Verify(signPub) || time.Now().After(g.ExpiresAt) {
+	sigOK := g.Verify(signPub)
+	expOK := time.Now().Before(g.ExpiresAt)
+	if !sigOK || !expOK {
+		log.Printf("[trace] 任务 %s 被拒：签名无效=%v 过期=%v（本机 %s vs 授权至 %s）",
+			g.ID, !sigOK, !expOK, time.Now().Format(time.RFC3339), g.ExpiresAt.Format(time.RFC3339))
 		done(false, "grant 验签失败或已过期")
 		return
 	}
-	if !transfer.PathAllowed(g.SrcPath) {
-		done(false, "源路径不在白名单内")
-		return
-	}
+	log.Printf("[trace] 任务 %s 开始执行：sources=%d mode=%q", g.ID, len(g.Sources), g.Mode)
 	timeout := time.Until(g.ExpiresAt)
 	if timeout > 30*time.Minute {
 		timeout = 30 * time.Minute
@@ -696,22 +707,18 @@ func runJob(g api.TransferGrant) {
 	// 多源模式：本节点只发自己分到的块区间 [Start, End)；单源模式
 	// 发全文件。找不到自己的分片则忽略（这份 grant 是发给别的源的）。
 	var startCh, endCh int64 = 0, -1
-	var hopAddr, hopProto string
+	var hopAddr, hopProto, sendPath string
+	sendPath = g.SrcPath
 	via := ""
 	switch {
 	case len(g.Sources) > 0:
-		mine := -1
-		for i, sp := range g.Sources {
-			if sp.NodeID == nodeID {
-				mine = i
-				break
-			}
-		}
-		if mine < 0 {
+		if mineIdx < 0 {
+			log.Printf("[trace] 忽略任务 %s：本机不在分片列表", g.ID)
 			return // 不是我的分片
 		}
-		startCh, endCh = g.Sources[mine].Start, g.Sources[mine].End
-		hopAddr, hopProto = g.Sources[mine].Addr, g.Sources[mine].Proto
+		startCh, endCh = g.Sources[mineIdx].Start, g.Sources[mineIdx].End
+		hopAddr, hopProto = g.Sources[mineIdx].Addr, g.Sources[mineIdx].Proto
+		sendPath = g.Sources[mineIdx].Path // 各副本本地路径不同
 		via = fmt.Sprintf("（多源分片 [%d,%d)）", startCh, endCh)
 	case g.Mode == "switch":
 		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
@@ -726,6 +733,11 @@ func runJob(g api.TransferGrant) {
 			via = "（经 " + strings.Join(ids, " -> ") + " 中继）"
 		}
 	}
+	if !transfer.PathAllowed(sendPath) {
+		log.Printf("[trace] 任务 %s 被拒：源路径不在白名单 %s", g.ID, sendPath)
+		done(false, "源路径不在白名单内")
+		return
+	}
 	// switch 模式建流走配对；直连/多源直接拨
 	var open transfer.StreamOpener
 	if g.Mode == "switch" {
@@ -734,7 +746,7 @@ func runJob(g api.TransferGrant) {
 		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto}
 		open = transfer.OpenerDirect(ctx, hop, tlsConf)
 	}
-	sentBytes, err := transfer.SendFileRange(ctx, g.SrcPath, open, tlsConf, &g, startCh, endCh)
+	sentBytes, err := transfer.SendFileRange(ctx, sendPath, open, tlsConf, &g, startCh, endCh)
 	if err != nil {
 		done(false, err.Error())
 		log.Printf("任务 %s 失败：%v", g.ID, err)

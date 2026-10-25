@@ -865,7 +865,10 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	for _, t := range targets {
 		c.pending[t] = append(c.pending[t], grant) // 每个源各收一份，各取自己的区间
 	}
+	npend := len(c.pending[req.Src])
 	c.mu.Unlock()
+	log.Printf("[trace] 签发 %s：sources=%d streams=%d 投递=%v 源队列长度=%d",
+		grant.ID, len(grant.Sources), grant.Streams, targets, npend)
 	c.jobPersist(&grant)
 	srcs := make([]string, 0, len(targets))
 	for _, t := range targets {
@@ -915,25 +918,26 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 	}
 	// 权重：源本身按其到目的的实测带宽（缺省 2MB/s），副本按各自
 	// 实测带宽（缺省 1MB/s——副本路径通常未经实测，保守起步）
+	// 候选评分 = 实测带宽 × 负载折扣 100/(100+load)：自动在
+	// "路径快"与"节点闲"之间取最优（多源版的最优负载）
 	type cand struct {
 		id    api.NodeID
 		addr  string
 		proto string
+		path  string
 		w     float64
 	}
-	// 候选评分 = 实测带宽 × 负载折扣 100/(100+load)：自动在
-	// "路径快"与"节点闲"之间取最优（多源版的最优负载）
 	cands := []cand{}
 	if proto, addr, ok := c.graph.EdgeDetail(g.Src, g.Dst); ok && addr != "" {
 		w := c.score(g.Src, g.Dst, 2.0)
-		cands = append(cands, cand{g.Src, addr, proto, w})
+		cands = append(cands, cand{g.Src, addr, proto, g.SrcPath, w})
 	}
-	for id := range others {
+	for id, path := range others {
 		proto, addr, ok := c.graph.EdgeDetail(id, g.Dst)
 		if !ok || addr == "" {
 			continue // 无直连边的副本不参与（v1）
 		}
-		cands = append(cands, cand{id, addr, proto, c.score(id, g.Dst, 1.0)})
+		cands = append(cands, cand{id, addr, proto, path, c.score(id, g.Dst, 1.0)})
 	}
 	if len(cands) < 2 {
 		return
@@ -954,7 +958,7 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 			end = totalChunks
 		}
 		g.Sources = append(g.Sources, api.SourceSpec{
-			NodeID: cd.id, Addr: cd.addr, Proto: cd.proto, Start: cursor, End: end,
+			NodeID: cd.id, Addr: cd.addr, Proto: cd.proto, Path: cd.path, Start: cursor, End: end,
 		})
 		cursor = end
 		if cursor >= totalChunks {

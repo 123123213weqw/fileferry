@@ -156,6 +156,7 @@ type SourceSpec struct {
 	NodeID NodeID `json:"node_id"`
 	Addr   string `json:"addr"`
 	Proto  string `json:"proto"`
+	Path   string `json:"path"`  // 该源本地的文件路径（各副本路径可不同）
 	Start  int64  `json:"start"` // 起始块号（含）
 	End    int64  `json:"end"`   // 结束块号（不含）
 }

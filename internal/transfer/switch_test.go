@@ -1,6 +1,10 @@
 package transfer
 
 import (
+	"fmt"
+	"crypto/tls"
+	"net"
+	"strconv"
 	"bufio"
 	"bytes"
 	"context"
@@ -202,4 +206,79 @@ func TestMultiSource(t *testing.T) {
 	}
 	_ = s1Q
 	_ = s2Q
+}
+
+// TestParallelStreamsTCP 进程内 TCP 4 流并行——复现真机"多流卡死"
+// 则为代码 bug；通过则指向环境（中间设备并发连接限制）。
+func TestParallelStreamsTCP(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, verify := grantKeys(t)
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpPort := raw.Addr().(*net.TCPAddr).Port
+	raw.Close()
+	_, _, dstCert, err := root.Issue("dst", true, ca.RoleNode, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{dstCert},
+		ClientCAs:    root.Pool(),
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS13,
+	}
+	tln, err := tls.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort)), serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tln.Close()
+	go ServeTCP(tln, "dst", verify, clientTLSFor(t, root, "dst"))
+
+	dir := t.TempDir()
+	payload := make([]byte, 40*1024*1024)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(dir, "s.bin")
+	dstPath := filepath.Join(dir, "d.bin")
+	os.WriteFile(srcPath, payload, 0o600)
+
+	grant := &api.TransferGrant{
+		ID: fmt.Sprintf("xfer-ptest-%d", time.Now().UnixNano()), Src: "src", Dst: "dst", Streams: 4,
+		Hops: []api.Hop{
+			{NodeID: "src"},
+			{NodeID: "dst", Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort-1)), Proto: "tcp"},
+		},
+		SrcPath: srcPath, DstPath: dstPath,
+	}
+	sign(grant)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("TCP 4 流失败：%v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("TCP 4 流卡死（45 秒未完成）——真机问题进程内复现！")
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("目的文件未落盘：%v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("内容不一致：%d vs %d", len(payload), len(got))
+	}
 }

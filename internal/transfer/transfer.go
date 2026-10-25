@@ -337,10 +337,16 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 	return mf.Size, nil
 }
 
-// OpenerDirect 返回常规模式的建流函数（拨 firstHop）。
+// OpenerDirect 返回常规模式的建流函数（拨 firstHop）。QUIC 建流
+// 失败时自动降级 TCP 重试——签发时刻的边协议可能与当前网络状态
+// 有 30 秒竞态窗口，拨号层兜底比取消任务友好。
 func OpenerDirect(ctx context.Context, firstHop api.Hop, tlsConf *tls.Config) StreamOpener {
 	return func() (Stream, func(), error) {
-		return DialStream(ctx, firstHop.Addr, firstHop.Proto, tlsConf)
+		s, closeFn, err := DialStream(ctx, firstHop.Addr, firstHop.Proto, tlsConf)
+		if err == nil || firstHop.Proto != "quic" {
+			return s, closeFn, err
+		}
+		return DialStream(ctx, firstHop.Addr, "tcp", tlsConf)
 	}
 }
 
@@ -688,8 +694,14 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 	}
 	g, err := groupFor(grant, &mf)
 	if err == ErrAlreadyDone {
+		// 先 ACK 让对端收尾，再 drain 到对端关闭——否则对端仍在写数据，
+		// 连接一关就是 broken pipe，重试也全撞墙（多流卡死的根因）
 		stream.Write([]byte("ACK\n"))
 		fmt.Printf("迟到流确认：%s（文件此前已完整落盘）\n", grant.ID)
+		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+			s.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		}
+		io.Copy(io.Discard, stream)
 		return
 	}
 	if err != nil {
