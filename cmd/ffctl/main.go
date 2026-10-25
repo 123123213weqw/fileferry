@@ -6,14 +6,18 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -27,6 +31,7 @@ import (
 
 const usage = `用法：
   ffctl -cert-dir <dir> put  <本机文件> <dst-node>:<path>   ← 本机直推（等价 scp）
+  ffctl -cert-dir <dir> get  <src-node>:<path> <本机路径>   ← 拉取到本机（等价 scp）
   ffctl -rate <字节/秒> -streams <n> ...                      ← 可选：限速 / 并行流数
   ffctl -cert-dir <dir> send <src-node>:<path> <dst-node>:<path>
   ffctl -cert-dir <dir> status
@@ -41,9 +46,22 @@ func main() {
 	noWait := false
 	rateBps := int64(0) // -rate：限速（字节/秒），0 = 不限
 	streams := 0        // -streams：并行流数，0 = 由 controller 决定
+	advertise := ""     // -advertise：ffctl 接收端对外地址（NAT 后需显式给）
+	pinHash := false    // -pin：把源节点索引里的摘要钉进授权（强校验）
 	args := os.Args[1:]
 	var rest []string
 	for i := 0; i < len(args); i++ {
+		if args[i] == "-pin" {
+			pinHash = true
+			continue
+		}
+		if args[i] == "-advertise" {
+			if i+1 < len(args) {
+				advertise = args[i+1]
+				i++
+			}
+			continue
+		}
 		if args[i] == "-streams" {
 			if i+1 < len(args) {
 				if n, err := strconv.Atoi(args[i+1]); err == nil {
@@ -176,6 +194,32 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	case "get":
+		// 两种用法：
+		//   ffctl get <src-node>:<path> <本机路径>   ← 从节点拉到本机（等价 scp）
+		//   ffctl get <取件码>                        ← 兑换 share 取件码
+		if len(rest) == 3 {
+			srcNode, srcPath, ok := splitNodePath(rest[1])
+			if !ok {
+				fmt.Fprintln(os.Stderr, "源格式应为 node:/path")
+				os.Exit(2)
+			}
+			if err := runGet(cl, certDir, srcNode, srcPath, rest[2], streams, advertise, pinHash); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+		if len(rest) != 2 {
+			fmt.Fprintln(os.Stderr, "用法: ffctl get <取件码>")
+			os.Exit(2)
+		}
+		var g api.TransferGrant
+		if err := cl.Post("/v1/get", map[string]string{"code": rest[1]}, &g); err != nil {
+			fmt.Fprintln(os.Stderr, "取件失败：", err)
+			os.Exit(1)
+		}
+		fmt.Printf("已受理：%s -> 本机 %s（%s）\n", g.Src, g.DstPath, g.ID)
 	case "token":
 		// 铸造一枚一次性入网令牌：打印后由管理员加入 controller
 		// 配置的 enroll-tokens 并重启 controller，再交给新服务器
@@ -225,17 +269,6 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("取件码：%v（%v 分钟内有效，最多 %v 次）\n目标机执行：ff get %v\n", resp["code"], resp["expires_in_min"], resp["max_uses"], resp["code"])
-	case "get":
-		if len(rest) != 2 {
-			fmt.Fprintln(os.Stderr, "用法: ffctl get <取件码>")
-			os.Exit(2)
-		}
-		var g api.TransferGrant
-		if err := cl.Post("/v1/get", map[string]string{"code": rest[1]}, &g); err != nil {
-			fmt.Fprintln(os.Stderr, "取件失败：", err)
-			os.Exit(1)
-		}
-		fmt.Printf("已受理：%s -> 本机 %s（%s）\n", g.Src, g.DstPath, g.ID)
 	case "revoke":
 		if len(rest) != 2 {
 			fmt.Fprintln(os.Stderr, "用法: ffctl revoke <node-id>")
@@ -390,6 +423,201 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 	fmt.Printf("完成：%s（%d 字节，%.2fs，%.0f MB/s，SHA256 %s…）\n",
 		grant.DstPath, n, el.Seconds(), mbps, sum[:12])
 	return nil
+}
+
+// runGet 实现"远端 → 本机"拉取：本机起临时 TLS 数据面接收端，由源节点
+// 主动连过来推送。等价 scp host:/path ./local。
+//
+// 与 put 的差别：这里 ffctl 是 TLS **服务器**，所以需要一张带
+// ServerAuth 的短时效证书（管理员证书只有 ClientAuth）。证书由
+// controller 按需签发，CN 一次性。
+func runGet(cl *api.Client, certDir, srcNode, srcPath, localPath string, streams int, advertise string, pinHash bool) error {
+	var ep api.PullEndpoint
+	if err := cl.Post("/v1/pullcert", struct{}{}, &ep); err != nil {
+		return fmt.Errorf("申请传输端点证书失败：%w", err)
+	}
+	pair, err := tls.X509KeyPair([]byte(ep.CertPEM), []byte(ep.KeyPEM))
+	if err != nil {
+		return fmt.Errorf("加载端点证书失败：%w", err)
+	}
+
+	// 校验授权签名用的公钥
+	block, _ := pem.Decode([]byte(ep.SignPubPEM))
+	if block == nil {
+		return fmt.Errorf("controller 未提供签名公钥")
+	}
+	pk, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("解析签名公钥失败：%w", err)
+	}
+	signPub, ok := pk.(ed25519.PublicKey)
+	if !ok {
+		return fmt.Errorf("签名公钥不是 ed25519")
+	}
+
+	// 根证书：优先用端点证书里的 CA（controller 已签发链），否则读 cert-dir
+	_, pool, err := loadCreds(certDir)
+	if err != nil {
+		return fmt.Errorf("加载根证书失败：%w", err)
+	}
+
+	srvTLS := &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		// RootCAs 必须同时设置：传输层（HandleStream → recvOne）用它来
+		// 校验 manifest 签名者的证书链。只设 ClientCAs 会让根池为 nil，
+		// 于是回退到系统根证书，验签必然失败（实测报
+		// "certificate is using a broken key size"，具有误导性）。
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS13,
+	}
+	ln, err := tls.Listen("tcp", ":0", srvTLS)
+	if err != nil {
+		return fmt.Errorf("监听数据面失败：%w", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	host := advertise
+	if host == "" {
+		host = localIPTowards(cl.Base)
+	}
+	listenAddr := net.JoinHostPort(host, strconv.Itoa(port))
+
+	var grant api.TransferGrant
+	if err := cl.Post("/v1/pull", api.PullRequest{
+		NodeID:     ep.NodeID,
+		Src:        srcNode,
+		SrcPath:    srcPath,
+		DstPath:    localPath,
+		ListenAddr: listenAddr,
+		ListenPort: port,
+		Streams:    streams,
+		PinHash:    pinHash,
+	}, &grant); err != nil {
+		return fmt.Errorf("申请拉取授权失败：%w", err)
+	}
+	fmt.Printf("已授权 %s：%s:%s -> 本机 %s（经由 %s）\n", grant.ID, grant.Src, grant.SrcPath, grant.DstPath, listenAddr)
+
+	// 接收端放行任意本地路径（这是用户自己的机器，且路径由用户给出）
+	transfer.SetPathGuard(nil)
+	transfer.SetInboxRoot("")
+
+	verify := func(g *api.TransferGrant) bool {
+		return g.Verify(signPub) && time.Now().Before(g.ExpiresAt)
+	}
+	want := grant.Streams
+	if want < 1 {
+		want = 1
+	}
+	worst := make(chan error, want+1)
+	var got int
+
+	// 源节点会为每条流各建一条连接
+	done := make(chan struct{}, want+1)
+	go func() {
+		for i := 0; i < want+1; i++ {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				peer := ""
+				if tc, ok := c.(*tls.Conn); ok {
+					if err := tc.Handshake(); err != nil {
+						c.Close()
+						return
+					}
+					if len(tc.ConnectionState().PeerCertificates) > 0 {
+						peer = tc.ConnectionState().PeerCertificates[0].Subject.CommonName
+					}
+				}
+				transfer.HandleStream(c, string(ep.NodeID), verify, srvTLS, peer)
+				done <- struct{}{}
+			}(c)
+		}
+	}()
+
+	// 等文件落地（或失败）
+	deadline := time.Now().Add(30 * time.Minute)
+	finished := false
+	lastPoll := time.Now()
+	for time.Now().Before(deadline) {
+		// 轮询任务状态：源端失败（文件不存在、白名单拒绝等）时必须
+		// 立刻返回，否则会一直等到 30 分钟超时（实测源文件不存在时
+		// 挂满 60 秒仍无输出）。
+		if time.Since(lastPoll) > 2*time.Second {
+			lastPoll = time.Now()
+			if jobs, err := cl.Jobs(grant.ID); err == nil && len(jobs) > 0 {
+				switch jobs[0].Status {
+				case "failed":
+					return fmt.Errorf("拉取失败：源端报告失败（%s）", jobs[0].ID)
+				case "done":
+					finished = true
+				}
+			}
+		}
+		if finished {
+			break
+		}
+		if st, err := os.Stat(grant.DstPath); err == nil && st.Size() >= 0 {
+			// 只有在收到全部流或文件已完整时才认为完成：用 grant 里的大小判断
+			if grant.FileSize > 0 && st.Size() == grant.FileSize {
+				finished = true
+				break
+			}
+			if grant.FileSize == 0 && st.Size() > 0 {
+				finished = true
+				break
+			}
+		}
+		select {
+		case <-done:
+			got++
+			if got >= want {
+				finished = true
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+		if finished {
+			break
+		}
+	}
+	select {
+	case err := <-worst:
+		if err != nil {
+			return err
+		}
+	default:
+	}
+	if !finished {
+		return fmt.Errorf("拉取超时：%s 未在 30 分钟内就绪", grant.DstPath)
+	}
+	st, err := os.Stat(grant.DstPath)
+	if err != nil {
+		return fmt.Errorf("拉取结束但本机没有文件：%w", err)
+	}
+	fmt.Printf("完成：%s（%d 字节）\n", grant.DstPath, st.Size())
+	return nil
+}
+
+// localIPTowards 猜测本机对 controller 可达的地址（用于告诉源节点回连）。
+func localIPTowards(base string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "127.0.0.1"
+	}
+	host := u.Hostname()
+	c, err := net.Dial("udp", net.JoinHostPort(host, "9"))
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer c.Close()
+	if a, ok := c.LocalAddr().(*net.UDPAddr); ok {
+		return a.IP.String()
+	}
+	return "127.0.0.1"
 }
 
 // dedupProtos 按顺序去重并丢掉空串（第一个通常是 controller 给的建议值）。

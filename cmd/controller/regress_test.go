@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -64,8 +66,11 @@ func newTestController(t *testing.T) *controller {
 		}
 	}
 	t.Cleanup(func() { db.Close() })
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	return &controller{
 		cfg:          Config{DataDir: dir},
+		signer:       priv,
+		signPub:      pub,
 		graph:        topology.New(),
 		db:           db,
 		pending:      map[api.NodeID][]api.TransferGrant{},
@@ -324,5 +329,79 @@ func TestRegressNormalizeDstPath(t *testing.T) {
 		if got := normalizeDstPath(in[0], in[1]); got != want {
 			t.Fatalf("normalizeDstPath(%q,%q)=%q，期望 %q", in[0], in[1], got, want)
 		}
+	}
+}
+
+// 回归：pull 授权必须把 ffctl 作为目的端写进 Hops（源节点据此回连），
+// 且默认**不**用可能过期的索引摘要钉死内容。
+func TestRegressPullGrant(t *testing.T) {
+	c := newTestController(t)
+	// 让源节点"在线"
+	c.graph.Apply(api.Heartbeat{
+		NodeID: "store", Hostname: "h", Addr: "10.0.0.9:17800", TCPPort: 18400,
+		TS: time.Now(),
+	})
+	// 索引里放一条**过期**的摘要：默认不应被用于钉死
+	c.mu.Lock()
+	c.indexCache["store"] = []api.IndexEntry{{Path: "/data/f.bin", Size: 123, SHA256: "deadbeef"}}
+	c.mu.Unlock()
+
+	req := api.PullRequest{
+		NodeID: "ffctl-abc", Src: "store", SrcPath: "/data/f.bin",
+		DstPath: "/tmp/out/", ListenAddr: "10.0.0.5", ListenPort: 40000, Streams: 2,
+	}
+	body, _ := json.Marshal(req)
+	r := httptest.NewRequest("POST", "/v1/pull", bytes.NewReader(body))
+	r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{
+		{Subject: pkix.Name{CommonName: "admin", OrganizationalUnit: []string{"admin"}}},
+	}}
+	w := &recWriter{}
+	c.handlePull(w, r)
+	if w.buf.Len() == 0 {
+		t.Fatal("pull 未返回授权")
+	}
+	var g api.TransferGrant
+	if err := json.Unmarshal(w.buf.Bytes(), &g); err != nil {
+		t.Fatal(err)
+	}
+	if g.Src != "store" || g.Dst != "ffctl-abc" {
+		t.Fatalf("src/dst 不符：%s -> %s", g.Src, g.Dst)
+	}
+	if len(g.Hops) != 2 || g.Hops[1].NodeID != "ffctl-abc" {
+		t.Fatalf("Hops[1] 应是 ffctl 端点：%+v", g.Hops)
+	}
+	if g.Hops[1].Addr != "10.0.0.5" || g.Hops[1].TCPPort != 40000 {
+		t.Fatalf("回连地址不对：%+v", g.Hops[1])
+	}
+	if g.DstPath != "/tmp/out/f.bin" {
+		t.Fatalf("目录目标应补源文件名，实际 %q", g.DstPath)
+	}
+	if g.FileSHA256 != "" {
+		t.Fatalf("默认不应钉死索引摘要（索引可能过期），实际 %q", g.FileSHA256)
+	}
+	// 授权应已排给源节点
+	c.mu.Lock()
+	n := len(c.pending["store"])
+	c.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("授权应入源节点队列，实际 %d 条", n)
+	}
+	if !g.Verify(c.signPub) {
+		t.Fatal("签发的授权验签失败")
+	}
+
+	// 显式 PinHash 时才用索引
+	req.PinHash = true
+	body, _ = json.Marshal(req)
+	r2 := httptest.NewRequest("POST", "/v1/pull", bytes.NewReader(body))
+	r2.TLS = r.TLS
+	w2 := &recWriter{}
+	c.handlePull(w2, r2)
+	var g2 api.TransferGrant
+	if err := json.Unmarshal(w2.buf.Bytes(), &g2); err != nil {
+		t.Fatal(err)
+	}
+	if g2.FileSHA256 != "deadbeef" || g2.FileSize != 123 {
+		t.Fatalf("PinHash 时应带上索引摘要，实际 %q/%d", g2.FileSHA256, g2.FileSize)
 	}
 }

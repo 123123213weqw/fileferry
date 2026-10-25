@@ -300,6 +300,8 @@ func main() {
 	mux.HandleFunc("POST /v1/heartbeat", c.handleHeartbeat)
 	mux.HandleFunc("POST /v1/transfer", c.handleTransfer)
 	mux.HandleFunc("POST /v1/push", c.handlePush)
+	mux.HandleFunc("POST /v1/pullcert", c.handlePullCert)
+	mux.HandleFunc("POST /v1/pull", c.handlePull)
 	mux.HandleFunc("POST /v1/jobdone", c.handleJobDone)
 	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
@@ -439,6 +441,132 @@ const (
 	// grantTTL 是签发后的有效期；超时视为失效（防重放）。
 	grantTTL = 30 * time.Minute
 )
+
+// handlePullCert：给 ffctl 签发一张**可作 TLS 服务器**的短时效传输证书。
+// 仅 admin。管理员证书只带 ClientAuth，无法在 pull 场景里充当服务端。
+func (c *controller) handlePullCert(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
+		c.event("forbidden", clientRole(r), "pullcert")
+		return
+	}
+	if !c.limiter.allow("pullcert:"+string(clientRole(r)), 20) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	// CN 带随机后缀：一张证书只用于一次拉取，避免"临时端点"变成长期身份
+	id := api.NodeID(fmt.Sprintf("ffctl-%x", time.Now().UnixNano()&0xffffff))
+	certPEM, keyPEM, _, err := c.ca.Issue(string(id), true, ca.RoleNode, "127.0.0.1", "localhost")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(api.PullEndpoint{
+		NodeID:     id,
+		CertPEM:    string(certPEM),
+		KeyPEM:     string(keyPEM),
+		SignPubPEM: signPubPEM(c.signPub),
+		ExpiresAt:  time.Now().Add(grantTTL).Unix(),
+	})
+}
+
+// handlePull：签发"远端节点 → ffctl 端点"的授权。仅 admin。
+// 数据面由源节点主动连 ffctl，不经过 controller。
+func (c *controller) handlePull(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, ca.RoleAdmin) {
+		c.event("forbidden", clientRole(r), "pull")
+		return
+	}
+	var req api.PullRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.NodeID == "" || req.Src == "" || req.SrcPath == "" || req.DstPath == "" ||
+		req.ListenAddr == "" || req.ListenPort <= 0 {
+		http.Error(w, "node_id/src/src_path/dst_path/listen_addr/listen_port required", http.StatusBadRequest)
+		return
+	}
+	if req.Src == req.NodeID {
+		http.Error(w, "source cannot be the transfer endpoint", http.StatusBadRequest)
+		return
+	}
+	if !c.limiter.allow("pull:"+string(req.Src), 50) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	if c.graph.Addr(req.Src) == "" {
+		http.Error(w, "source node offline", http.StatusUnprocessableEntity)
+		return
+	}
+	c.mu.Lock()
+	srcRevoked := c.revoked[req.Src]
+	c.mu.Unlock()
+	if srcRevoked {
+		http.Error(w, "source revoked", http.StatusForbidden)
+		return
+	}
+
+	// 目标路径写成目录时补源文件名（与 put 一致）
+	dstPath := normalizeDstPath(req.DstPath, req.SrcPath)
+
+	// 若源节点索引里能查到该文件的摘要，就把内容钉进授权，
+	// 让接收端能校验"拿到的就是那个文件"而不只是"签名者合法"。
+	var fileSHA string
+	var fileSize int64
+	c.mu.Lock()
+	if req.PinHash {
+		for _, e := range c.indexCache[req.Src] {
+			if e.Path == req.SrcPath {
+				fileSHA, fileSize = e.SHA256, e.Size
+				break
+			}
+		}
+	}
+	streams := req.Streams
+	if streams <= 0 {
+		streams = 4
+	}
+	if streams > 8 {
+		streams = 8
+	}
+	c.nextID++
+	c.mu.Unlock()
+
+	g := api.TransferGrant{
+		ID:   fmt.Sprintf("pull-%d", time.Now().UnixNano()%1e12),
+		Src:  req.Src,
+		Dst:  req.NodeID,
+		Mode: "pull",
+		Hops: []api.Hop{
+			{NodeID: req.Src},
+			{
+				NodeID:  req.NodeID,
+				Addr:    req.ListenAddr,
+				Proto:   "tcp", // ffctl 只监听 TCP
+				TCPPort: req.ListenPort,
+			},
+		},
+		SrcPath:    req.SrcPath,
+		DstPath:    dstPath,
+		ChunkSize:  grantChunkSize,
+		Streams:    streams,
+		FileSHA256: fileSHA,
+		FileSize:   fileSize,
+		ExpiresAt:  time.Now().Add(grantTTL),
+	}
+	g.Sign(c.signer)
+	c.jobPersist(&g)
+	c.jobUpdate(g.ID, "sent")
+
+	// 交给源节点执行（它下一轮心跳就会拿到）
+	c.mu.Lock()
+	c.pending[req.Src] = append(c.pending[req.Src], g)
+	c.mu.Unlock()
+	c.notifyPending(req.Src)
+
+	c.event("pull", req.Src, fmt.Sprintf("%s -> %s:%s", req.SrcPath, req.NodeID, dstPath))
+	json.NewEncoder(w).Encode(g)
+}
 
 // pushProto 给出优先拨号协议：有探测边就用探测结果，否则默认 quic。
 func pushProto(c *controller, id api.NodeID) string {

@@ -127,6 +127,34 @@ type DoneRequest struct {
 	Duration float64 `json:"duration_s,omitempty"`
 }
 
+// PullEndpoint 是 ffctl 作为**数据面接收端**所需的凭据。
+//
+// 与 put 相反，pull 时 ffctl 要监听 TLS 并充当服务器，因此需要一张带
+// ServerAuth 的证书——管理员证书只带 ClientAuth，直接用会在 TLS 握手
+// 阶段被发送方拒绝。controller 为此按需签发一张短时效的传输端点证书。
+type PullEndpoint struct {
+	NodeID     NodeID `json:"node_id"` // ffctl 的身份（证书 CN）
+	CertPEM    string `json:"cert_pem"`
+	KeyPEM     string `json:"key_pem"`
+	SignPubPEM string `json:"sign_pub_pem"` // 校验授权签名用
+	ExpiresAt  int64  `json:"expires_at"`
+}
+
+// PullRequest 申请"从远端节点拉取到本机"的授权。
+type PullRequest struct {
+	NodeID     NodeID `json:"node_id"` // 上面拿到的 ffctl 身份
+	Src        NodeID `json:"src"`
+	SrcPath    string `json:"src_path"`
+	DstPath    string `json:"dst_path"`    // 本机保存路径（目录会自动补源文件名）
+	ListenAddr string `json:"listen_addr"` // ffctl 数据面监听地址 host:port
+	ListenPort int    `json:"listen_port"` // 实际 TCP 端口
+	Streams    int    `json:"streams,omitempty"`
+	// PinHash 要求把源节点索引里的摘要钉进授权（强校验）。
+	// 默认关闭：索引是定期上报的，文件在两次上报之间被改动就会让
+	// 合法传输被拒（实测踩到——agent 启动时索引了同名旧文件）。
+	PinHash bool `json:"pin_hash,omitempty"`
+}
+
 // PushRequest 是"本机 → 远端节点"直推的申请（等价 scp local host:/path）。
 // ffctl 在本地算好摘要与大小一起提交，controller 只负责签授权、给出
 // 目标的拨号地址——数据面由 ffctl 直接连目标节点，不经过 controller，

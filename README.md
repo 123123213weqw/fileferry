@@ -166,9 +166,11 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 | 想做的事 | scp | fileferry |
 |---|---|---|
 | 本机 → 远端 | `scp f host:/p` | `ffctl put f node-b:/p` |
+| 远端 → 本机 | `scp host:/p ./local` | `ffctl get node-b:/p ./local` |
 | 远端 → 远端 | `scp a:/f b:/p`（走本机中转） | `ffctl send a:/f b:/p`（节点直连/中继，不经本机） |
 | 限速 | `-l`（Kbit/s） | `-rate <字节/秒>`（整任务共享配额） |
 | 断点续传 | 无 | 自动（进度位图 + `.ffpart`） |
+| 内容校验 | 无（只有传输校验和） | 逐块 SHA256 + 全文件摘要（由发送方签名） |
 | 免 ssh | 需要 sshd | 不需要，自建 mTLS 数据面 |
 | 被墙/只放 443 | 取决于 sshd 端口 | `tcp-port: 443` 即可 |
 
@@ -213,6 +215,29 @@ loopback 上一切都 <5 秒，所以这个 bug 长期不可见；一旦上真�
 限速，必然命中。现在 HAVE 之后立即清零，ACK 前单独给 30 秒。
 回归测试用真实 TCP + 手工"慢对端"（HAVE 后停 6 秒再发数据），
 两处修复任一缺失都会失败。
+
+### put / get 的实现要点
+
+- `put`：本机作 TLS 客户端直连目标节点，授权里 `Src` = 调用者管理员 CN。
+- `get`：本机作 TLS **服务器**，由源节点回连推数据。管理员证书只带
+  `ClientAuth`，无法充当服务端，所以 controller 按需签发一张
+  **一次性、短时效、带 ServerAuth** 的传输端点证书（CN 带随机后缀）。
+- 两条方向都不经过 controller 传数据，也都受目标节点的 `allowed-dirs`
+  白名单约束。
+- `get` 默认**不**用节点索引里的摘要钉死内容（`-pin` 可强制）。原因：
+  索引是定期上报的，文件在两次上报之间被改动，钉死会让合法传输被拒
+  ——实测踩到过一次（agent 启动时索引了同名旧文件）。
+- 源端失败（文件不存在、白名单拒绝）时 ffctl 会在约 2 秒内返回，
+  不会干等到超时（靠轮询 `/v1/jobs`）。
+
+实测（本机 loopback，一个 agent）：
+
+```
+get 8MB          0.67s   ✅ SHA256 一致
+get 到目录       自动补源文件名 ✅
+get 源不存在     2.03s 内失败（不是等 30 分钟）
+get 白名单外     2.03s 内失败
+```
 
 ### 断点续传的实测证据
 
