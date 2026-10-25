@@ -493,7 +493,7 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 
 	buf := make([]byte, ChunkSize)
 	if wd, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		wd.SetWriteDeadline(time.Now().Add(5 * time.Minute)) // 写阻塞自断，交给份额重试
+		wd.SetWriteDeadline(time.Now().Add(90 * time.Second)) // 写阻塞自断，交给份额重试
 	}
 	for idx := startCh + int64(r); endCh < 0 || idx < endCh; idx += int64(n) {
 		if have[idx] {
@@ -792,6 +792,9 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		fmt.Printf("迟到流确认：%s（文件此前已完整落盘）\n", grant.ID)
 		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
 			s.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		}
+		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+			s.SetReadDeadline(time.Now().Add(90 * time.Second))
 		}
 		io.Copy(io.Discard, stream)
 		return
