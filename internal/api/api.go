@@ -3,6 +3,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"strings"
 	"bytes"
 	"crypto/ed25519"
@@ -150,6 +151,7 @@ type TransferGrant struct {
 	RateLimit  int64     `json:"rate_limit_bps"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Retries    int       `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
+	Enc        bool      `json:"enc,omitempty"`    // 端到端加密（密钥经 controller 专递，不进 grant）
 	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
 }
 
@@ -198,7 +200,7 @@ func (g *TransferGrant) payload() []byte {
 	sb.WriteString(g.SrcPath)
 	sb.WriteByte('|')
 	sb.WriteString(g.DstPath)
-	fmt.Fprintf(&sb, "|%d|%d|%d", g.Streams, g.Retries, g.ExpiresAt.Unix())
+	fmt.Fprintf(&sb, "|%d|%d|%d|%v", g.Streams, g.Retries, g.ExpiresAt.Unix(), g.Enc)
 	return []byte(sb.String())
 }
 
@@ -363,4 +365,22 @@ func (c *Client) Index(rep IndexReport) error {
 func TokenHash(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+// Keypass 上报/获取端到端加密密钥材料（key+nonce 前缀）。
+func (c *Client) PostKeypass(grantID string, material []byte) error {
+	var ignored struct{}
+	return c.post("/v1/keypass", map[string]any{
+		"grant_id": grantID, "key_b64": base64.StdEncoding.EncodeToString(material),
+	}, &ignored)
+}
+
+func (c *Client) GetKeypass(grantID string) ([]byte, error) {
+	var resp struct {
+		KeyB64 string `json:"key_b64"`
+	}
+	if err := c.Get("/v1/keypass?id="+url.QueryEscape(grantID), &resp); err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(resp.KeyB64)
 }

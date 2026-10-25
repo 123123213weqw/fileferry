@@ -190,7 +190,7 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 	}
 	idx = int64(binary.BigEndian.Uint32(hdr[4:8]))
 	n := binary.BigEndian.Uint64(hdr[8:16])
-	if n > ChunkSize {
+	if n > ChunkSize+64 { // 端到端加密的密文比明文多 AEAD 标签（16B）
 		return 0, nil, fmt.Errorf("chunk too large: %d", n)
 	}
 	data = make([]byte, n)
@@ -423,6 +423,22 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
+	var enc *streamCipher
+	if grant.Enc {
+		var key []byte
+		var err error
+		if enc, key, err = newStreamCipher(); err != nil {
+			return err
+		}
+		// 密钥专递 controller（key + nonce 前缀），中继不可见
+		if keyDeliverer != nil {
+			if err := keyDeliverer(grant.ID, append(key, enc.noncePrefix...)); err != nil {
+				return fmt.Errorf("密钥上报失败: %w", err)
+			}
+		} else {
+			return fmt.Errorf("grant 要求加密但未配置密钥上报")
+		}
+	}
 	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
 	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
 	have := map[int64]bool{}
@@ -451,7 +467,11 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 		}
 		nread, rerr := f.ReadAt(buf, idx*ChunkSize)
 		if nread > 0 {
-			if err := WriteFrame(stream, idx, buf[:nread]); err != nil {
+			data := buf[:nread]
+			if enc != nil {
+				data = enc.seal(idx, data) // 端到端加密：帧哈希对密文（传输完整性），manifest 对明文
+			}
+			if err := WriteFrame(stream, idx, data); err != nil {
 				return err
 			}
 		}
@@ -713,6 +733,14 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		fmt.Printf("拒绝传输 %s：%v\n", grant.ID, err)
 		return
 	}
+	var deckey *streamCipher
+	if grant.Enc {
+		var kerr error
+		if deckey, kerr = cipherForGrant(grant.ID); kerr != nil {
+			fmt.Printf("接收 %s 取密钥失败：%v\n", grant.ID, kerr)
+			return
+		}
+	}
 	g, err := groupFor(grant, &mf)
 	if err == nil {
 		// 断点续传握手：告知发送端已收块位图（HAVE 行），对端跳块；
@@ -738,7 +766,7 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
 		return
 	}
-	if err := g.feed(br); err != nil {
+	if err := g.feed(br, deckey); err != nil {
 		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
 		return
 	}
@@ -922,7 +950,8 @@ func (g *recvGroup) hasChunk(idx int64) bool {
 }
 
 // feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
-func (g *recvGroup) feed(r io.Reader) error {
+// deckey 非空时先解密（端到端加密）。
+func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 	for {
 		idx, data, err := ReadFrame(r)
 		if err == io.EOF {
@@ -933,6 +962,11 @@ func (g *recvGroup) feed(r io.Reader) error {
 		}
 		if len(data) == 0 { // 本连接份额完成哨兵
 			return nil
+		}
+		if deckey != nil {
+			if data, err = deckey.open(idx, data); err != nil {
+				return fmt.Errorf("块 %d 解密失败: %w", idx, err)
+			}
 		}
 		if _, err := g.tmp.WriteAt(data, idx*int64(ChunkSize)); err != nil {
 			return err

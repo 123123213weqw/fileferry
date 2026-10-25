@@ -61,6 +61,7 @@ type controller struct {
 	pathBW     map[[2]api.NodeID]float64          // 实测路径吞吐 MB/s（jobdone 回填）
 	indexCache map[api.NodeID][]api.IndexEntry    // 各节点最近索引（查源文件哈希/大小）
 	revoked    map[api.NodeID]bool                // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
+	keypass    map[string]string                  // grantID -> 密钥材料（端到端加密专递，一次性）
 }
 
 type pubEntry struct {
@@ -124,6 +125,7 @@ func main() {
 		pathBW:       map[[2]api.NodeID]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		revoked:      map[api.NodeID]bool{},
+		keypass:      map[string]string{},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
@@ -278,6 +280,8 @@ func main() {
 	mux.HandleFunc("GET /v1/jobs", c.handleJobs)
 	mux.HandleFunc("POST /v1/index", c.handleIndex)
 	mux.HandleFunc("POST /v1/revoke", c.handleRevoke)
+	mux.HandleFunc("POST /v1/keypass", c.handleKeypassPost)
+	mux.HandleFunc("GET /v1/keypass", c.handleKeypassGet)
 
 	tlsCfg := rootCA.ServerTLS(tls.Certificate{})
 	tlsCfg.Certificates = nil // 交由 GetCertificate 动态提供（有静态列表时 TLS 不走回调）
@@ -351,6 +355,19 @@ func retryDepth(id string) int {
 		n++
 	}
 	return n
+}
+
+// lookupGrantSrc 从任务表反查源端（密钥上报校验用）。
+func (c *controller) lookupGrantSrc(id string) api.NodeID {
+	var gj string
+	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, id).Scan(&gj); err != nil {
+		return ""
+	}
+	var g api.TransferGrant
+	if json.Unmarshal([]byte(gj), &g) != nil {
+		return ""
+	}
+	return g.Src
 }
 
 // lookupGrantDst 从任务表反查目的端（吞吐回填用）。
@@ -494,6 +511,62 @@ func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 	c.event("renew", nodeID, "")
 	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
+}
+
+// handleKeypassPost：源端上报端到端加密密钥材料（验证其为任务源端）。
+// 密钥只在 controller 内存停留至目的端取走（一次性）。
+func (c *controller) handleKeypassPost(w http.ResponseWriter, r *http.Request) {
+	if len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
+	var req struct {
+		GrantID string `json:"grant_id"`
+		KeyB64  string `json:"key_b64"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.GrantID == "" || req.KeyB64 == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if dst := c.lookupGrantDst(req.GrantID); dst == "" || dst != cn {
+		// 仅任务的目的端上报的密钥才对——此处是源端上报：应校验 CN==Src
+		if gsrc := c.lookupGrantSrc(req.GrantID); gsrc == "" || gsrc != cn {
+			http.Error(w, "not a participant", http.StatusForbidden)
+			return
+		}
+	}
+	if !c.limiter.allow("kp:"+string(cn), 20) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	c.mu.Lock()
+	c.keypass[req.GrantID] = req.KeyB64
+	c.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleKeypassGet：目的端取密钥（校验 CN==Dst，一次性发放）。
+func (c *controller) handleKeypassGet(w http.ResponseWriter, r *http.Request) {
+	if len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "client cert required", http.StatusUnauthorized)
+		return
+	}
+	cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
+	id := r.URL.Query().Get("id")
+	if dst := c.lookupGrantDst(id); dst == "" || dst != cn {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	c.mu.Lock()
+	k, ok := c.keypass[id]
+	delete(c.keypass, id) // 一次性
+	c.mu.Unlock()
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"key_b64": k})
 }
 
 // handleRevoke：仅 admin。软吊销一个节点：从拓扑/队列/索引中即刻
@@ -917,6 +990,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		Streams:   4, // TODO(M4)：按路径质量与负载动态定
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
+		Enc:       true, // 端到端加密默认开启（中继/交换台只见密文）
 	}
 	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
 	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。

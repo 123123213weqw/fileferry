@@ -356,3 +356,61 @@ func TestResumeAfterInterrupt(t *testing.T) {
 		t.Fatal("完成后进度文件应清理")
 	}
 }
+
+// TestEndToEndEncrypted 端到端加密传输：密钥经注入的专递/获取回调
+// 传递，中继（若在路径上）只见密文；明文逐字节一致。
+func TestEndToEndEncrypted(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign, verify := grantKeys(t)
+	dstQ, stopDst := startNode(t, "dst", root, verify)
+	defer stopDst()
+
+	// 密钥专递：内存 map 模拟 controller
+	var keyMu sync.Mutex
+	keybox := map[string][]byte{}
+	SetKeyDeliverer(func(id string, mat []byte) error {
+		keyMu.Lock()
+		keybox[id] = mat
+		keyMu.Unlock()
+		return nil
+	})
+	SetKeyFetcher(func(id string) ([]byte, error) {
+		keyMu.Lock()
+		defer keyMu.Unlock()
+		m, ok := keybox[id]
+		if !ok {
+			return nil, fmt.Errorf("no key")
+		}
+		return m, nil
+	})
+
+	dir := t.TempDir()
+	payload := make([]byte, 9*1024*1024)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(dir, "s.bin")
+	dstPath := filepath.Join(dir, "d.bin")
+	os.WriteFile(srcPath, payload, 0o600)
+
+	grant := &api.TransferGrant{
+		ID: fmt.Sprintf("xfer-enc-%d", time.Now().UnixNano()), Src: "src", Dst: "dst",
+		Streams: 2, Enc: true,
+		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+		SrcPath: srcPath, DstPath: dstPath,
+	}
+	sign(grant)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := SendFile(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], clientTLSFor(t, root, "src")), clientTLSFor(t, root, "src"), grant); err != nil {
+		t.Fatalf("加密传输失败：%v", err)
+	}
+	got := waitForFile(t, dstPath)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("解密后内容不一致：%d vs %d", len(payload), len(got))
+	}
+}

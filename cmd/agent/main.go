@@ -136,6 +136,12 @@ func run(cfgPath string) error {
 	if err := loadSignPub(); err != nil {
 		return err
 	}
+	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
+		return hbClient.PostKeypass(grantID, material)
+	})
+	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
+		return hbClient.GetKeypass(grantID)
+	})
 	if len(cfg.AllowedDirs) > 0 {
 		transfer.SetPathGuard(func(p string) bool {
 			for _, dir := range cfg.AllowedDirs {
@@ -411,6 +417,12 @@ func shareDir() string {
 	if cfg.ShareDir != "" {
 		return cfg.ShareDir
 	}
+	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
+		return hbClient.PostKeypass(grantID, material)
+	})
+	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
+		return hbClient.GetKeypass(grantID)
+	})
 	if len(cfg.AllowedDirs) > 0 {
 		return cfg.AllowedDirs[0]
 	}
