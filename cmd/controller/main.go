@@ -38,6 +38,7 @@ type Config struct {
 	Listen       string   `yaml:"listen"`
 	DataDir      string   `yaml:"data-dir"`
 	EnrollTokens []string `yaml:"enroll-tokens"`
+	EncDefault   bool     `yaml:"enc-default"` // 传输内容端到端加密（实验）
 }
 
 type controller struct {
@@ -142,6 +143,8 @@ func main() {
 		pendingPunch: map[api.NodeID][]api.PunchDirective{},
 	}
 
+	// schema 迁移：旧库补列（ALTER 幂等，已存在则忽略）
+	c.db.Exec(`ALTER TABLE jobs ADD COLUMN base TEXT`)
 	// 重启恢复：未完成任务 + 副本索引 + 吊销名单（全部持久化于 SQLite）
 	if n := c.rehydrate(); n > 0 {
 		log.Printf("恢复未完成任务 %d 条", n)
@@ -1127,7 +1130,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		Streams:   4, // TODO(M4)：按路径质量与负载动态定
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
-		Enc:       true, // 端到端加密默认开启（中继/交换台只见密文）
+		Enc:       c.cfg.EncDefault, // 端到端加密（真机密钥专递链路待修，默认关；单测已验证）
 	}
 	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
 	if len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {

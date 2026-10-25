@@ -151,7 +151,7 @@ func main() {
 				h.NodeID, h.Hostname, h.CPUPct, h.MemPct, h.ActiveXfers, strings.Join(edges, " "))
 		}
 	case "share":
-		if len(rest) != 2 {
+		if len(rest) < 2 || len(rest) > 3 {
 			fmt.Fprintln(os.Stderr, "用法: ffctl share <node>:<path> [ttl分钟]")
 			os.Exit(2)
 		}

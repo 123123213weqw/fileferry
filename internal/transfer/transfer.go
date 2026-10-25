@@ -333,6 +333,22 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 	if n < 1 {
 		n = 1
 	}
+	// 端到端加密：每 grant 一把密钥（所有流共用），发送前上报一次。
+	// 每流一把会让 controller 的单槽一次性发放互相覆盖（真机踩坑）。
+	var enc *streamCipher
+	if grant.Enc {
+		var key []byte
+		var err error
+		if enc, key, err = newStreamCipher(); err != nil {
+			return 0, err
+		}
+		if keyDeliverer == nil {
+			return 0, fmt.Errorf("grant 要求加密但未配置密钥上报")
+		}
+		if err := keyDeliverer(grant.ID, append(key, enc.noncePrefix...)); err != nil {
+			return 0, fmt.Errorf("密钥上报失败: %w", err)
+		}
+	}
 	errCh := make(chan error, n)
 	var wg sync.WaitGroup
 	for r := 0; r < n; r++ {
@@ -354,7 +370,7 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 		wg.Add(1)
 		go func(r int, o StreamOpener, g2 *api.TransferGrant) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, o, g2, mf, startCh, endCh, r, n)
+			errCh <- sendShare(ctx, f, o, g2, mf, enc, startCh, endCh, r, n)
 		}(r, thisOpen, thisGrant)
 	}
 	wg.Wait()
@@ -420,12 +436,12 @@ func DialSwitch(ctx context.Context, addr, proto string, tlsConf *tls.Config, gr
 
 // sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
 // 保证各连接进度均衡。流头为 grant 行 + manifest 行，然后是数据帧。
-func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, startCh, endCh int64, r, n int) error {
+func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
 	// 连接失败/中断 → 重连重发整个份额（最多 3 次）：多流交错下
 	// 单条连接的块缺口会让收发两端同时死等，必须自愈
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if err := sendShareOnce(ctx, f, open, grant, mf, startCh, endCh, r, n); err == nil {
+		if err := sendShareOnce(ctx, f, open, grant, mf, enc, startCh, endCh, r, n); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -434,7 +450,7 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 	return fmt.Errorf("份额 [%d,%d) 第 %d 流 3 次尝试均失败: %w", startCh, endCh, r, lastErr)
 }
 
-func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, startCh, endCh int64, r, n int) error {
+func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
 	stream, closeConn, err := open()
 	if err != nil {
 		return fmt.Errorf("建流失败: %w", err)
@@ -451,22 +467,6 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	}
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
-	}
-	var enc *streamCipher
-	if grant.Enc {
-		var key []byte
-		var err error
-		if enc, key, err = newStreamCipher(); err != nil {
-			return err
-		}
-		// 密钥专递 controller（key + nonce 前缀），中继不可见
-		if keyDeliverer != nil {
-			if err := keyDeliverer(grant.ID, append(key, enc.noncePrefix...)); err != nil {
-				return fmt.Errorf("密钥上报失败: %w", err)
-			}
-		} else {
-			return fmt.Errorf("grant 要求加密但未配置密钥上报")
-		}
 	}
 	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
 	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
@@ -770,7 +770,7 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 			return
 		}
 	}
-	g, err := groupFor(grant, &mf)
+	g, err := groupFor(grant, &mf, deckey)
 	if err == nil {
 		// 断点续传握手：告知发送端已收块位图（HAVE 行），对端跳块；
 		// 旧版发送端不读此行也无碍（多写一行被当数据丢弃的风险——
@@ -795,7 +795,7 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
 		return
 	}
-	if err := g.feed(br, deckey); err != nil {
+	if err := g.feed(br, g.deckey); err != nil {
 		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
 		return
 	}
@@ -837,6 +837,7 @@ type recvGroup struct {
 	finished  chan struct{}
 	finErr    error
 	done      bool
+	deckey    *streamCipher // 端到端解密器（组级共享，建组时取一次）
 	size      int64 // 文件精确字节数（进度键）
 	dirty     int   // 距上次位图落盘的新块数
 }
@@ -850,7 +851,7 @@ var (
 	completed  = map[string]time.Time{} // 已完成的 grant，2h 内拒绝重放
 )
 
-func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
+func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*recvGroup, error) {
 	if !PathAllowed(grant.DstPath) {
 		return nil, fmt.Errorf("目的路径不在白名单内：%s", grant.DstPath)
 	}
@@ -880,6 +881,7 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 		grantID:   grant.ID,
 		wantSHA:   mf.SHA256,
 		size:      mf.Size,
+		deckey:    deckey,
 		finalPath: grant.DstPath,
 		tmp:       tmp,
 		tmpName:   tmp.Name(),
