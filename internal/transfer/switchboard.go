@@ -12,12 +12,34 @@ import (
 	"time"
 )
 
+// quicProbeTimeout 是"试一下 QUIC"的预算。
+//
+// 必须远小于调用方的整体预算：UDP 被墙/被拦时 QUIC 握手会一直等到
+// 握手空闲超时（quic-go 默认 5s），不改的话 3 次重试就把 10s 的任务
+// 预算吃光，TCP 回退永远轮不到——实测跨机 pull 正是这样失败的：
+// 「第 3 流 3 次尝试均失败: 建流失败: context deadline exceeded」，
+// 而对端 TCP 端口明明是通的。
+//
+// 3 秒足够跑完任何合理 RTT 下的 QUIC 握手（1-RTT，4.6ms 链路上是毫秒级）。
+const quicProbeTimeout = 3 * time.Second
+
 func OpenerDirect(ctx context.Context, firstHop api.Hop, tlsConf *tls.Config) StreamOpener {
 	return func() (Stream, func(), error) {
-		s, closeFn, err := DialStream(ctx, firstHop.Addr, firstHop.Proto, firstHop.TCPPort, tlsConf)
-		if err == nil || firstHop.Proto != "quic" {
-			return s, closeFn, err
+		if firstHop.Proto != "quic" {
+			return DialStream(ctx, firstHop.Addr, firstHop.Proto, firstHop.TCPPort, tlsConf)
 		}
+		// QUIC 有独立预算：试不通就立刻回退 TCP，而不是把任务预算耗在
+		// "一条这条链路上根本不通的腿"上。
+		qctx, qcancel := context.WithTimeout(ctx, quicProbeTimeout)
+		s, closeFn, err := DialStream(qctx, firstHop.Addr, "quic", firstHop.TCPPort, tlsConf)
+		qcancel()
+		if err == nil {
+			return s, closeFn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err() // 整体已超时，别再徒劳回退
+		}
+		tracef("QUIC 拨号失败（%v），回退 TCP", err)
 		return DialStream(ctx, firstHop.Addr, "tcp", firstHop.TCPPort, tlsConf)
 	}
 }

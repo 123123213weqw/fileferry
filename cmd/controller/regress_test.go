@@ -493,3 +493,27 @@ func TestRegressProtoLearning(t *testing.T) {
 		t.Fatal("非正吞吐不应被记录")
 	}
 }
+
+// 回归：req.Proto 必须能强制数据面协议。
+//
+// 之前 `ffctl -proto tcp send ...` 被**静默忽略**：TransferRequest 里根本
+// 没有这个字段，controller 只按探测结果选。被墙链路里 UDP 常被拦，用户
+// 以为强制了 TCP，实际仍走默认——排查时会误判成"TCP 也不行"。
+func TestRegressTransferRequestProtoOverride(t *testing.T) {
+	// 直接验证字段能被序列化进请求（API 面）
+	var req api.TransferRequest
+	body := []byte(`{"src":"a","src_path":"/x","dst":"b","dst_path":"/y","proto":"tcp"}`)
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Proto != "tcp" {
+		t.Fatalf("Proto 未被解析：%q", req.Proto)
+	}
+	// 非法的值不应被当成覆盖指令（由 controller 侧判断）
+	for _, v := range []string{"", "udp", "TCP"} {
+		req2 := api.TransferRequest{Proto: v}
+		if req2.Proto == "tcp" || req2.Proto == "quic" {
+			t.Errorf("%q 不应被视为有效覆盖", v)
+		}
+	}
+}

@@ -145,7 +145,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "路径格式应为 node:/path")
 			os.Exit(2)
 		}
-		grant, err := cl.Send(api.TransferRequest{Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath, RateLimit: rateBps})
+		grant, err := cl.Send(api.TransferRequest{Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath, RateLimit: rateBps, Proto: protoSel})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "传输请求失败：", err)
 			os.Exit(1)
@@ -538,17 +538,35 @@ func runGet(cl *api.Client, certDir, srcNode, srcPath, localPath string, streams
 		RootCAs:    pool,
 		MinVersion: tls.VersionTLS13,
 	}
-	ln, err := tls.Listen("tcp", ":0", srvTLS)
-	if err != nil {
-		return fmt.Errorf("监听数据面失败：%w", err)
+	// 监听必须绑在**将要公布出去的地址**上，不能图省事用 ":0"。
+	//
+	// 实测（macOS + 跨机）：":0" 解析成 IPv6 通配 [::] 且 v6only，于是
+	// lsof 只看到 `TCP *:52074 (LISTEN)` 的 IPv6 条目；对端按 IPv4 地址
+	// 拨过来就是 connection refused。本机自测（对端也在本机）不会暴露，
+	// 只有跨机才炸。
+	//
+	// -advertise 允许写 "host" 或 "host:port"：写端口就固定端口（便于
+	// 放行防火墙），不写则随机。
+	host, wantPort := advertise, 0
+	if h, ps, err := net.SplitHostPort(advertise); err == nil {
+		host = h
+		if n, cerr := strconv.Atoi(ps); cerr == nil {
+			wantPort = n
+		}
 	}
-	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
-
-	host := advertise
 	if host == "" {
 		host = localIPTowards(cl.Base)
 	}
+	bindHost := host
+	if net.ParseIP(bindHost) == nil && bindHost != "" {
+		bindHost = "" // 主机名解析交给系统：退回通配，靠公布地址被拨通
+	}
+	ln, err := tls.Listen("tcp", net.JoinHostPort(bindHost, strconv.Itoa(wantPort)), srvTLS)
+	if err != nil {
+		return fmt.Errorf("监听数据面失败（%s）：%w", net.JoinHostPort(bindHost, strconv.Itoa(wantPort)), err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
 	listenAddr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	var grant api.TransferGrant

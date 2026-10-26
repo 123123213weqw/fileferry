@@ -207,6 +207,12 @@ type TransferRequest struct {
 	Dst       NodeID `json:"dst"`
 	DstPath   string `json:"dst_path"`
 	RateLimit int64  `json:"rate_limit_bps"` // 0 = 不限速
+	// Proto 强制数据面协议（"tcp"/"quic"，空=按探测/学习结果）。
+	//
+	// 存在的理由：被墙网络里 UDP 常被丢包或拦截，QUIC 会静默变慢或不通。
+	// 没有这个字段时，`ffctl -proto tcp send ...` 会被**静默忽略**——用户
+	// 以为强制了 TCP，实际仍按默认走，排查时会误判成"TCP 也慢"。
+	Proto string `json:"proto,omitempty"`
 }
 
 // TransferGrant 是 controller 签名的单次传输授权：写明源、目的、

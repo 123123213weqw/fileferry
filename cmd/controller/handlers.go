@@ -917,6 +917,11 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, fmt.Sprintf("%s 无可用地址", id), http.StatusUnprocessableEntity)
 				return
 			}
+			// 调用方显式指定协议时以它为准：被墙链路里 UDP 可能被拦，
+			// 按探测结果自动选会挑到一条实际上不通/很慢的腿。
+			if req.Proto == "tcp" || req.Proto == "quic" {
+				hop.Proto = req.Proto
+			}
 		}
 		hops = append(hops, hop)
 	}
