@@ -345,12 +345,36 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
 	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
 	have := map[int64]bool{}
+	// 增量：接收端已有文件的「块哈希 → 偏移」。命中就发引用帧，不传数据。
+	var reuseIdx map[string]int64
+	reusedBlocks := 0
 	if rd, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-		rd.SetReadDeadline(time.Now().Add(3 * time.Second))
+		// 15s 而不是 3s：接收端发 HAVE 前要扫描已有文件算分块哈希（增量
+		// 协商），大文件可能要一两秒；3 秒会直接放弃协商，增量永远不生效。
+		// 旧版接收端会立刻回 HAVE，不会让正常路径变慢。
+		rd.SetReadDeadline(time.Now().Add(15 * time.Second))
 		line, lerr := readLine(stream)
+		if os.Getenv("FF_DEBUG_HAVE") != "" {
+			n := len(line)
+			head := line
+			if len(head) > 40 {
+				head = head[:40]
+			}
+			log.Printf("[have] 流%d len=%d err=%v head=%q", r, n, lerr, head)
+		}
 		tracef("[tl] %s 流%d HAVE读取完成 err=%v", grant.ID, r, lerr)
 		if lerr == nil && strings.HasPrefix(line, "HAVE ") {
-			if bits, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, "HAVE ")); err == nil {
+			// 行格式：HAVE <bits> [<reuse>]
+			// 旧版接收端只有 bits 段；旧版发送端读到带 reuse 的行会
+			// base64 解码失败 → 位图为空 → 全量发送（正确但无优化）。
+			rest := strings.TrimPrefix(line, "HAVE ")
+			if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+				if rt := decodeReuseTable(rest[sp+1:]); rt != nil {
+					reuseIdx = rt.index()
+				}
+				rest = rest[:sp]
+			}
+			if bits, err := base64.StdEncoding.DecodeString(rest); err == nil {
 				for i := 0; i*8 < len(bits); i++ {
 					for b := 0; b < 8; b++ {
 						if bits[i]&(1<<b) != 0 {
@@ -373,6 +397,18 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 		nread, rerr := f.ReadAt(buf, idx*ChunkSize)
 		if nread > 0 {
 			data := buf[:nread]
+			// 增量：本块内容在接收端已有文件里存在（按 SHA-256 比对）
+			// 就不传数据，只发 8 字节偏移。
+			if len(reuseIdx) > 0 {
+				if off, ok := reuseIdx[blockHash(data)]; ok {
+					cw := &countingWriter{w: stream, rate: rate}
+					if err := WriteRefFrame(cw, idx, off); err != nil {
+						return err
+					}
+					reusedBlocks++
+					continue
+				}
+			}
 			if enc != nil {
 				data = enc.seal(idx, data) // 端到端加密：帧哈希对密文（传输完整性），manifest 对明文
 			}
@@ -399,6 +435,10 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	// QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
 	if err := WriteFrame(stream, -1, []byte{}); err != nil {
 		return err
+	}
+	if reusedBlocks > 0 {
+		log.Printf("[tl] %s 流%d 增量：%d 块由接收端本地复用（省 %d 字节）",
+			grant.ID, r, reusedBlocks, int64(reusedBlocks)*int64(ChunkSize))
 	}
 	ack := make([]byte, 4)
 	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {

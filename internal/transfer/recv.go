@@ -12,6 +12,7 @@ import (
 	"fileferry/internal/api"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,23 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
 			w.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		}
-		fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
+		// 增量：把目标位置**已有文件**的分块哈希一并带过去，发送端
+		// 据此跳过相同块。旧版发送端会因整行 base64 解码失败而退化为
+		// 全量发送，行为仍然正确。
+		g.reuseOnce.Do(func() {
+			reuse := buildReuseTable(g.dstPath, grant.ChunkSize)
+			g.reuseEnc = reuse.encode()
+			if g.reuseEnc != "" {
+				// 这行对用户有意义（决定了要传多少），始终输出
+				log.Printf("%s 增量协商：目标已有 %d 块可复用（%d 字节）",
+					grant.ID, len(reuse.Blocks), reuse.Size)
+			}
+		})
+		if g.reuseEnc != "" {
+			fmt.Fprintf(stream, "HAVE %s %s\n", base64.StdEncoding.EncodeToString(g.haveBits()), g.reuseEnc)
+		} else {
+			fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
+		}
 		// 必须立刻清掉这个写超时：它会把**后面所有写**（尤其末尾的
 		// ACK）都限制在 5 秒内。实测限速 1MB/s 传 5MB 时，接收端写
 		// ACK 已距 HAVE 超过 5 秒 → "i/o timeout" → 对端看到 EOF →
@@ -114,6 +131,7 @@ type recvGroup struct {
 	grantID   string
 	wantSHA   string
 	finalPath string
+	dstPath   string // 最终落盘路径（增量扫描已有文件用）
 	tmp       *os.File
 	tmpName   string
 	expected  int64
@@ -124,6 +142,11 @@ type recvGroup struct {
 	deckey    *streamCipher // 端到端解密器（组级共享，建组时取一次）
 	size      int64         // 文件精确字节数（进度键）
 	dirty     int           // 距上次位图落盘的新块数
+	reused    int64         // 由增量引用填充的块数（仅统计用）
+	// reuseOnce/reuseEnc 缓存增量协商行：扫描已有文件要读全文件算哈希，
+	// 每个并行流各扫一遍会成倍放大（4 流 × 100MB）。只算一次。
+	reuseOnce sync.Once
+	reuseEnc  string
 }
 
 // ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
@@ -208,6 +231,7 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 		size:      mf.Size,
 		deckey:    deckey,
 		finalPath: grant.DstPath,
+		dstPath:   grant.DstPath,
 		tmp:       tmp,
 		tmpName:   tmp.Name(),
 		expected:  n,
@@ -312,6 +336,69 @@ func (g *recvGroup) hasChunk(idx int64) bool {
 
 // feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
 // deckey 非空时先解密（端到端加密）。
+// fillFromLocal 用**本机已有文件**里的一段内容填充第 idx 块（增量）。
+//
+// 这是"引用"而不是"传输"：数据从旧文件直接搬到临时文件，不过网络、
+// 也不解密（发送端没加密它，因为没有传输）。
+//
+// 完整性：这里不做逐块校验——引用帧只有 8 字节偏移，没有块哈希可比。
+// 终态由整文件 SHA-256（manifest，源端签名）兜底：若旧文件在协商后
+// 被改动，最终校验会失败并丢弃结果，不会静默产出错误文件。
+func (g *recvGroup) fillFromLocal(idx, srcOff int64) error {
+	if srcOff < 0 {
+		return fmt.Errorf("引用偏移为负：%d", srcOff)
+	}
+	src, err := os.Open(g.dstPath)
+	if err != nil {
+		return fmt.Errorf("引用块 %d 失败（无法打开已有文件）：%w", idx, err)
+	}
+	defer src.Close()
+	// 只读本块需要的字节数：最后一块可能不足 ChunkSize
+	want := int64(ChunkSize)
+	g.mu.Lock()
+	if (idx+1)*int64(ChunkSize) > g.size {
+		want = g.size - idx*int64(ChunkSize)
+	}
+	g.mu.Unlock()
+	if want <= 0 {
+		return fmt.Errorf("引用块 %d 的期望长度非法：%d", idx, want)
+	}
+	buf := make([]byte, want)
+	n, rerr := src.ReadAt(buf, srcOff)
+	if int64(n) != want {
+		// 旧文件被截短，或对端给了越界偏移——回退为失败，让上层重试，
+		// 而不是写入不完整的数据。
+		return fmt.Errorf("引用块 %d 读取不足：需 %d 实得 %d（%v）", idx, want, n, rerr)
+	}
+	if _, err := g.tmp.WriteAt(buf, idx*int64(ChunkSize)); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	if !g.got[idx] {
+		g.got[idx] = true
+		g.dirty++
+		g.reused++
+	}
+	needFlush := g.dirty >= 8 || len(g.got) == int(g.expected)
+	pending := g.dirty
+	g.mu.Unlock()
+	if needFlush {
+		g.saveProgress()
+		g.mu.Lock()
+		g.dirty -= pending
+		g.mu.Unlock()
+	}
+	if len(g.got) == int(g.expected) && !g.done {
+		g.mu.Lock()
+		if !g.done {
+			g.done = true
+		}
+		g.mu.Unlock()
+		g.finalize()
+	}
+	return nil
+}
+
 func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 	for {
 		idx, data, err := ReadFrame(r)
@@ -334,6 +421,25 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 				g.finalize()
 			}
 			return nil
+		}
+		// 增量引用帧：数据段是 8 字节源偏移，内容取自本机**已有文件**，
+		// 不经过网络也不经过加密层。
+		if isRefFrame(idx) {
+			realIdx := int64(uint32(idx) &^ refFlag)
+			srcOff, oerr := refOffset(data)
+			if oerr != nil {
+				return oerr
+			}
+			g.mu.Lock()
+			expected := g.expected
+			g.mu.Unlock()
+			if realIdx < 0 || realIdx >= expected {
+				return fmt.Errorf("引用帧块号 %d 超出范围 [0,%d)", realIdx, expected)
+			}
+			if err := g.fillFromLocal(realIdx, srcOff); err != nil {
+				return err
+			}
+			continue
 		}
 		// 块号必须落在清单声明的范围内：否则 WriteAt 会在超大偏移处
 		// 写一个稀疏文件，一个恶意（或出 bug 的）对端就能把接收端
