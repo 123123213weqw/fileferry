@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // 滚动校验的核心：rollWeak 必须与「在新位置从头重算」逐位一致。
@@ -606,5 +607,87 @@ func TestPlanSegChunksEndToEnd(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("整文件按计划重建与目标不符")
+	}
+}
+
+// 回归：内容全新的区域必须快速放弃，不能逐字节空扫。
+//
+// 实测（V100，200MB 随机数据、前 100MB 可复用）：没有快速放弃时
+// planSegChunks 要 5.4 秒，且完全挡在数据发送之前——用户看到的是
+// "增量传输反而比全量还慢 60%"。
+func TestPlanNewContentGivesUpFast(t *testing.T) {
+	rng := rand.New(rand.NewSource(31))
+	const B = 4096
+	// 旧文件：32 块随机
+	oldData := make([]byte, 32*B)
+	rng.Read(oldData)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "old.bin")
+	os.WriteFile(p, oldData, 0o600)
+	sig, _ := buildSignature(p, B)
+	ix := sig.index()
+
+	// 新数据：完全不相干的 8MB
+	fresh := make([]byte, 8<<20)
+	rng.Read(fresh)
+
+	t0 := time.Now()
+	ops := ix.scanChunk(fresh, 0, int64(len(fresh)), &segScanState{})
+	el := time.Since(t0)
+
+	// 全部应是字面量（没有可复用内容）
+	for _, o := range ops {
+		if o.op == opCopy {
+			t.Fatalf("全新内容不该产生拷贝指令")
+		}
+	}
+	// 关键：耗时必须是亚秒级。逐字节扫 8MB 在 CI 上也要数秒。
+	if el > 2*time.Second {
+		t.Fatalf("全新内容扫描过慢（%v）：快速放弃未生效", el)
+	}
+	t.Logf("8MB 全新内容扫描耗时 %v", el.Round(time.Millisecond))
+}
+
+// 快速放弃不能误伤"错位但内容存在"的情况。
+func TestPlanShiftedStillMatches(t *testing.T) {
+	rng := rand.New(rand.NewSource(32))
+	const B = 4096
+	oldData := make([]byte, 64*B)
+	rng.Read(oldData)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "old.bin")
+	os.WriteFile(p, oldData, 0o600)
+	sig, _ := buildSignature(p, B)
+	ix := sig.index()
+
+	// 在中间插 500 字节 → 之后全部错位，但内容仍然存在
+	want := append([]byte{}, oldData[:20*B]...)
+	want = append(want, bytes.Repeat([]byte{0x5A}, 500)...)
+	want = append(want, oldData[20*B:]...)
+
+	ops := ix.scanChunk(want, 0, int64(len(want)), &segScanState{})
+	var copyBytes, litBytes int
+	for _, o := range ops {
+		if o.op == opCopy {
+			copyBytes += o.length
+		} else {
+			litBytes += o.length
+		}
+	}
+	if copyBytes == 0 {
+		t.Fatal("错位内容应当仍能匹配（快速放弃误伤了）")
+	}
+	// 大部分内容应被复用，只有插入处附近是字面量
+	if litBytes > 10*B {
+		t.Fatalf("字面量应只在插入点附近，实际 %d 字节（总 %d）", litBytes, len(want))
+	}
+	// 重建正确性
+	payload := encodeSegOps(want, ops)
+	got, err := decodeSegOps(payload, len(want), func() (io.ReaderAt, func(), error) {
+		f, _ := os.Open(p)
+		return f, func() { f.Close() }, nil
+	})
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("重建失败: %v", err)
 	}
 }

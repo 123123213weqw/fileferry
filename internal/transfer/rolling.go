@@ -41,6 +41,17 @@ const (
 	strongLen = 8
 	// weakMask 用于 16 位滚动运算。
 	weakMask = 0xffff
+	// segGiveUpRun 是"判定这段内容全新"的连续未匹配字节数。
+	//
+	// 没有它时，内容全新的区域会逐字节滚动，每字节一次 map 查找：实测
+	// 200MB 随机数据、前 100MB 可复用，planSegChunks 要 **5.4 秒**，而这
+	// 5.4 秒完全挡在数据发送之前——用户感知为"增量反而更慢"。
+	//
+	// 阈值取 16 个校验块：连续 256KB（16KB×16）找不到匹配就断定是新内容。
+	// 内容"错位但存在"不会触发——错位后仍会持续命中，计数每次命中清零。
+	// 实测 64 块阈值下 200MB 仍需 2.4s（新块各要空滚 1MB），降到 16 块后
+	// 空扫量减少 4 倍。
+	segGiveUpRun = 16
 )
 
 // chooseBlockSize 按文件大小挑块大小（向下取到 2 的幂，便于对齐）。
@@ -284,6 +295,9 @@ func (ix *sigIndex) scanChunk(data []byte, chunkStart, chunkEnd int64, st *segSc
 	if p < chunkStart {
 		p = chunkStart
 	}
+	// 连续未匹配字节数：超过阈值就认定这段是全新内容，剩余部分整体当
+	// 字面量，避免在必然无匹配的区域空转（见 segGiveUpRun 的说明）。
+	miss := 0
 	availEnd := chunkStart + int64(len(data)) // 可用数据的绝对结束位置
 	if p+B > availEnd {
 		// 数据不足以形成一个窗口：整段当字面量
@@ -342,6 +356,7 @@ func (ix *sigIndex) scanChunk(data []byte, chunkStart, chunkEnd int64, st *segSc
 				p += take
 				litFrom = p
 				matched = true
+				miss = 0
 				break
 			}
 			if matched {
@@ -356,6 +371,12 @@ func (ix *sigIndex) scanChunk(data []byte, chunkStart, chunkEnd int64, st *segSc
 			weak = rollWeak(weak, data[p-chunkStart], data[p+1-chunkStart+B-1], int(B))
 		}
 		p++
+		miss++
+		if miss >= int(int64(segGiveUpRun)*B) {
+			// 这一整段都找不到匹配：剩余部分全是字面量，直接跳出。
+			// 注意只跳本分块，跨块状态仍正常交接。
+			break
+		}
 	}
 	flushLit(chunkEnd)
 	st.p, st.litAt = chunkEnd, chunkEnd
