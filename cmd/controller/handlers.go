@@ -179,6 +179,44 @@ func (c *controller) bestProto(from, to api.NodeID, fallback string) string {
 }
 
 // pushProto 给出优先拨号协议：有探测边就用探测结果，否则默认 quic。
+// resolveOrFail 把请求里的节点名解析成 node_id。失败时**把候选写进错误
+// 信息**，让调用方（尤其是 AI）能在同一轮里改正参数重试，而不是再查一次。
+//
+// 返回 false 表示已写响应，调用方直接 return。
+func (c *controller) resolveOrFail(w http.ResponseWriter, raw string, field string) (api.NodeID, bool) {
+	res := c.graph.Resolve(raw)
+	if res.ID != "" && res.Online {
+		return res.ID, true
+	}
+	if res.Ambiguous {
+		ids := make([]string, len(res.Candidates))
+		for i, id := range res.Candidates {
+			ids[i] = string(id)
+		}
+		http.Error(w, fmt.Sprintf("%s %q 有多个匹配，请指定其中之一：%s",
+			field, raw, strings.Join(ids, ", ")), http.StatusConflict)
+		return "", false
+	}
+	if res.ID != "" && !res.Online {
+		http.Error(w, fmt.Sprintf("%s %q 已解析为 %s，但该节点当前离线",
+			field, raw, res.ID), http.StatusUnprocessableEntity)
+		return "", false
+	}
+	online := c.graph.OnlineIDs()
+	ids := make([]string, len(online))
+	for i, id := range online {
+		ids[i] = string(id)
+	}
+	if len(ids) == 0 {
+		http.Error(w, fmt.Sprintf("%s %q 不存在：当前没有节点在线", field, raw),
+			http.StatusUnprocessableEntity)
+		return "", false
+	}
+	http.Error(w, fmt.Sprintf("%s %q 不存在；在线节点：%s（也可用主机名或 IP）",
+		field, raw, strings.Join(ids, ", ")), http.StatusUnprocessableEntity)
+	return "", false
+}
+
 func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, ca.RoleAdmin) {
 		c.event("forbidden", clientRole(r), "push")
@@ -193,6 +231,12 @@ func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dst/dst_path required", http.StatusBadRequest)
 		return
 	}
+	// 宽松解析：允许写主机名或 IP，省掉调用方"先查名字"的那一轮往返
+	dstID, ok := c.resolveOrFail(w, req.Dst, "dst")
+	if !ok {
+		return
+	}
+	req.Dst = string(dstID)
 	if req.SHA256 == "" || req.Size < 0 {
 		http.Error(w, "sha256/size required", http.StatusBadRequest)
 		return
@@ -418,7 +462,12 @@ func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	// 于是 ff get 永远失败（一直被误认为密钥问题）。
 	path := c.graph.Path(se.Src, dst)
 	if path == nil || len(path) < 2 {
-		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
+		// 把两端各自的出边写进错误：AI/人不用再跑 status 去猜为什么不通
+		http.Error(w, fmt.Sprintf("no path %s -> %s（%s 出边: %s；%s 出边: %s）",
+			se.Src, dst,
+			se.Src, strings.Join(c.graph.Neighbors(se.Src), ","),
+			dst, strings.Join(c.graph.Neighbors(dst), ",")),
+			http.StatusUnprocessableEntity)
 		return
 	}
 	hops := make([]api.Hop, 0, len(path))
@@ -828,6 +877,21 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// 宽松解析两端：允许写主机名或 IP
+	srcID, ok := c.resolveOrFail(w, req.Src, "src")
+	if !ok {
+		return
+	}
+	dstID, ok := c.resolveOrFail(w, req.Dst, "dst")
+	if !ok {
+		return
+	}
+	if srcID == dstID {
+		http.Error(w, "src 与 dst 是同一个节点；本机到本机请用 ffctl put（源在本机）",
+			http.StatusBadRequest)
+		return
+	}
+	req.Src, req.Dst = string(srcID), string(dstID)
 	path := c.graph.Path(req.Src, req.Dst)
 	if (path == nil || len(path) < 2) && c.trySwitch(w, req) {
 		return // 走交换台模式（响应已写）

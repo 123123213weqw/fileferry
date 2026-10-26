@@ -15,6 +15,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -200,7 +201,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "目标格式应为 node:/path")
 			os.Exit(2)
 		}
-		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, streams, protoSel, noWait); err != nil {
+		if err := runPut(cl, certDir, localPath, dstNode, dstPath, rateBps, streams, protoSel, noWait, jsonOut); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -368,7 +369,7 @@ func dataPlaneTLS(certDir string) (*tls.Config, error) {
 // 完整性：授权里带 FileSHA256/FileSize（controller 签名钉死），接收端
 // 校验 manifest 与之一致，且逐块 SHA256——与节点间传输同一套保证。
 // 权限：目标节点的 allowed-dirs 白名单照常生效。
-func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, streams int, protoSel string, noWait bool) error {
+func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps int64, streams int, protoSel string, noWait, jsonOut bool) error {
 	fi, err := os.Stat(localPath)
 	if err != nil {
 		return fmt.Errorf("读本机文件失败：%w", err)
@@ -393,7 +394,9 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 	}, &grant); err != nil {
 		return fmt.Errorf("申请推送授权失败：%w", err)
 	}
-	fmt.Printf("已授权 %s：本机 -> %s:%s（%d 字节）\n", grant.ID, grant.Dst, grant.DstPath, fi.Size())
+	if !jsonOut {
+		fmt.Printf("已授权 %s：本机 -> %s:%s（%d 字节）\n", grant.ID, grant.Dst, grant.DstPath, fi.Size())
+	}
 
 	if noWait {
 		fmt.Println("（-nowait 对 put 无效：推送由本进程完成，必须等待）")
@@ -473,6 +476,16 @@ func runPut(cl *api.Client, certDir, localPath, dstNode, dstPath string, rateBps
 		return fmt.Errorf("推送失败（%v 均不可用）：%w", protos, lastE)
 	}
 	mbps := float64(n) / (1 << 20) / el.Seconds()
+	if jsonOut {
+		// 机器可读：单行、短键。给 agent/脚本用，比人读的句子省 token
+		// 也更好解析（不必正则解析中文）。
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"ok": true, "dst": grant.DstPath, "bytes": n,
+			"secs":   math.Round(el.Seconds()*1000) / 1000,
+			"mbps":   math.Round(mbps*10) / 10,
+			"sha256": sum,
+		})
+	}
 	fmt.Printf("完成：%s（%d 字节，%.2fs，%.0f MB/s，SHA256 %s…）\n",
 		grant.DstPath, n, el.Seconds(), mbps, sum[:12])
 	return nil

@@ -58,6 +58,59 @@ internal/topology 有向可达图 + 负载加权选链
 internal/transfer QUIC 分块传输 / 断点续传 / 中继
 ```
 
+## 给 AI agent 用：token 成本与往返次数
+
+先说结论：**MCP schema 不是主要成本，往返次数才是。**
+
+实测（4 个工具，中文描述）：
+
+| 项 | token | 什么时候付 |
+|---|---|---|
+| tools/list schema | **297** | 每次对话一次 |
+| `ff_status` 输出 | ~35 | 每次调用 |
+| `ffctl put` 输出 | ~48 | 每次调用 |
+| `ffctl -json put` 输出 | ~45（纯 JSON，好解析） | 每次调用 |
+
+一次工具调用的**结果**很便宜；但每多一轮往返，整段对话都要重新输入一遍。
+所以优化的目标是**别让 agent 多绕一圈**：
+
+### 1. 直接写主机名或 IP，不用先查名字
+
+```bash
+ffctl put ./x.bin 10.0.0.5:/data/x.bin     # IP
+ffctl put ./x.bin web-01:/data/x.bin       # 主机名
+ffctl put ./x.bin beta:/data/x.bin         # node_id（旧写法，仍然可用）
+```
+
+服务端按 `node_id → 主机名 → IP` 顺序解析（只考虑在线节点）。
+
+### 2. 报错自带可选项，改一个参数就能重试
+
+```
+dst "nosuch" 不存在；在线节点：alpha, beta（也可用主机名或 IP）
+dst "web-01" 有多个匹配，请指定其中之一：alpha, beta
+no path alpha -> beta（alpha 出边: ; beta 出边: gamma）
+```
+
+对比一下「node not found」——agent 只能再调一次 status 才知道有哪些节点。
+
+> 歧义时不猜。同一台机器跑多个 agent 时（主机名/IP 相同）会要求显式指定，
+> 因为传错文件比报错更难排查。
+
+### 3. 机器可读输出
+
+```bash
+ffctl -json put ./x.bin beta:/data/x.bin
+{"bytes":1048624,"dst":"/data/x.bin","mbps":68.4,"ok":true,"secs":0.015,"sha256":"2666…"}
+```
+
+单行、短键、无中文句子——不用正则解析，也省 token。
+
+### 4. schema 本身也压过一轮
+
+旧版 4 个工具 ≈ 420 token，现在 ≈ 297（-29%）。删掉的是"重装/重启不变"
+这类安抚性说明——那属于文档，不该出现在每次对话都要读的接口描述里。
+
 ## 当作 MCP 服务器用（AI agent 原生工具）
 
 `ffmcp` 把传输能力封装为 MCP（Model Context Protocol）工具，ZCode /

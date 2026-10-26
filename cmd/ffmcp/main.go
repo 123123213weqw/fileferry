@@ -143,50 +143,43 @@ func textErr(s string) callResult {
 }
 
 func tools() []toolDef {
-	str := func(items ...string) map[string]any { // {"type":"string",...枚举/描述}
-		m := map[string]any{"type": "string"}
-		if len(items) == 1 {
-			m["description"] = items[0]
-		}
-		return m
-	}
-	_ = str
+	// 工具描述刻意写得短。理由：schema 是**每对话都付一次**的固定成本
+	// （实测旧版 4 个工具 ≈420 token），而真正的语义只需几句话。
+	// 被删掉的是"重装/重启不变"这类安抚性说明——那属于文档，不属于
+	// 每次对话都要读的接口描述。
 	return []toolDef{
 		{
 			Name: "ff_send",
-			Description: "跨服务器按需传输文件（自动选路：直连/中继/交换台）。默认阻塞到完成。" +
-				"路径格式 <节点名>:/绝对路径。节点名是部署时固定的稳定名字（agent.yaml 的 node-name），" +
-				"重装/重启不变，可安全写进脚本；不确定时先用 ff_status 查（返回 node_id/hostname/addr，" +
-				"可按 hostname 或 IP 反查 node_id）。目标写目录（以 / 结尾）会自动补源文件名。",
+			Description: "在节点间传文件。src/dst 形如 node:/路径，node 可写节点名、主机名或 IP。" +
+				"目标以 / 结尾则自动补源文件名。默认阻塞到完成。",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"src":    map[string]any{"type": "string", "description": "源 node:/绝对路径"},
-					"dst":    map[string]any{"type": "string", "description": "目的 node:/绝对路径（目录需在目标机白名单内）"},
-					"nowait": map[string]any{"type": "boolean", "description": "true=只入队立即返回（默认等待完成）"},
+					"dst":    map[string]any{"type": "string", "description": "目的 node:/路径"},
+					"nowait": map[string]any{"type": "boolean", "description": "true=只入队不等"},
 				},
 				"required": []string{"src", "dst"},
 			},
 		},
 		{
-			Name: "ff_status",
-			Description: "查看舰队：在线节点（node_id 即传输用的节点名）、主机名、CPU/内存、" +
-				"探测边（延迟/协议）。传输前用它把主机名或 IP 映射到 node_id。",
+			Name:        "ff_status",
+			Description: "列出在线节点（名字/主机名/IP/负载）。仅在需要挑节点或排查时用——ff_send 能直接吃主机名和 IP。",
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
 			Name:        "ff_jobs",
-			Description: "查询近期传输任务与状态（done/failed/queued）。",
+			Description: "查最近传输任务（done/failed/queued）。",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"id": map[string]any{"type": "string", "description": "可选，精确查某任务"},
+					"id": map[string]any{"type": "string", "description": "可选，查单个"},
 				},
 			},
 		},
 		{
 			Name:        "ff_token",
-			Description: "铸造一次性入网令牌（ff_enroll_…）。需管理员把它加入 controller 配置后，新服务器才能入网。",
+			Description: "铸造一次性入网令牌（管理员加入 controller 配置后新节点才能入网）。",
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 	}
