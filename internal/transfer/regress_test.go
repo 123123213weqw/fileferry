@@ -745,7 +745,7 @@ func TestRegressProgressSmoothDuringSlowWrite(t *testing.T) {
 	// 模拟一个"每次 Write 耗时 40ms"的慢流
 	slow := &slowWriter{perWrite: 40 * time.Millisecond}
 	rt := newTaskRate(0) // 不限速，只观察计数
-	cw := &countingWriter{w: slow, rate: rt}
+	cw := &countingWriter{w: slow, rate: rt, progress: true}
 
 	var seen []int64
 	var mu sync.Mutex

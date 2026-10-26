@@ -23,7 +23,8 @@ import (
 type taskRate struct {
 	mu    sync.Mutex
 	limit int64
-	sent  int64
+	sent  int64 // 线缆字节（限速与吞吐统计用）
+	done  int64 // 逻辑字节（进度用；增量传输时远大于 sent）
 	start time.Time
 }
 
@@ -140,10 +141,14 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 // 总块数判定完成（而非哨兵计数），重放旧流只会重复写相同块，无害。
 type Manifest struct {
 	GrantID string `json:"grant_id"`
-	SHA256  string `json:"sha256"`
-	Size    int64  `json:"size"`
-	CertB64 string `json:"cert"` // 源端证书 DER
-	SigB64  string `json:"sig"`  // ed25519 签名 over grantID|sha256|size
+	// Cap 是发送端能力声明。目前只用于告诉接收端"我能处理分段帧"。
+	// 放在这里而不是新开一行是刻意的：旧接收端会忽略未知 JSON 字段，
+	// 所以在 FFJ1 头里多加一行会让旧接收端把它当帧数据读，直接崩坏。
+	Cap     []string `json:"cap,omitempty"`
+	SHA256  string   `json:"sha256"`
+	Size    int64    `json:"size"`
+	CertB64 string   `json:"cert"` // 源端证书 DER
+	SigB64  string   `json:"sig"`  // ed25519 签名 over grantID|sha256|size
 }
 
 func manifestPayload(grantID, sha string, size int64) []byte {
@@ -172,6 +177,7 @@ func BuildManifest(grantID, path string, tlsConf *tls.Config) (*Manifest, error)
 	}
 	m := &Manifest{
 		GrantID: grantID,
+		Cap:     []string{"seg"},
 		SHA256:  hex.EncodeToString(h.Sum(nil)),
 		Size:    size,
 		CertB64: base64.StdEncoding.EncodeToString(cert.Certificate[0]),
@@ -294,6 +300,9 @@ const progressWriteSlice = 64 << 10
 type countingWriter struct {
 	w    io.Writer
 	rate *taskRate
+	// progress=false 时只计线缆字节与限速，不推进逻辑进度
+	// （增量帧的进度由调用方按整块长度单独 advance）。
+	progress bool
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
@@ -308,6 +317,9 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 			total += n
 			if c.rate != nil {
 				c.rate.take(int64(n))
+				if c.progress {
+					c.rate.advance(int64(n))
+				}
 			}
 		}
 		if err != nil {
@@ -347,13 +359,18 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	have := map[int64]bool{}
 	// 增量：接收端已有文件的「块哈希 → 偏移」。命中就发引用帧，不传数据。
 	var reuseIdx map[string]int64
+	// 滚动校验签名索引（rsync 风格）：可在**任意偏移**上匹配，块小得多，
+	// 所以错位和 4KB 小改都能只传改动部分。
+	var sigIdx *sigIndex
 	reusedBlocks := 0
+	segFrames := 0
+	var segSaved int64
 	if rd, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
 		// 15s 而不是 3s：接收端发 HAVE 前要扫描已有文件算分块哈希（增量
 		// 协商），大文件可能要一两秒；3 秒会直接放弃协商，增量永远不生效。
 		// 旧版接收端会立刻回 HAVE，不会让正常路径变慢。
-		rd.SetReadDeadline(time.Now().Add(15 * time.Second))
-		line, lerr := readLine(stream)
+		rd.SetReadDeadline(time.Now().Add(30 * time.Second))
+		line, lerr := readLineMax(stream, haveLineMax)
 		if os.Getenv("FF_DEBUG_HAVE") != "" {
 			n := len(line)
 			head := line
@@ -364,23 +381,45 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 		}
 		tracef("[tl] %s 流%d HAVE读取完成 err=%v", grant.ID, r, lerr)
 		if lerr == nil && strings.HasPrefix(line, "HAVE ") {
-			// 行格式：HAVE <bits> [<reuse>]
-			// 旧版接收端只有 bits 段；旧版发送端读到带 reuse 的行会
-			// base64 解码失败 → 位图为空 → 全量发送（正确但无优化）。
-			rest := strings.TrimPrefix(line, "HAVE ")
-			if sp := strings.IndexByte(rest, ' '); sp >= 0 {
-				if rt := decodeReuseTable(rest[sp+1:]); rt != nil {
-					reuseIdx = rt.index()
-				}
-				rest = rest[:sp]
+			// 行格式演进（全部向后兼容）：
+			//   HAVE <bits>                      最早版本：只有续传位图
+			//   HAVE <bits> <reuse>              上一版：整块复用表
+			//   HAVE <bits> - <sig>              本版：rsync 风格签名
+			//   HAVE <bits> - -                  本版：签名在同一 grant 的
+			//                                    另一条流上（只发一次以省带宽）
+			fields := strings.Split(strings.TrimPrefix(line, "HAVE "), " ")
+			var reuseStr, sigStr string
+			if len(fields) > 1 {
+				reuseStr = fields[1]
 			}
-			if bits, err := base64.StdEncoding.DecodeString(rest); err == nil {
+			if len(fields) > 2 {
+				sigStr = fields[2]
+			}
+			if bits, derr := base64.StdEncoding.DecodeString(fields[0]); derr == nil {
 				for i := 0; i*8 < len(bits); i++ {
 					for b := 0; b < 8; b++ {
 						if bits[i]&(1<<b) != 0 {
 							have[int64(i*8+b)] = true
 						}
 					}
+				}
+			}
+			switch {
+			case sigStr != "" && sigStr != "-":
+				if sig := decodeSignature(sigStr); sig != nil {
+					sigIdx = sig.index()
+					putSigIndex(grant.ID, sigIdx)
+				}
+			case sigStr == "-":
+				// 接收端明确表示"本流不带签名"：签名在另一条流上。
+				// 只有这种情况才需要等，否则（目标不存在/旧版对端）
+				// 绝不能等——实测会把首传白白拖慢 3 秒。
+				if ix := getSigIndex(grant.ID, 3*time.Second); ix != nil {
+					sigIdx = ix
+				}
+			case reuseStr != "" && reuseStr != "-":
+				if rt := decodeReuseTable(reuseStr); rt != nil {
+					reuseIdx = rt.index()
 				}
 			}
 		}
@@ -401,12 +440,35 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 			// 就不传数据，只发 8 字节偏移。
 			if len(reuseIdx) > 0 {
 				if off, ok := reuseIdx[blockHash(data)]; ok {
-					cw := &countingWriter{w: stream, rate: rate}
+					cw := &countingWriter{w: stream, rate: rate, progress: false}
 					if err := WriteRefFrame(cw, idx, off); err != nil {
 						return err
 					}
+					rate.advance(int64(len(data)))
 					reusedBlocks++
 					continue
+				}
+			}
+			// rsync 风格分段：用滚动校验在**任意偏移**上找匹配，把本块表达成
+			// 「从接收端旧文件拷贝若干段 + 少量字面量」。只有编码比原文更小时
+			// 才值得发（内容全新时立刻回退普通帧）。
+			// 加密传输（share/get 的密钥专递）时禁用分段帧：
+			// 分段帧里的**字面量**是明文，若照发就会绕过端到端加密。
+			// 引用/复用帧不涉及明文（只搬接收端自己的数据），仍可用。
+			if sigIdx != nil && enc == nil {
+				if ops := sigIdx.buildSegOps(data); len(ops) > 0 {
+					payload := encodeSegOps(data, ops)
+					if len(payload) < len(data) {
+						cw := &countingWriter{w: stream, rate: rate, progress: false}
+						if err := WriteSegFrame(cw, idx, payload); err != nil {
+							return err
+						}
+						// 逻辑进度按整块推进：增量帧的线缆字节远少于块长度
+						rate.advance(int64(len(data)))
+						segFrames++
+						segSaved += int64(len(data) - len(payload))
+						continue
+					}
 				}
 			}
 			if enc != nil {
@@ -419,7 +481,7 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 			// 13 秒。按块计数的话，前 6 秒进度是 0、进度条按 20% 跳，
 			// 停滞检测也会把"正在稳定慢传"误判成"完全没动"（实测日志
 			// 打出 "quic 太慢（0 KB/s）"，其实是 300KB/s 在稳定推进）。
-			cw := &countingWriter{w: stream, rate: rate}
+			cw := &countingWriter{w: stream, rate: rate, progress: true}
 			if err := WriteFrame(cw, idx, data); err != nil {
 				return err
 			}
@@ -439,6 +501,10 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	if reusedBlocks > 0 {
 		log.Printf("[tl] %s 流%d 增量：%d 块由接收端本地复用（省 %d 字节）",
 			grant.ID, r, reusedBlocks, int64(reusedBlocks)*int64(ChunkSize))
+	}
+	if segFrames > 0 {
+		log.Printf("[tl] %s 流%d 滚动匹配：%d 块走分段帧（省 %d 字节）",
+			grant.ID, r, segFrames, segSaved)
 	}
 	ack := make([]byte, 4)
 	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {

@@ -96,6 +96,11 @@ func (t *taskRate) sentBytes() int64 {
 }
 
 // take 记录本次发送字节数，并按整任务平均速率补睡（limit<=0 不睡）。
+// take 计入**线缆字节**并执行限速，不推进进度。
+//
+// 进度必须单独走 advance()：增量传输（引用帧/分段帧）传输字节远少于
+// 逻辑字节，若用线缆字节当进度，进度条会永远到不了 100%，停滞检测
+// 还会把"只传了 4% 就发完"误判成"慢"。
 func (t *taskRate) take(n int64) {
 	if t == nil || n <= 0 {
 		return
@@ -105,7 +110,7 @@ func (t *taskRate) take(n int64) {
 	sent := t.sent
 	limit := t.limit
 	t.mu.Unlock()
-	emitProgress(sent)
+	_ = sent
 	if limit <= 0 {
 		return
 	}
@@ -113,6 +118,18 @@ func (t *taskRate) take(n int64) {
 	if ahead := want - time.Since(t.start); ahead > 0 {
 		time.Sleep(ahead)
 	}
+}
+
+// advance 推进**逻辑进度**（已完成的明文分块字节数）并回调 CLI。
+func (t *taskRate) advance(n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.done += n
+	done := t.done
+	t.mu.Unlock()
+	emitProgress(done)
 }
 
 // spreadPorts 是"端口未知"时允许探测的候选偏移。之前固定扫 13 个
@@ -571,10 +588,17 @@ func readHeaderLine(br *bufio.Reader) (string, error) {
 	}
 }
 
-func readLine(r io.Reader) (string, error) {
+func readLine(r io.Reader) (string, error) { return readLineMax(r, 8192) }
+
+// readLineMax 是 readLine 的可设上限版本。
+//
+// HAVE 行在增量协商里可能很大（签名 = 块数×12 字节，100MB 文件约 77KB）。
+// 上限放大是安全的：这是 mTLS 认证后的数据面，对端是已知节点，且
+// sigMaxBlocks 已经把块数封住，行长度有确定上界。
+func readLineMax(r io.Reader, max int) (string, error) {
 	var sb []byte
 	one := make([]byte, 1)
-	for len(sb) < 8192 {
+	for len(sb) < max {
 		if _, err := io.ReadFull(r, one); err != nil {
 			return "", err
 		}
@@ -585,3 +609,7 @@ func readLine(r io.Reader) (string, error) {
 	}
 	return "", fmt.Errorf("line too long")
 }
+
+// haveLineMax 是 HAVE 行的上限：足够容纳最大签名（sigMaxBlocks×12 字节
+// 再 base64），又不至于无界。
+const haveLineMax = 4 << 20

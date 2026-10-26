@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,18 +50,44 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		// 据此跳过相同块。旧版发送端会因整行 base64 解码失败而退化为
 		// 全量发送，行为仍然正确。
 		g.reuseOnce.Do(func() {
-			reuse := buildReuseTable(g.dstPath, grant.ChunkSize)
-			g.reuseEnc = reuse.encode()
-			if g.reuseEnc != "" {
-				// 这行对用户有意义（决定了要传多少），始终输出
-				log.Printf("%s 增量协商：目标已有 %d 块可复用（%d 字节）",
-					grant.ID, len(reuse.Blocks), reuse.Size)
+			// 发送端声明支持分段帧时，改用 rsync 风格签名：块更小、
+			// 且可由发送端在**任意偏移**上滚动匹配，能处理错位。
+			// 不支持的话退回上一版的整块复用表（只认 4MB 对齐）。
+			if hasCap(mf.Cap, "seg") {
+				st, serr := os.Stat(g.dstPath)
+				if serr == nil && st.Mode().IsRegular() && st.Size() > 0 {
+					bs := chooseBlockSize(st.Size())
+					if sig, err := buildSignature(g.dstPath, bs); err == nil {
+						g.sigEnc = sig.encode()
+						if g.sigEnc != "" {
+							log.Printf("%s 增量协商：旧文件 %d 字节，按 %d 字节分块生成 %d 块签名",
+								grant.ID, st.Size(), bs, sig.Count)
+						}
+					}
+				}
+			}
+			if g.sigEnc == "" {
+				reuse := buildReuseTable(g.dstPath, grant.ChunkSize)
+				g.reuseEnc = reuse.encode()
+				if g.reuseEnc != "" {
+					log.Printf("%s 增量协商：目标已有 %d 块可复用（%d 字节）",
+						grant.ID, len(reuse.Blocks), reuse.Size)
+				}
 			}
 		})
-		if g.reuseEnc != "" {
-			fmt.Fprintf(stream, "HAVE %s %s\n", base64.StdEncoding.EncodeToString(g.haveBits()), g.reuseEnc)
-		} else {
-			fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
+		bits := base64.StdEncoding.EncodeToString(g.haveBits())
+		// 只有第一条流带完整签名；其余用 "-" 占位，发送端从共享缓存取。
+		sendSig := g.sigEnc != "" && g.sigSent.CompareAndSwap(false, true)
+		switch {
+		case sendSig:
+			// 第三字段是签名；第二字段填 "-" 占位（保持字段位稳定）
+			fmt.Fprintf(stream, "HAVE %s - %s\n", bits, g.sigEnc)
+		case g.sigEnc != "":
+			fmt.Fprintf(stream, "HAVE %s - -\n", bits)
+		case g.reuseEnc != "":
+			fmt.Fprintf(stream, "HAVE %s %s\n", bits, g.reuseEnc)
+		default:
+			fmt.Fprintf(stream, "HAVE %s\n", bits)
 		}
 		// 必须立刻清掉这个写超时：它会把**后面所有写**（尤其末尾的
 		// ACK）都限制在 5 秒内。实测限速 1MB/s 传 5MB 时，接收端写
@@ -147,6 +174,10 @@ type recvGroup struct {
 	// 每个并行流各扫一遍会成倍放大（4 流 × 100MB）。只算一次。
 	reuseOnce sync.Once
 	reuseEnc  string
+	sigEnc    string // rsync 风格签名（与 reuseEnc 二选一）
+	// sigSent 保证签名只随**第一条**流发出：HAVE 是每流各发一次的，
+	// 4 条流各带 102KB 签名就是 410KB 下行（实测比 rsync 的校验量还大）。
+	sigSent atomic.Bool
 }
 
 // ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
@@ -336,6 +367,40 @@ func (g *recvGroup) hasChunk(idx int64) bool {
 
 // feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
 // deckey 非空时先解密（端到端加密）。
+// storeBlock 写入一个已就绪的明文分块，并推进进度/完成判定。
+//
+// 抽出来是因为三条路径（普通帧、引用帧、分段帧）的落盘逻辑必须完全一致，
+// 否则会出现"某种帧永远不触发落盘"这类只在特定路径复现的问题。
+func (g *recvGroup) storeBlock(idx int64, data []byte) error {
+	if _, err := g.tmp.WriteAt(data, idx*int64(ChunkSize)); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	first := !g.got[idx]
+	if first {
+		g.got[idx] = true
+		g.dirty++
+	}
+	needFlush := g.dirty >= 8 || len(g.got) == int(g.expected)
+	pending := g.dirty
+	if needFlush {
+		g.dirty = 0
+	}
+	done := len(g.got) == int(g.expected) && !g.done
+	if done {
+		g.done = true
+	}
+	g.mu.Unlock()
+	if needFlush {
+		g.saveProgress()
+	}
+	if done {
+		g.finalize()
+	}
+	_ = pending
+	return nil
+}
+
 // fillFromLocal 用**本机已有文件**里的一段内容填充第 idx 块（增量）。
 //
 // 这是"引用"而不是"传输"：数据从旧文件直接搬到临时文件，不过网络、
@@ -421,6 +486,38 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 				g.finalize()
 			}
 			return nil
+		}
+		// 分段帧：负载是「从本机旧文件拷贝若干段 + 少量字面量」的指令流，
+		// 由发送端用滚动校验在任意偏移上匹配得到。重建后校验分块哈希，
+		// 因此不需要走解密路径（负载本身不含明文分块内容）。
+		if isSegFrame(idx) {
+			realIdx := int64(uint32(idx) &^ (segFlag | refFlag))
+			g.mu.Lock()
+			expected := g.expected
+			size := g.size
+			g.mu.Unlock()
+			if realIdx < 0 || realIdx >= expected {
+				return fmt.Errorf("分段帧块号 %d 超出范围 [0,%d)", realIdx, expected)
+			}
+			chunkLen := int64(ChunkSize)
+			if (realIdx+1)*int64(ChunkSize) > size {
+				chunkLen = size - realIdx*int64(ChunkSize)
+			}
+			path := g.dstPath
+			rebuilt, err := decodeSegOps(data, int(chunkLen), func() (io.ReaderAt, func(), error) {
+				f, ferr := os.Open(path)
+				if ferr != nil {
+					return nil, nil, ferr
+				}
+				return f, func() { f.Close() }, nil
+			})
+			if err != nil {
+				return fmt.Errorf("重建分块 %d 失败: %w", realIdx, err)
+			}
+			if err := g.storeBlock(realIdx, rebuilt); err != nil {
+				return err
+			}
+			continue
 		}
 		// 增量引用帧：数据段是 8 字节源偏移，内容取自本机**已有文件**，
 		// 不经过网络也不经过加密层。
