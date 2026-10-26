@@ -340,3 +340,271 @@ func TestMergedOpsStillReconstruct(t *testing.T) {
 		}
 	}
 }
+
+// scanInChunks 模拟发送端行为：按固定分块调用 scanChunk。
+//
+// lookahead=true 时额外提供 B-1 字节前视；useState=true 时扫描状态跨块延续。
+// 两者是**独立**的优化，必须分开测——我第一版把两者混在一起，用「插入 1
+// 字节」构造，结果前视一项就把字面量降到 15 字节，跨块状态根本没被验证到
+// （回退状态后测试照样通过）。
+func scanInChunks(t *testing.T, ix *sigIndex, data []byte, chunkSize int, lookahead, useState bool) (litBytes int) {
+	t.Helper()
+	B := ix.blockSize
+	st := &segScanState{}
+	for start := 0; start < len(data); start += chunkSize {
+		end := start + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		avail := end
+		if lookahead {
+			avail = end + B - 1
+			if avail > len(data) {
+				avail = len(data)
+			}
+		}
+		if !useState {
+			// 每块从零开始（旧行为）
+			st = &segScanState{p: int64(start), litAt: int64(start)}
+		}
+		for _, op := range ix.scanChunk(data[start:avail], int64(start), int64(end), st) {
+			if op.op == opLit {
+				litBytes += op.length
+			}
+		}
+	}
+	return
+}
+
+// 跨分块连续扫描的价值：错位量大时，每块开头「凑不满一个校验块」的浪费消失。
+//
+// 用 B/2 的插入量，这样「仅前视」仍会在每块开头浪费约 B/2 字节，
+// 而「前视 + 跨块状态」几乎不浪费。
+func TestCrossChunkScanRemovesBoundaryWaste(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	const B = 1024
+	oldData := make([]byte, 256*B)
+	rng.Read(oldData)
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "old.bin")
+	os.WriteFile(p, oldData, 0o600)
+	sig, err := buildSignature(p, B)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix := sig.index()
+
+	// 插入 B/2 字节（大错位），在 37 块处
+	const shift = B / 2
+	ins := append([]byte{}, oldData[:37*B]...)
+	ins = append(ins, bytes.Repeat([]byte{0x77}, shift)...)
+	ins = append(ins, oldData[37*B:]...)
+
+	const chunkSize = 16 * B // 16KB 分块
+
+	base := scanInChunks(t, ix, ins, chunkSize, false, false) // 旧行为
+	look := scanInChunks(t, ix, ins, chunkSize, true, false)  // 仅加前视
+	cross := scanInChunks(t, ix, ins, chunkSize, true, true)  // 前视 + 跨块状态
+
+	t.Logf("字面量：旧行为 %d / 仅前视 %d / 前视+跨块 %d（数据 %d）", base, look, cross, len(ins))
+
+	if cross >= look {
+		t.Fatalf("跨块状态应比「仅前视」更省：%d vs %d（每块约浪费 B/2=%d 字节）", cross, look, B/2)
+	}
+	// 插入 shift 字节，理想情况下字面量只有 shift 附近几十字节
+	if cross > 4*shift {
+		t.Fatalf("字面量应接近插入量（%d），实际 %d", shift, cross)
+	}
+	if look <= base/2 {
+		t.Fatalf("构造无效：仅前视不该把字面量从 %d 降到 %d，否则测不出跨块状态的贡献", base, look)
+	}
+}
+
+// scanChunkOps 与 scanInChunks 相同但返回每块指令（前视 + 跨块状态全开）。
+func scanChunkOps(t *testing.T, ix *sigIndex, data []byte, chunkSize int) [][]segOp {
+	t.Helper()
+	B := ix.blockSize
+	st := &segScanState{}
+	var all [][]segOp
+	for start := 0; start < len(data); start += chunkSize {
+		end := start + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		avail := end + B - 1
+		if avail > len(data) {
+			avail = len(data)
+		}
+		all = append(all, ix.scanChunk(data[start:avail], int64(start), int64(end), st))
+	}
+	return all
+}
+
+// 跨块扫描必须仍能正确重建（这是最容易写出错位 bug 的地方）。
+func TestCrossChunkScanReconstructs(t *testing.T) {
+	rng := rand.New(rand.NewSource(12))
+	const B = 512
+	oldData := make([]byte, 128*B)
+	rng.Read(oldData)
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "old.bin")
+	os.WriteFile(p, oldData, 0o600)
+	sig, _ := buildSignature(p, B)
+	ix := sig.index()
+
+	variants := map[string][]byte{
+		"ins": append(append(append([]byte{}, oldData[:5*B+7]...), 0xAB), oldData[5*B+7:]...),
+		"del": append(append([]byte{}, oldData[:9*B]...), oldData[9*B+33:]...),
+		"mix": append(append(append([]byte{}, oldData[:3*B]...), bytes.Repeat([]byte{0x11}, 50)...), oldData[7*B:]...),
+	}
+	const chunkSize = 16 * B
+
+	for name, want := range variants {
+		opsByChunk := scanChunkOps(t, ix, want, chunkSize)
+		// 逐块重建并拼接，验证与目标完全一致
+		var got []byte
+		for i, ops := range opsByChunk {
+			start := i * chunkSize
+			end := start + chunkSize
+			if end > len(want) {
+				end = len(want)
+			}
+			chunk := want[start:end]
+			payload := encodeSegOps(chunk, ops)
+			rebuilt, err := decodeSegOps(payload, len(chunk), func() (io.ReaderAt, func(), error) {
+				f, _ := os.Open(p)
+				return f, func() { f.Close() }, nil
+			})
+			if err != nil {
+				t.Fatalf("%s 第 %d 块重建失败: %v", name, i, err)
+			}
+			got = append(got, rebuilt...)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: 跨块重建结果与目标不符", name)
+		}
+	}
+}
+
+// planSegChunks 必须让每个分块都能独立正确重建（这是多流场景的正确性前提）。
+//
+// 回归：上一版把扫描状态放在**流**里，而多流按 idx%n 交错分配分块，
+// 状态在不相邻的块之间传递导致编码错位——实测 4 流 × 100MB 的「插入 1 字节」
+// 场景里第 12~15 块重建哈希全部不符。这里用"每块独立重建"来卡住同类错误。
+func TestPlanSegChunksReconstructs(t *testing.T) {
+	rng := rand.New(rand.NewSource(21))
+	const B = 1024
+	// 用小于 ChunkSize 的假分块做验证：把 planSegChunks 的分块概念换成
+	// 手动逐块调用 scanChunk（跨块状态连续），等价于整文件预扫描。
+	oldData := make([]byte, 64*B)
+	rng.Read(oldData)
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "old.bin")
+	os.WriteFile(p, oldData, 0o600)
+	sig, _ := buildSignature(p, B)
+	ix := sig.index()
+
+	// 插入 B/2 字节造成大错位
+	shift := B / 2
+	want := append([]byte{}, oldData[:20*B]...)
+	want = append(want, bytes.Repeat([]byte{0x9}, shift)...)
+	want = append(want, oldData[20*B:]...)
+
+	const chunkSize = 8 * B
+	st := &segScanState{}
+	var got []byte
+	var litTotal int
+	for start := 0; start < len(want); start += chunkSize {
+		end := start + chunkSize
+		if end > len(want) {
+			end = len(want)
+		}
+		avail := end + B - 1
+		if avail > len(want) {
+			avail = len(want)
+		}
+		chunk := want[start:end]
+		ops := ix.scanChunk(want[start:avail], int64(start), int64(end), st)
+		for _, op := range ops {
+			if op.op == opLit {
+				litTotal += op.length
+			}
+		}
+		payload := encodeSegOps(chunk, ops)
+		rebuilt, err := decodeSegOps(payload, len(chunk), func() (io.ReaderAt, func(), error) {
+			f, _ := os.Open(p)
+			return f, func() { f.Close() }, nil
+		})
+		if err != nil {
+			t.Fatalf("块 %d 重建失败: %v（跨块编码错位的典型症状）", start/chunkSize, err)
+		}
+		got = append(got, rebuilt...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("逐块重建后拼接与目标不符")
+	}
+	if litTotal > 4*shift {
+		t.Fatalf("字面量应接近插入量 %d，实际 %d", shift, litTotal)
+	}
+}
+
+// planSegChunks 的真实入口：整文件扫一遍，每块都能重建。
+func TestPlanSegChunksEndToEnd(t *testing.T) {
+	rng := rand.New(rand.NewSource(22))
+	// 需要至少跨两个 ChunkSize 才能测到真实分块边界；为控制测试耗时，
+	// 这里只验证"每块负载都能重建"，分块大小沿用真实 ChunkSize。
+	size := int64(ChunkSize) + 100*1024 // 1 块 + 一小段
+	oldData := make([]byte, size)
+	rng.Read(oldData)
+
+	dir := t.TempDir()
+	pOld := filepath.Join(dir, "old.bin")
+	os.WriteFile(pOld, oldData, 0o600)
+	sig, err := buildSignature(pOld, 16<<10)
+	if err != nil {
+		t.Fatalf("签名构建失败: %v", err)
+	}
+	ix := sig.index()
+
+	// 新文件：在 50KB 处插 100 字节（大错位）
+	want := append([]byte{}, oldData[:50<<10]...)
+	want = append(want, bytes.Repeat([]byte{0x3}, 100)...)
+	want = append(want, oldData[50<<10:]...)
+	pNew := filepath.Join(dir, "new.bin")
+	os.WriteFile(pNew, want, 0o600)
+
+	f, _ := os.Open(pNew)
+	defer f.Close()
+	plan := planSegChunks(f, ix, int64(len(want)))
+	if plan == nil {
+		t.Fatal("应产生分段计划")
+	}
+	// 逐块用计划重建，必须与目标一致
+	var got []byte
+	for idx := int64(0); idx*int64(ChunkSize) < int64(len(want)); idx++ {
+		base := idx * int64(ChunkSize)
+		end := base + int64(ChunkSize)
+		if end > int64(len(want)) {
+			end = int64(len(want))
+		}
+		payload, ok := plan[idx]
+		if !ok {
+			got = append(got, want[base:end]...) // 该块走普通帧
+			continue
+		}
+		rebuilt, err := decodeSegOps(payload, int(end-base), func() (io.ReaderAt, func(), error) {
+			f2, _ := os.Open(pOld)
+			return f2, func() { f2.Close() }, nil
+		})
+		if err != nil {
+			t.Fatalf("块 %d 重建失败: %v", idx, err)
+		}
+		got = append(got, rebuilt...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("整文件按计划重建与目标不符")
+	}
+}

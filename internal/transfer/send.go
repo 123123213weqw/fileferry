@@ -426,6 +426,19 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	}
 
 	buf := make([]byte, ChunkSize)
+	// 增量计划：整文件预扫描一次（跨分块连续匹配），各流只查表。
+	// 不能每流各扫各的——多流是按 idx%n 交错分配分块的，流内相邻块并不
+	// 相邻，跨块状态续写会错位（实测第 12~15 块重建哈希全部不符）。
+	var segPlan map[int64][]byte
+	if sigIdx != nil && enc == nil {
+		segPlan = getSegPlan(grant.ID, func() map[int64][]byte {
+			return planSegChunks(f, sigIdx, mf.Size)
+		})
+		if segPlan != nil {
+			log.Printf("[tl] %s 分段计划：%d/%d 块可用增量（跨分块连续匹配）",
+				grant.ID, len(segPlan), (mf.Size+int64(ChunkSize)-1)/int64(ChunkSize))
+		}
+	}
 	if wd, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		wd.SetWriteDeadline(time.Now().Add(90 * time.Second)) // 写阻塞自断，交给份额重试
 	}
@@ -455,21 +468,17 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 			// 加密传输（share/get 的密钥专递）时禁用分段帧：
 			// 分段帧里的**字面量**是明文，若照发就会绕过端到端加密。
 			// 引用/复用帧不涉及明文（只搬接收端自己的数据），仍可用。
-			if sigIdx != nil && enc == nil {
-				if ops := sigIdx.buildSegOps(data); len(ops) > 0 {
-					payload := encodeSegOps(data, ops)
-					if len(payload) < len(data) {
-						cw := &countingWriter{w: stream, rate: rate, progress: false}
-						if err := WriteSegFrame(cw, idx, payload); err != nil {
-							return err
-						}
-						// 逻辑进度按整块推进：增量帧的线缆字节远少于块长度
-						rate.advance(int64(len(data)))
-						segFrames++
-						segSaved += int64(len(data) - len(payload))
-						continue
-					}
+			// rsync 风格分段：整文件预扫描（跨分块连续滚动匹配）已算出
+			// 每个分块的「拷贝指令 + 字面量」编码，且只保留比原文更小的。
+			if payload, ok := segPlan[idx]; ok {
+				cw := &countingWriter{w: stream, rate: rate, progress: false}
+				if err := WriteSegFrame(cw, idx, payload); err != nil {
+					return err
 				}
+				rate.advance(int64(len(data)))
+				segFrames++
+				segSaved += int64(len(data) - len(payload))
+				continue
 			}
 			if enc != nil {
 				data = enc.seal(idx, data) // 端到端加密：帧哈希对密文（传输完整性），manifest 对明文

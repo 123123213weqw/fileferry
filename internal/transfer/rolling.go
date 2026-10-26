@@ -225,68 +225,147 @@ const (
 	opLit  byte = 1
 )
 
-// buildSegOps 用滑动窗口把 data（发送端源文件的一个完整分块）表达为
-// 「拷贝旧文件片段 + 内联字面量」的序列。
+// segScanState 是**跨分块**的滚动扫描状态。
 //
-// 命中后一次跳过整个块（这是效率的关键：未改动区域每 B 字节才做一次
-// 校验，而不是每个字节都做）。只有真正改动过的区域才逐字节滚动。
-func (ix *sigIndex) buildSegOps(data []byte) []segOp {
-	if ix == nil || ix.blockSize <= 0 || ix.count == 0 || len(data) == 0 {
-		return nil
-	}
-	B := ix.blockSize
-	if len(data) < B {
-		return nil
-	}
-	ops := make([]segOp, 0, 16)
-	litStart := 0 // 尚未处理成字面量的起点
+// 为什么需要它：每个 4MB 分块若独立扫描，错位时块内首尾各有一段凑不出
+// 完整校验块（最多 2×块大小）只能当字面量发。实测「中间插 1 字节」因此
+// 要传 461KB。把扫描状态跨块延续、并允许拷贝指令在块边界切开续写，
+// 这部分浪费就没了。
+type segScanState struct {
+	p     int64 // 下一个待检查的输出偏移
+	litAt int64 // 当前待发字面量的起始输出偏移
+	// pendOff/pendLen 是"上一块末尾被截断的那次拷贝还剩多少"。
+	//
+	// 没有它的话，跨块状态是无效的：续上来的 p 落在块中间，窗口不再对齐
+	// 任何校验块，只能逐字节滚到下一个块边界再重新匹配——实测"前视+跨块
+	// 状态"与"仅前视"的字面量完全相同（7680 vs 7680），正是这个原因。
+	pendOff int64
+	pendLen int64
+}
 
-	flushLit := func(end int) {
-		if end > litStart {
-			ops = append(ops, segOp{op: opLit, length: end - litStart, lit: data[litStart:end]})
+// scanChunk 为输出区间 [chunkStart, chunkEnd) 生成指令，使用从 chunkStart
+// 开始的数据（末尾需带最多 blockSize-1 字节的前瞻，供跨界窗口使用）。
+//
+// 返回的 lit 切片指向 data，调用方须在复用 data 之前完成编码。
+func (ix *sigIndex) scanChunk(data []byte, chunkStart, chunkEnd int64, st *segScanState) []segOp {
+	if ix == nil || ix.blockSize <= 0 || ix.count == 0 || len(data) == 0 || chunkEnd <= chunkStart {
+		return nil
+	}
+	B := int64(ix.blockSize)
+	ops := make([]segOp, 0, 8)
+
+	litFrom := chunkStart
+	flushLit := func(to int64) {
+		if to > litFrom {
+			ops = append(ops, segOp{
+				op:     opLit,
+				length: int(to - litFrom),
+				lit:    data[litFrom-chunkStart : to-chunkStart],
+			})
 		}
 	}
+	// 相邻拷贝合并：连续命中的内容在旧文件里也是连续的，合成一条即可。
+	// 不合并的话一个未改动的 4MB 分块要发 256 条 13 字节指令。
+	addCopy := func(off int64, n int) {
+		if n <= 0 {
+			return
+		}
+		if len(ops) > 0 {
+			last := &ops[len(ops)-1]
+			if last.op == opCopy && last.srcOff+int64(last.length) == off {
+				last.length += n
+				return
+			}
+		}
+		ops = append(ops, segOp{op: opCopy, srcOff: off, length: n})
+	}
 
-	// 初始窗口
-	weak := weakSum(data[:B])
-	p := 0
-	for p+B <= len(data) {
+	p := st.p
+	if p < chunkStart {
+		p = chunkStart
+	}
+	availEnd := chunkStart + int64(len(data)) // 可用数据的绝对结束位置
+	if p+B > availEnd {
+		// 数据不足以形成一个窗口：整段当字面量
+		st.p, st.litAt = chunkEnd, chunkEnd
+		flushLit(chunkEnd)
+		return ops
+	}
+	// 先续上一块被截断的拷贝：这类续写是块内任意偏移，只能靠状态传递。
+	if st.pendLen > 0 {
+		for st.pendLen > 0 && p < chunkEnd {
+			take := chunkEnd - p
+			if take > st.pendLen {
+				take = st.pendLen
+			}
+			addCopy(st.pendOff, int(take))
+			p += take
+			st.pendOff += take
+			st.pendLen -= take
+			litFrom = p
+		}
+		if p >= chunkEnd {
+			flushLit(chunkEnd)
+			st.p, st.litAt = chunkEnd, chunkEnd
+			return ops
+		}
+	}
+	if p+B > availEnd {
+		flushLit(chunkEnd)
+		st.p, st.litAt = chunkEnd, chunkEnd
+		return ops
+	}
+	weak := weakSum(data[p-chunkStart : p-chunkStart+B])
+
+	for p < chunkEnd && p+B <= availEnd {
+		idx := p - chunkStart
 		if cands, ok := ix.byWeak[weak]; ok {
-			sum := strongSum(data[p : p+B])
+			sum := strongSum(data[idx : idx+B])
+			matched := false
 			for _, bi := range cands {
 				if string(ix.blocks[bi].strong[:]) != string(sum) {
 					continue
 				}
-				// 命中：先把之前的字面量吐出去，再记一条拷贝指令
 				flushLit(p)
-				off := int64(bi) * int64(B)
-				// 合并相邻拷贝：连续匹配到的块在旧文件里也是连续的，
-				// 合成一条指令即可。不合并的话，一个未改动的 4MB 分块要发
-				// 256 条 13 字节指令（3.3KB），而合并后只要 13 字节——
-				// 实测这一步把「原地改 4KB」的传输量从 117KB 降到 4KB 量级。
-				if len(ops) > 0 && ops[len(ops)-1].op == opCopy &&
-					ops[len(ops)-1].srcOff+int64(ops[len(ops)-1].length) == off {
-					ops[len(ops)-1].length += B
-				} else {
-					ops = append(ops, segOp{op: opCopy, srcOff: off, length: B})
+				// 拷贝可以跨出本分块：只在边界处截断，下一块接着续。
+				take := chunkEnd - p
+				if take > B {
+					take = B
 				}
-				litStart = p + B
-				p += B
-				if p+B <= len(data) {
-					weak = weakSum(data[p : p+B])
+				srcOff := int64(bi) * int64(B)
+				addCopy(srcOff, int(take))
+				if take < B {
+					// 本块放不下整块：剩下部分留给下一块续写
+					st.pendOff = srcOff + take
+					st.pendLen = B - take
 				}
-				goto next
+				p += take
+				litFrom = p
+				matched = true
+				break
+			}
+			if matched {
+				if p < chunkEnd && p+B <= availEnd {
+					weak = weakSum(data[p-chunkStart : p-chunkStart+B])
+				}
+				continue
 			}
 		}
 		// 未命中：滚动一个字节
-		if p+1+B <= len(data) {
-			weak = rollWeak(weak, data[p], data[p+B], B)
+		if p+1 < chunkEnd && p+1+B <= availEnd {
+			weak = rollWeak(weak, data[p-chunkStart], data[p+1-chunkStart+B-1], int(B))
 		}
 		p++
-	next:
 	}
-	flushLit(len(data))
+	flushLit(chunkEnd)
+	st.p, st.litAt = chunkEnd, chunkEnd
 	return ops
+}
+
+// buildSegOps 对单个数据块做扫描（无跨块状态）。保留给测试与单块场景。
+func (ix *sigIndex) buildSegOps(data []byte) []segOp {
+	st := &segScanState{}
+	return ix.scanChunk(data, 0, int64(len(data)), st)
 }
 
 // encodeSegOps 编码分段帧负载，同时给出负载大小（用于判断值不值得）。
@@ -475,4 +554,108 @@ func hasCap(caps []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// 整文件预扫描（planSegChunks）
+//
+// 为什么必须"整文件一次扫完"而不是每流各扫各的：
+// 跨分块连续扫描依赖**相邻分块首尾相接**。但多流传输是把分块按 idx%n 交错
+// 分给各流的（流 r 处理 r, r+n, r+2n…），每条流看到的相邻块之间隔着 n 个块，
+// 状态续写必然错位。实测症状：4 流 × 100MB 的「插入 1 字节」场景，第 12~15
+// 块重建哈希全部不符（正好是每条流第 4 个块），接收端正确拒绝并丢文件。
+//
+// 所以扫描只做一次、覆盖整个文件，产物是一张「块号 → 编码后的分段负载」表，
+// 各流只负责查表发送。
+// ---------------------------------------------------------------------------
+
+// segPlanMaxBytes 限制预扫描占用内存：全部字面量的最坏情况不应把整文件
+// 读进内存。超过就放弃分段帧（退回普通帧），与"编码不比原文小就不发"的
+// 判断口径一致。
+const segPlanMaxBytes = 32 << 20
+
+// planSegChunks 从头到尾连续扫描文件，返回每个分块的分段负载。
+//
+// 只有编码后小于原文的分块才会进结果；返回 nil 表示放弃（总量超限）。
+func planSegChunks(f *os.File, ix *sigIndex, size int64) map[int64][]byte {
+	if ix == nil || size <= 0 || ix.blockSize <= 0 || ix.count == 0 {
+		return nil
+	}
+	B := int64(ix.blockSize)
+	chunk := int64(ChunkSize)
+	// 单块加前视：扫描窗口可跨出块尾
+	buf := make([]byte, chunk+B)
+	st := &segScanState{}
+	out := make(map[int64][]byte)
+	var kept int64
+
+	for idx := int64(0); idx*chunk < size; idx++ {
+		base := idx * chunk
+		want := chunk
+		if base+want > size {
+			want = size - base
+		}
+		n, err := f.ReadAt(buf[:want], base)
+		if n <= 0 {
+			_ = err
+			break
+		}
+		data := buf[:n]
+		cn := n
+		if look := int(B) - 1; look > 0 && cn+look <= len(buf) {
+			if ln, _ := f.ReadAt(buf[cn:cn+look], base+int64(cn)); ln > 0 {
+				cn += ln
+			}
+		}
+		ops := ix.scanChunk(buf[:cn], base, base+int64(n), st)
+		if len(ops) == 0 {
+			continue
+		}
+		payload := encodeSegOps(data, ops)
+		if len(payload) >= n {
+			continue // 不如直接发原文
+		}
+		kept += int64(len(payload))
+		if kept > segPlanMaxBytes {
+			return nil // 放弃：占用过大，整体退回普通帧
+		}
+		// payload 是 encodeSegOps 新分配的切片，但 ops 里的 lit 指向 buf，
+		// 已在本轮编码完成，无需保留。
+		out[idx] = payload
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// planCacheEntry 让同一 grant 的多条并行流共享一次预扫描结果。
+type planCacheEntry struct {
+	once sync.Once
+	plan map[int64][]byte
+	at   time.Time
+}
+
+var (
+	planCacheMu sync.Mutex
+	planCache   = map[string]*planCacheEntry{}
+)
+
+// getSegPlan 返回某 grant 的分段计划，只构建一次（多流并发安全）。
+func getSegPlan(grantID string, build func() map[int64][]byte) map[int64][]byte {
+	planCacheMu.Lock()
+	now := time.Now()
+	for k, v := range planCache {
+		if now.Sub(v.at) > 10*time.Minute {
+			delete(planCache, k)
+		}
+	}
+	e, ok := planCache[grantID]
+	if !ok {
+		e = &planCacheEntry{at: now}
+		planCache[grantID] = e
+	}
+	planCacheMu.Unlock()
+	e.once.Do(func() { e.plan = build() })
+	return e.plan
 }
