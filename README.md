@@ -44,7 +44,14 @@
 数据面：QUIC（UDP，多路复用、弱网友好），探测发现 UDP 被禁的
 链路自动回退 TCP+TLS（约定端口 = 数据面端口 + 1），同一套流协议。
 4 MiB 分块，逐块 SHA-256 校验，接收端临时文件 + 原子改名，完成
-哨兵 + ACK 握手后才断开连接。
+哨兵 + ACK 握手后才断开连接。**目录递归**：`ffctl send -r` 整树
+复制，相对路径参与清单签名（防篡改落盘位置），权限位与修改时间
+保留（对齐 `scp -p` / `rsync -a` 基本语义）；每文件独立清单 +
+HKDF 派生文件密钥（加密时），QUIC 连接池化省逐文件握手。
+**限速**：`ffctl send -limit <MB/s>` 整条传输令牌桶配额（多流共享）。
+落盘完整性：逐块 + 全文件 SHA-256、原子改名；`sync-write: true`
+（agent 配置）可加开 fsync 获得掉电级持久性（默认关，对齐 rsync/cp
+的语义，小文件吞吐高一个量级）。
 
 ## 目录
 
@@ -122,6 +129,9 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 # 发文件
 ./bin/ffctl -cert-dir /tmp/ff1 -controller https://127.0.0.1:8443 \
     send node-1:/tmp/big.iso node-2:/tmp/
+# 整个目录递归（保留权限/修改时间），整条传输限速 20MB/s
+./bin/ffctl -cert-dir /tmp/ff1 -controller https://127.0.0.1:8443 \
+    send -r -limit 20 node-1:/tmp/dataset node-2:/data/
 ```
 
 ## 里程碑
@@ -136,8 +146,12 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       ✅ 探测回填可达边 ✅ 证书自动续期（/v1/renew + 自我重启）
       ✅ SQLite 审计与任务持久化（重启恢复队列）✅ API 限速
       ✅ 落盘路径白名单 ⬜ /proc 指标采集
-- [ ] M2 直连传输（基础可用）：✅ grant 签发与两端验签 ✅ 分块传输
-      + 逐块校验 + 原子落盘 ✅ 完成回报 ⬜ 限速 ⬜ 断点续传接线
+- [x] M2 直连传输（基础可用）：✅ grant 签发与两端验签 ✅ 分块传输
+      + 逐块校验 + 原子落盘 ✅ 完成回报 ✅ 限速（-limit，令牌桶多流共享）
+      ✅ 断点续传接线（autoRetry + HAVE 位图）
+- [x] M2.7 目录递归：send -r 整树复制，相对路径入清单签名，权限/
+      mtime 保留，QUIC 连接池化，加密模式每文件派生密钥（防跨文件
+      nonce 重用），交换台模式 FFEND 哨兵收尾
 - [ ] M3 复杂网络（核心已落地）：✅ TCP 回退（探测 QUIC 失败自动
       降级，端口约定 +1） ✅ 中继链数据面（grant 逐跳路径 + 验签 +
       双向管道 + 防开放代理） ⬜ 断链换路续传
@@ -147,10 +161,18 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       监听/拨号/WHOAMI 同源）✅ 对发开洞 + 前缀探测自动建边
       真实环境验证：跨两个校园 NAT 的对等打洞被对称型 NAT 拒绝
       （双方同时行动、地址正确、失败被正确识别并回落中继）
-- [ ] M4 精准负载：⬜ 边权调优 ⬜ 每任务限速 ⬜ 磁盘水位参与调度
+- [ ] M4 精准负载：✅ 每任务限速（-limit MB/s） ⬜ 边权调优 ⬜ 磁盘水位参与调度
 - [ ] M5 收尾：✅ systemd 沙箱单元（systemd/）✅ 安全自检脚本
       （scripts/security-check.sh）✅ make audit（govulncheck）
       ⬜ ffctl 管理令牌 ⬜ 部署打包 ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
+- [x] 稳定性打磨（本轮）：✅ agent 启动竞态修复（whoamiLoop 在数据面
+      socket 就绪前启动 → nil panic 崩进程；改为就绪后启动 + 判空兜底）
+      ✅ enroll 指数退避重试（controller 未起不再 crash-loop）
+      ✅ 空文件死锁修复（0 块文件哨兵即完成，旧版单文件路径同样受累）
+      ✅ 心跳周期默认 2s→1s + ffctl 完成轮询 250ms（grant 投递与
+      完成感知延迟减半以上）✅ 本地 e2e/基准/soak 脚本（scripts/local-e2e.sh、
+      scripts/bench-local.sh）：回环 256MB 单文件 ≈1s、400MB 目录
+      1.0s（rsync 1.9s）、500×16KB 小文件 0.5s
 - [x] 安全加固（自渗透驱动）：✅ token 核销持久化 ✅ 管理员证书 10 年
       ✅ 认证清单 manifest（源端签名 文件哈希+大小，唯一块计数判定
       完成 + 全文件验哈希——防重放、防恶意中继篡改内容）

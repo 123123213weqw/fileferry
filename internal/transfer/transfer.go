@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -226,20 +227,34 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 // 字节数} 用源端节点证书私钥签名。它把"文件内容"与"授权"绑定：
 // 恶意中继即使整体替换数据和清单也无法通过验签；接收端按清单的
 // 总块数判定完成（而非哨兵计数），重放旧流只会重复写相同块，无害。
+// 目录模式（grant.IsDir）额外携带 Path（树内相对路径，**参与签名**，
+// 防中继改写落盘位置）与 Mode/Mtime（属性保留，不参与签名——
+// 属性不构成内容完整性边界）。单文件模式 Path 为空，payload 与
+// 旧版完全一致，新旧版本互通。
 type Manifest struct {
 	GrantID  string `json:"grant_id"`
 	SHA256   string `json:"sha256"`
 	Size     int64  `json:"size"`
+	Path     string `json:"path,omitempty"` // 目录模式：树内相对路径（参与签名）
+	Mode     uint32 `json:"mode,omitempty"` // 权限位（不参与签名）
+	Mtime    int64  `json:"mtime,omitempty"` // 修改时间 Unix 秒（不参与签名）
 	CertB64  string `json:"cert"` // 源端证书 DER
-	SigB64   string `json:"sig"`  // ed25519 签名 over grantID|sha256|size
+	SigB64   string `json:"sig"`  // ed25519 签名 over manifestPayload
 }
 
-func manifestPayload(grantID, sha string, size int64) []byte {
-	return []byte(grantID + "|" + sha + "|" + strconv.FormatInt(size, 10))
+func manifestPayload(m *Manifest) []byte {
+	if m.Path != "" {
+		return []byte(m.GrantID + "|" + m.Path + "|" + m.SHA256 + "|" + strconv.FormatInt(m.Size, 10))
+	}
+	return []byte(m.GrantID + "|" + m.SHA256 + "|" + strconv.FormatInt(m.Size, 10))
 }
 
 // BuildManifest 计算文件指纹并用 tlsConf 中的节点证书签名（发送端）。
-func BuildManifest(grantID, path string, tlsConf *tls.Config) (*Manifest, error) {
+func BuildManifest(grantID, path, relPath string, tlsConf *tls.Config) (*Manifest, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -262,9 +277,12 @@ func BuildManifest(grantID, path string, tlsConf *tls.Config) (*Manifest, error)
 		GrantID: grantID,
 		SHA256:  hex.EncodeToString(h.Sum(nil)),
 		Size:    size,
+		Path:    relPath,
+		Mode:    uint32(st.Mode().Perm()),
+		Mtime:   st.ModTime().Unix(),
 		CertB64: base64.StdEncoding.EncodeToString(cert.Certificate[0]),
 	}
-	m.SigB64 = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifestPayload(m.GrantID, m.SHA256, m.Size)))
+	m.SigB64 = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifestPayload(m)))
 	return m, nil
 }
 
@@ -299,11 +317,20 @@ func (m *Manifest) Verify(grant *api.TransferGrant, roots *x509.CertPool) error 
 	if !ok {
 		return fmt.Errorf("manifest: 非 ed25519 证书")
 	}
-	if !ed25519.Verify(pub, manifestPayload(m.GrantID, m.SHA256, m.Size), sig) {
+	if !ed25519.Verify(pub, manifestPayload(m), sig) {
 		return fmt.Errorf("manifest: 签名无效")
 	}
 	if m.GrantID != grant.ID {
 		return fmt.Errorf("manifest: grantID 不符")
+	}
+	if m.Path != "" && !grant.IsDir {
+		return fmt.Errorf("manifest: 带相对路径但 grant 非目录模式")
+	}
+	if m.Path == "" && grant.IsDir {
+		return fmt.Errorf("manifest: 目录模式清单缺少相对路径")
+	}
+	if m.Path != "" && !SafeRelPath(m.Path) {
+		return fmt.Errorf("manifest: 非法相对路径 %q", m.Path)
 	}
 	return nil
 }
@@ -321,7 +348,7 @@ func SendFile(ctx context.Context, path string, open StreamOpener, tlsConf *tls.
 // 自己的区间；接收端按块号稀疏写，天然汇聚。返回发送字节数。
 // grant.Streams 是本源的并行连接数，区间内交错分块。
 func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant, startCh, endCh int64) (int64, error) {
-	mf, err := BuildManifest(grant.ID, path, tlsConf)
+	mf, err := BuildManifest(grant.ID, path, "", tlsConf)
 	if err != nil {
 		return 0, fmt.Errorf("构建清单失败: %w", err)
 	}
@@ -350,6 +377,7 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 			return 0, fmt.Errorf("密钥上报失败: %w", err)
 		}
 	}
+	lim := newBandwidth(grant.RateLimit, int64(n))
 	errCh := make(chan error, n)
 	var wg sync.WaitGroup
 	for r := 0; r < n; r++ {
@@ -370,7 +398,7 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 		wg.Add(1)
 		go func(r int, o StreamOpener) {
 			defer wg.Done()
-			errCh <- sendShare(ctx, f, o, grant, mf, enc, startCh, endCh, r, n)
+			errCh <- sendShare(ctx, f, o, grant, mf, enc, startCh, endCh, r, n, lim)
 		}(r, thisOpen)
 	}
 	wg.Wait()
@@ -381,6 +409,240 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 		}
 	}
 	return mf.Size, nil
+}
+
+// SendTree 目录模式发送：递归枚举 root 下的常规文件，逐个签名清单
+//（带树内相对路径，防篡改落盘位置），K 个 worker 并行发送（K=
+// grant.Streams，每文件单流）。目录模式下 grant 只签发一次，密钥
+// 只上报一次；每文件密钥由主密钥 + 相对路径 HKDF 派生（共用密钥会
+// 跨文件重用 nonce，破坏 AEAD）。限速预算整树均分。
+// 跳过软链接与非常规文件（v1 不复制符号链接）；错误即中止，已到
+// 文件保留在目的端（断点续传按 HAVE 位图补齐）。
+func SendTree(ctx context.Context, root string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant) (int64, int, error) {
+	root = filepath.Clean(root)
+	type item struct {
+		path, rel string
+	}
+	var files []item
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() { // 跳过软链接/设备等
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".ff-") || strings.HasSuffix(d.Name(), ".ffpart") {
+			return nil // 传输中间产物
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		if !SafeRelPath(filepath.ToSlash(rel)) {
+			return fmt.Errorf("相对路径异常 %q", rel)
+		}
+		files = append(files, item{p, filepath.ToSlash(rel)})
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	k := grant.Streams
+	if k < 1 {
+		k = 1
+	}
+	if k > 8 {
+		k = 8
+	}
+	// 密钥只上报一次：目录模式整树一把主密钥，文件密钥按相对路径派生
+	var masterKey []byte
+	var prefix []byte
+	if grant.Enc {
+		var c *streamCipher
+		var err error
+		if c, masterKey, err = newStreamCipher(); err != nil {
+			return 0, 0, err
+		}
+		prefix = c.noncePrefix
+		if keyDeliverer == nil {
+			return 0, 0, fmt.Errorf("grant 要求加密但未配置密钥上报")
+		}
+		if err := keyDeliverer(grant.ID, append(append([]byte{}, masterKey...), prefix...)); err != nil {
+			return 0, 0, fmt.Errorf("密钥上报失败: %w", err)
+		}
+	}
+	lim := newBandwidth(grant.RateLimit, int64(k))
+	items := make(chan item, len(files))
+	errCh := make(chan error, k)
+	var wg sync.WaitGroup
+	var bytes int64
+	var count int64
+	for w := 0; w < k; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// 每 worker 一条持久 QUIC 连接，文件流在其上按需开
+			//（省逐文件握手）；TCP/交换台退化为逐文件直拨
+			var op *dirOpener
+			if grant.Mode == "switch" {
+				op = newDirOpener(ctx, api.Hop{}, tlsConf, open) // 交换台：逐文件经台配对
+			} else {
+				op = newDirOpener(ctx, grant.Hops[1], tlsConf, nil) // 直连/中继：池化 QUIC
+			}
+			defer op.closeAll()
+			for it := range items {
+				if ctx.Err() != nil {
+					return
+				}
+				f, err := os.Open(it.path)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				mf, err := BuildManifest(grant.ID, it.path, it.rel, tlsConf)
+				if err != nil {
+					f.Close()
+					errCh <- err
+					return
+				}
+				var enc *streamCipher
+				if grant.Enc {
+					if enc, err = cipherFromMaterial(DeriveFileKey(masterKey, it.rel), prefix); err != nil {
+						f.Close()
+						errCh <- err
+						return
+					}
+				}
+				serr := sendShare(ctx, f, op.openFor, grant, mf, enc, 0, -1, 0, 1, lim)
+				f.Close()
+				if serr != nil {
+					op.drop() // 流/连接可能已坏：后续文件重新建连
+					errCh <- fmt.Errorf("%s: %w", it.rel, serr)
+					return
+				}
+				atomic.AddInt64(&bytes, mf.Size)
+				atomic.AddInt64(&count, 1)
+			}
+		}(w)
+	}
+	for _, it := range files {
+		items <- it
+	}
+	close(items)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return bytes, int(count), err
+		}
+	}
+	return bytes, int(count), nil
+}
+
+// SendEndMarker 目录+交换台模式的收尾哨兵：目的端按"连接数"逐个
+// 接收，它无法从 grant 得知文件总数（Files 由源端树枚举决定）。
+// 树发完后拨一条哨兵流，目的端读到 FFEND 行即知全树完成，停止
+// 继续建连。直连/中继模式不需要（目的端被动接受流）。
+func SendEndMarker(ctx context.Context, open StreamOpener, grant *api.TransferGrant) {
+	stream, closer, err := open()
+	if err != nil {
+		return
+	}
+	defer closer()
+	gj, err := json.Marshal(grant)
+	if err != nil {
+		return
+	}
+	if _, err := fmt.Fprintf(stream, "FFJ1%s\nFFEND\n", gj); err != nil {
+		return
+	}
+	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+	_, _ = io.ReadFull(stream, make([]byte, 4)) // 期待 ACK（读不到也无妨）
+}
+
+// dirOpener 目录模式的每 worker 连接池：QUIC 下第一条文件流时建连，
+// 后续文件在**同一连接**上开新流（省掉逐文件 TLS 握手，小文件场景
+// 吞吐提升一个量级）；QUIC 不可用自动回退 TCP（逐文件，端口+1），
+// 交换台模式（base 非空）逐文件经台配对——交换台的配对语义是
+// 一连接一流，无法池化。发送失败后 drop() 丢弃连接，下个文件重建。
+type dirOpener struct {
+	ctx     context.Context
+	hop     api.Hop
+	tlsConf *tls.Config
+	base    StreamOpener // 交换台模式专用
+	mu      sync.Mutex
+	conn    *quic.Conn
+}
+
+func newDirOpener(ctx context.Context, hop api.Hop, tlsConf *tls.Config, base StreamOpener) *dirOpener {
+	return &dirOpener{ctx: ctx, hop: hop, tlsConf: tlsConf, base: base}
+}
+
+func (p *dirOpener) openFor() (Stream, func(), error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.base != nil { // 交换台：配对语义决定一连接一流
+		return p.base()
+	}
+	if p.conn != nil {
+		st, err := p.conn.OpenStreamSync(p.ctx)
+		if err == nil {
+			return st, func() { st.Close() }, nil
+		}
+		p.conn.CloseWithError(0, "")
+		p.conn = nil
+	}
+	// 优先 QUIC 池化；失败回退 TCP（DialStream 端口+1 约定）
+	if p.hop.Proto != "tcp" && p.hop.Addr != "" {
+		if udpAddr, err := net.ResolveUDPAddr("udp", p.hop.Addr); err == nil {
+			var conn *quic.Conn
+			if sharedTransport != nil {
+				conn, err = sharedTransport.Dial(p.ctx, udpAddr, p.tlsConf, quicConf())
+			} else {
+				udp, lerr := net.ListenUDP("udp", nil)
+				if lerr == nil {
+					_ = udp.SetReadBuffer(4 << 20)
+					_ = udp.SetWriteBuffer(4 << 20)
+					conn, err = quic.Dial(p.ctx, udp, udpAddr, p.tlsConf, quicConf())
+					if err != nil {
+						udp.Close()
+					}
+				}
+			}
+			if err == nil {
+				st, serr := conn.OpenStreamSync(p.ctx)
+				if serr == nil {
+					p.conn = conn
+					return st, func() { st.Close() }, nil
+				}
+				conn.CloseWithError(0, "")
+			}
+		}
+	}
+	return DialStream(p.ctx, p.hop.Addr, "tcp", p.tlsConf)
+}
+
+func (p *dirOpener) drop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn != nil {
+		p.conn.CloseWithError(0, "")
+		p.conn = nil
+	}
+}
+
+func (p *dirOpener) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn != nil {
+		p.conn.CloseWithError(0, "")
+		p.conn = nil
+	}
 }
 
 // OpenerDirect 返回常规模式的建流函数（拨 firstHop）。QUIC 建流
@@ -436,12 +698,13 @@ func DialSwitch(ctx context.Context, addr, proto string, tlsConf *tls.Config, gr
 
 // sendShare 发送第 r 条连接的份额：块序号 r, r+n, r+2n...交错分布，
 // 保证各连接进度均衡。流头为 grant 行 + manifest 行，然后是数据帧。
-func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
+// lim 为本 grant 全体流共享的限速器（nil=不限速）。
+func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, lim *bandwidth) error {
 	// 连接失败/中断 → 重连重发整个份额（最多 3 次）：多流交错下
 	// 单条连接的块缺口会让收发两端同时死等，必须自愈
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if err := sendShareOnce(ctx, f, open, grant, mf, enc, startCh, endCh, r, n); err == nil {
+		if err := sendShareOnce(ctx, f, open, grant, mf, enc, startCh, endCh, r, n, lim); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -450,7 +713,52 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 	return fmt.Errorf("份额 [%d,%d) 第 %d 流 3 次尝试均失败: %w", startCh, endCh, r, lastErr)
 }
 
-func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int) error {
+// bandwidth 是 grant 级令牌桶限速器（M4）：RateLimit 字节/秒在全部
+// 并行流间共享，整树/整文件总量不超配额。0 = 不限速。
+type bandwidth struct {
+	mu     sync.Mutex
+	rate   int64   // 字节/秒
+	budget float64 // 当前可用字节
+	last   time.Time
+}
+
+func newBandwidth(totalPerSec int64, shares int64) *bandwidth {
+	if totalPerSec <= 0 {
+		return nil
+	}
+	if shares < 1 {
+		shares = 1
+	}
+	return &bandwidth{rate: totalPerSec / shares, last: time.Now(), budget: float64(totalPerSec/shares) * 0.2}
+}
+
+// wait 消费 n 字节，必要时睡眠到配额恢复。
+func (b *bandwidth) wait(n int) {
+	if b == nil || b.rate <= 0 {
+		return
+	}
+	for {
+		b.mu.Lock()
+		now := time.Now()
+		b.budget += now.Sub(b.last).Seconds() * float64(b.rate)
+		b.last = now
+		if b.budget > float64(b.rate)*0.5 {
+			b.budget = float64(b.rate) * 0.5 // 突发上限：半秒配额
+		}
+		if b.budget >= float64(n) {
+			b.budget -= float64(n)
+			b.mu.Unlock()
+			return
+		}
+		need := (float64(n) - b.budget) / float64(b.rate)
+		b.mu.Unlock()
+		if need > 0 {
+			time.Sleep(time.Duration(need * float64(time.Second)))
+		}
+	}
+}
+
+func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, lim *bandwidth) error {
 	tA := time.Now()
 	stream, closeConn, err := open()
 	if err != nil {
@@ -505,6 +813,7 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 			if enc != nil {
 				data = enc.seal(idx, data) // 端到端加密：帧哈希对密文（传输完整性），manifest 对明文
 			}
+			lim.wait(len(data)) // 限速按密文计（真实线上字节数）
 			if err := WriteFrame(stream, idx, data); err != nil {
 				return err
 			}
@@ -747,8 +1056,37 @@ var pathGuard func(string) bool
 // SetPathGuard 注入落盘路径白名单检查。
 func SetPathGuard(g func(string) bool) { pathGuard = g }
 
+// syncWrite 控制落盘是否 fsync：开启 = 掉电也保证已确认文件完整
+//（强持久性）；关闭 = 对齐 rsync/cp 的默认语义（完整性仍由逐块+
+// 全文件 SHA-256 与原子改名保证），小文件吞吐提升一个量级。
+var syncWrite bool
+
+func SetSyncWrite(v bool) { syncWrite = v }
+
 // PathAllowed 报告路径是否被允许（发送端源路径与接收端目的路径通用）。
 func PathAllowed(p string) bool { return pathGuard == nil || pathGuard(p) }
+
+// SafeRelPath 校验目录模式的树内相对路径：非绝对、无 ".."、Clean 后
+// 不升级——防止恶意清单把文件写到目的根之外。
+func SafeRelPath(p string) bool {
+	if p == "" || filepath.IsAbs(p) || strings.HasPrefix(p, "/") {
+		return false
+	}
+	c := filepath.Clean(p)
+	if c == ".." || strings.HasPrefix(c, "../") || strings.Contains(c, "\x00") {
+		return false
+	}
+	return true
+}
+
+// groupKey 接收组/完成缓存的键：单文件模式只看 grantID；目录模式
+// 一个 grant 承载多文件，按相对路径区分。
+func groupKey(grant *api.TransferGrant, mf *Manifest) string {
+	if mf.Path == "" {
+		return grant.ID
+	}
+	return grant.ID + "\x00" + mf.Path
+}
 
 // RecvStream 按认证清单接收：读 manifest 行并验签，然后进组收块。
 // 这是接收端（直连与交换台路径共用的入口）。
@@ -770,7 +1108,8 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 	var deckey *streamCipher
 	if grant.Enc {
 		var kerr error
-		if deckey, kerr = cipherForGrant(grant.ID); kerr != nil {
+		// 目录模式按清单相对路径派生文件密钥（与发送端 SendTree 对称）
+		if deckey, kerr = cipherForGrant(grant.ID, mf.Path); kerr != nil {
 			fmt.Printf("接收 %s 取密钥失败：%v\n", grant.ID, kerr)
 			return
 		}
@@ -848,6 +1187,9 @@ type recvGroup struct {
 	deckey    *streamCipher // 端到端解密器（组级共享，建组时取一次）
 	size      int64 // 文件精确字节数（进度键）
 	dirty     int   // 距上次位图落盘的新块数
+	mode      uint32 // 权限位保留（0 = 不设置）
+	mtime     int64  // 修改时间保留（0 = 不设置）
+	key       string // recvGroups/completed 的键（groupKey 计算）
 }
 
 // ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
@@ -860,9 +1202,19 @@ var (
 )
 
 func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*recvGroup, error) {
-	if !PathAllowed(grant.DstPath) {
-		return nil, fmt.Errorf("目的路径不在白名单内：%s", grant.DstPath)
+	// 目录模式：落盘路径 = 目的根 + 树内相对路径（清单签名覆盖路径，
+	// SafeRelPath 防 .. 逃逸；路径仍须过白名单）
+	finalPath := grant.DstPath
+	if mf.Path != "" {
+		if !grant.IsDir || !SafeRelPath(mf.Path) {
+			return nil, fmt.Errorf("目录模式路径校验失败：%q", mf.Path)
+		}
+		finalPath = filepath.Join(grant.DstPath, filepath.FromSlash(mf.Path))
 	}
+	if !PathAllowed(finalPath) {
+		return nil, fmt.Errorf("目的路径不在白名单内：%s", finalPath)
+	}
+	key := groupKey(grant, mf)
 	recvMu.Lock()
 	defer recvMu.Unlock()
 	for k, t := range completed { // 陈年条目卫生清扫
@@ -870,15 +1222,15 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 			delete(completed, k)
 		}
 	}
-	if t, ok := completed[grant.ID]; ok && time.Since(t) < 2*time.Hour {
+	if t, ok := completed[key]; ok && time.Since(t) < 2*time.Hour {
 		// 文件已完整落盘：不是攻击，是发送端重试流晚到。回 ACK 让
 		// 对端成功收尾（"文件到达但任务报失败"的收尾问题）。
 		return nil, ErrAlreadyDone
 	}
-	if g, ok := recvGroups[grant.ID]; ok {
+	if g, ok := recvGroups[key]; ok {
 		return g, nil
 	}
-	dir := filepath.Dir(grant.DstPath)
+	dir := filepath.Dir(finalPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -886,24 +1238,24 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 	if err != nil {
 		return nil, err
 	}
-	n := (mf.Size + ChunkSize - 1) / ChunkSize
-	if n < 1 {
-		n = 1 // 空文件：仅哨兵
-	}
+	n := (mf.Size + ChunkSize - 1) / ChunkSize // 空文件 = 0 块：哨兵即完成
 	g := &recvGroup{
 		grantID:   grant.ID,
+		key:       key,
 		wantSHA:   mf.SHA256,
 		size:      mf.Size,
 		deckey:    deckey,
-		finalPath: grant.DstPath,
+		finalPath: finalPath,
 		tmp:       tmp,
 		tmpName:   tmp.Name(),
 		expected:  n,
 		got:       map[int64]bool{},
 		finished:  make(chan struct{}),
+		mode:      mf.Mode,
+		mtime:     mf.Mtime,
 	}
 	g.loadProgress() // 断点续传：加载同目标文件的历史进度（位图+临时文件）
-	recvGroups[grant.ID] = g
+	recvGroups[key] = g
 	return g, nil
 }
 
@@ -1005,6 +1357,7 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 			return err
 		}
 		if len(data) == 0 { // 本连接份额完成哨兵
+			g.checkDone()
 			return nil
 		}
 		if deckey != nil {
@@ -1036,6 +1389,20 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 	}
 }
 
+// checkDone 哨兵/EOF 时刻的完成复核：空文件（0 块）只等哨兵；
+// 多份额下最后一份的哨兵也可能先于 finalize 到达。
+func (g *recvGroup) checkDone() {
+	g.mu.Lock()
+	complete := int64(len(g.got)) >= g.expected && !g.done
+	if complete {
+		g.done = true
+	}
+	g.mu.Unlock()
+	if complete {
+		g.finalize()
+	}
+}
+
 // finalize 收尾：全文件 SHA-256 对清单核验，通过才原子改名。
 func (g *recvGroup) finalize() {
 	defer close(g.finished)
@@ -1048,9 +1415,11 @@ func (g *recvGroup) finalize() {
 		delete(recvGroups, g.grantID)
 		recvMu.Unlock()
 	}
-	if err := g.tmp.Sync(); err != nil {
-		fail(err)
-		return
+	if syncWrite {
+		if err := g.tmp.Sync(); err != nil {
+			fail(err)
+			return
+		}
 	}
 	if err := g.tmp.Close(); err != nil {
 		fail(err)
@@ -1077,10 +1446,18 @@ func (g *recvGroup) finalize() {
 		fail(err)
 		return
 	}
+	// 属性保留（清单携带，不参与签名）：权限位与修改时间，对齐
+	// scp -p / rsync -a 的基本语义（属主/组需要 root，v1 不保留）
+	if g.mode != 0 {
+		_ = os.Chmod(g.finalPath, os.FileMode(g.mode))
+	}
+	if g.mtime != 0 {
+		_ = os.Chtimes(g.finalPath, time.Unix(g.mtime, 0), time.Unix(g.mtime, 0))
+	}
 	g.clearProgress()
 	recvMu.Lock()
-	delete(recvGroups, g.grantID)
-	completed[g.grantID] = time.Now()
+	delete(recvGroups, g.key)
+	completed[g.key] = time.Now()
 	recvMu.Unlock()
 }
 

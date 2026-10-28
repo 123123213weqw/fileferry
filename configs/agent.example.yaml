@@ -2,6 +2,8 @@
 controller: https://ctl.example.internal:8443
 enroll-token: ff_enroll_replace-me   # 首次入网用，核销即废；入网后可删
 data-port: 7800                      # UDP(QUIC)；探测到只放 TCP 时回退 7801/tcp
+# sync-write: true                   # 落盘 fsync：掉电也保证已确认文件完整（默认关，
+#                                    # 完整性仍由逐块+全文件 SHA-256 与原子改名保证）
 data-dir: /var/lib/ff                # 本节点证书、断点清单缓存
 allowed-dirs:                    # 落盘白名单（空 = 不限制）
   - /home/wzu/ff

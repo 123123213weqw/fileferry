@@ -1135,6 +1135,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Enc:       c.cfg.EncDefault, // 端到端加密（真机密钥专递链路待修，默认关；单测已验证）
+		IsDir:     req.Dir,          // 目录递归：源端整树枚举，逐文件签名清单
 	}
 	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
 	if len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
@@ -1143,19 +1144,22 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
 	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。
 	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4
-	if sz := c.indexedSize(req.Src, req.SrcPath); sz > 0 {
-		switch {
-		case sz >= 256<<20:
-			grant.Streams = 6
-		case sz >= 64<<20:
-			grant.Streams = 4
-		case sz >= 16<<20:
-			grant.Streams = 3
-		default:
-			grant.Streams = 1
+	// 目录模式不走多源（树内文件已天然并行）。
+	if !req.Dir {
+		if sz := c.indexedSize(req.Src, req.SrcPath); sz > 0 {
+			switch {
+			case sz >= 256<<20:
+				grant.Streams = 6
+			case sz >= 64<<20:
+				grant.Streams = 4
+			case sz >= 16<<20:
+				grant.Streams = 3
+			default:
+				grant.Streams = 1
+			}
 		}
+		c.applyMultiSource(&grant)
 	}
-	c.applyMultiSource(&grant)
 	grant.Sign(c.signer)
 	targets := grant.AllSources()
 	c.mu.Lock()

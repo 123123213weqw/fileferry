@@ -3,9 +3,12 @@ package transfer
 import (
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
+	"io"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 )
 
 // streamCipher 是传输内容的端到端加密（M10）：源端生成一次性密钥，
@@ -40,6 +43,32 @@ func newStreamCipherFromKey(key []byte) (*streamCipher, error) {
 		return nil, err
 	}
 	return &streamCipher{aead: aead, noncePrefix: prefix}, nil
+}
+
+// cipherFromMaterial 用现成密钥材料（key || prefix）组装 cipher——
+// 目的端解密与源端目录模式派生共用。prefix 不再重新随机：nonce 必须与
+// 对端一致，且同一 grant 内所有文件共用同一前缀（密钥不同即安全）。
+func cipherFromMaterial(key, prefix []byte) (*streamCipher, error) {
+	if len(key) != chacha20poly1305.KeySize || len(prefix) != 7 {
+		return nil, fmt.Errorf("密钥材料长度异常")
+	}
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
+	return &streamCipher{aead: aead, noncePrefix: append([]byte(nil), prefix...)}, nil
+}
+
+// DeriveFileKey 从 grant 主密钥为目录内每个文件派生独立密钥
+//（HKDF-SHA256，info 绑定相对路径）。目录模式下多文件共用同一
+// chunk 索引空间（每文件都从块 0 开始），若共用密钥则跨文件 nonce
+// 重用——AEAD 的致命错误。派生后每文件密钥互异，nonce 只在单文件
+// 内使用，安全性恢复。
+func DeriveFileKey(master []byte, relPath string) []byte {
+	r := hkdf.New(sha256.New, master, nil, []byte("fileferry/dir-file/"+relPath))
+	out := make([]byte, chacha20poly1305.KeySize)
+	io.ReadFull(r, out) // SHA-256 读源不会出错
+	return out
 }
 
 // material 返回给目的端的密钥材料（key || nonce 前缀）。
@@ -77,8 +106,10 @@ var keyFetcher func(grantID string) ([]byte, error)
 // SetKeyFetcher 注入密钥获取（目的端，接收时调用）。
 func SetKeyFetcher(f func(grantID string) ([]byte, error)) { keyFetcher = f }
 
-// cipherForGrant 组装本次传输的解密器（目的端）。
-func cipherForGrant(grantID string) (*streamCipher, error) {
+// cipherForGrant 组装本次传输的解密器（目的端）。relPath 非空
+//（目录模式）时按 HKDF(主钥, 相对路径) 派生文件密钥——与发送端
+// SendTree 的派生严格对称；空 = 单文件模式直接用主钥。
+func cipherForGrant(grantID, relPath string) (*streamCipher, error) {
 	if keyFetcher == nil {
 		return nil, fmt.Errorf("未配置密钥获取")
 	}
@@ -89,9 +120,10 @@ func cipherForGrant(grantID string) (*streamCipher, error) {
 	if len(mat) != chacha20poly1305.KeySize+7 {
 		return nil, fmt.Errorf("密钥材料长度异常")
 	}
-	aead, err := chacha20poly1305.New(mat[:chacha20poly1305.KeySize])
-	if err != nil {
-		return nil, err
+	key := mat[:chacha20poly1305.KeySize]
+	prefix := mat[chacha20poly1305.KeySize:]
+	if relPath != "" {
+		key = DeriveFileKey(key, relPath)
 	}
-	return &streamCipher{aead: aead, noncePrefix: mat[chacha20poly1305.KeySize:]}, nil
+	return cipherFromMaterial(key, prefix)
 }

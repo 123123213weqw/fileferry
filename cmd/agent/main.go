@@ -44,6 +44,8 @@ type Config struct {
 	Controller  string `yaml:"controller"`
 	EnrollToken string `yaml:"enroll-token"`
 	DataPort    int    `yaml:"data-port"`
+	Heartbeat   time.Duration `yaml:"heartbeat-interval"` // 心跳周期（默认 2s）：grant 投递延迟≈半个周期
+	SyncWrite   bool          `yaml:"sync-write"`         // 落盘 fsync（默认关；掉电级持久性按需开）
 	DataDir     string `yaml:"data-dir"`
 	// Advertise 显式声明对外的数据面地址（host:port）。controller 与
 	// agent 同机时自动探测会得到 127.0.0.1，公网机必须手工指定。
@@ -142,6 +144,7 @@ func run(cfgPath string) error {
 	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
 		return hbClient.GetKeypass(grantID)
 	})
+	transfer.SetSyncWrite(cfg.SyncWrite)
 	if len(cfg.AllowedDirs) > 0 {
 		transfer.SetPathGuard(func(p string) bool {
 			for _, dir := range cfg.AllowedDirs {
@@ -162,10 +165,10 @@ func run(cfgPath string) error {
 		go indexLoop()
 	}
 
-	// 2. 心跳 / 探测 / WHOAMI 保活 / 证书续期
+	// 2. 心跳 / 探测 / 证书续期（WHOAMI 在数据面 socket 建好后再启动，
+	//    它的首次 send 依赖 udpConn 非空——提前启动有 nil 崩溃竞态）
 	go heartbeatLoop()
 	go probeLoop()
-	go whoamiLoop()
 	go certRenewLoop()
 
 	// 3. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）
@@ -218,6 +221,7 @@ func run(cfgPath string) error {
 	if tcpLn != nil {
 		go func() { errCh <- transfer.ServeTCP(tcpLn, nodeID, verifyGrant, tlsConf) }()
 	}
+	go whoamiLoop() // 数据面 socket 就绪，WHOAMI 保活可以开始
 	select {
 	case err := <-errCh:
 		return err
@@ -272,13 +276,25 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}},
 	}}
-	resp, err := cl.Enroll(api.EnrollRequest{
-		Token:    cfg.EnrollToken,
-		Hostname: hostname,
-		Addr:     advertisedAddr(),
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("enroll: %w", err)
+	// controller 未起/网络抖动时退避重试：机器重启比 controller 快是常态，
+	// 一次性 enroll 失败即退出会变成 systemd crash-loop
+	var resp *api.EnrollResponse
+	backoff := time.Second
+	for {
+		r, err := cl.Enroll(api.EnrollRequest{
+			Token:    cfg.EnrollToken,
+			Hostname: hostname,
+			Addr:     advertisedAddr(),
+		})
+		if err == nil {
+			resp = r
+			break
+		}
+		log.Printf("enroll 失败（%v），%v 后重试…", err, backoff)
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
 	}
 	nodeID = resp.NodeID
 	if err := os.WriteFile(certPath, []byte(resp.CertPEM), 0o600); err != nil {
@@ -505,8 +521,15 @@ func indexLoop() {
 	}
 }
 
+func heartbeatInterval() time.Duration {
+	if cfg.Heartbeat >= 500*time.Millisecond {
+		return cfg.Heartbeat
+	}
+	return time.Second // 快投递：grant 经心跳下发，周期越短端到端延迟越低
+}
+
 func heartbeatLoop() {
-	t := time.NewTicker(5 * time.Second)
+	t := time.NewTicker(heartbeatInterval())
 	defer t.Stop()
 	for range t.C {
 		mu.Lock()
@@ -589,6 +612,9 @@ func whoamiLoop() {
 	t := time.NewTicker(25 * time.Second)
 	defer t.Stop()
 	send := func() {
+		if udpConn == nil { // 数据面 socket 尚未就绪：本轮跳过
+			return
+		}
 		pkt, err := nat.Build(nodeID, nodeCert, time.Now())
 		if err != nil {
 			return
@@ -726,12 +752,12 @@ func runJob(g api.TransferGrant) {
 	}()
 
 	startTime := time.Now()
-	sentBytes := int64(0)
+	var sentBytes int64
 	done := func(ok bool, errStr string) {
 		d := time.Since(startTime).Seconds()
 		reportDone(api.DoneRequest{
 			GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr,
-			Bytes: sentBytes, Duration: d,
+			Bytes: atomic.LoadInt64(&sentBytes), Duration: d,
 		})
 	}
 
@@ -801,7 +827,32 @@ func runJob(g api.TransferGrant) {
 		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto}
 		open = transfer.OpenerDirect(ctx, hop, tlsConf)
 	}
-	sentBytes, err := transfer.SendFileRange(ctx, sendPath, open, tlsConf, &g, startCh, endCh)
+	// 目录递归模式：整树枚举 + 逐文件签名清单（相对路径参与签名）
+	if g.IsDir {
+		st, err := os.Stat(sendPath)
+		if err != nil || !st.IsDir() {
+			done(false, "目录模式但源路径不是目录")
+			return
+		}
+		sentBytes, n, err := transfer.SendTree(ctx, sendPath, open, tlsConf, &g)
+		if err != nil {
+			done(false, fmt.Sprintf("%d 个文件后失败: %v", n, err))
+			log.Printf("任务 %s 失败（已发 %d 文件）：%v", g.ID, n, err)
+			return
+		}
+		// 交换台模式：目的端按连接逐个接收，发一条 FFEND 哨兵流告诉它"树已发完"
+		if g.Mode == "switch" {
+			transfer.SendEndMarker(ctx, open, &g)
+		}
+		atomic.StoreInt64(&sentBytes, sentBytes)
+		done(true, fmt.Sprintf("files=%d", n))
+		log.Printf("任务 %s 完成：%s/ → %s%s（%d 文件，%s）", g.ID, g.SrcPath, g.Dst, via, n, time.Since(startTime).Round(time.Millisecond))
+		return
+	}
+	// 注意赋值而非 :=：外层 sentBytes 要进 DoneRequest（原实现被
+	// := 遮蔽，回报字节数恒为 0）
+	var err error
+	sentBytes, err = transfer.SendFileRange(ctx, sendPath, open, tlsConf, &g, startCh, endCh)
 	if err != nil {
 		done(false, err.Error())
 		log.Printf("任务 %s 失败：%v", g.ID, err)
@@ -835,6 +886,33 @@ func runSwitchRecv(g api.TransferGrant) {
 	if timeout > 30*time.Minute {
 		timeout = 30 * time.Minute
 	}
+	if g.IsDir {
+		// 目录模式（交换台）：文件数事前未知（源端树枚举决定），
+		// 逐连接接收直到源端发来 FFEND 哨兵或配对超时（源端已停拨）。
+		// 每连接一个文件；收发两端都是出站拨号，NAT 不构成障碍。
+		start := time.Now()
+		nFiles, nFail := 0, 0
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			ended, err := switchRecvShare(ctx, g)
+			cancel()
+			if ended {
+				break
+			}
+			if err != nil {
+				nFail++
+				if nFail > 2 { // 连续 3 次建连/接收失败：源端大概率已收工或路径恶化
+					log.Printf("接收任务 %s 连续失败，停止接收：%v", g.ID, err)
+					break
+				}
+			} else {
+				nFiles++
+			}
+		}
+		log.Printf("接收完成：%s（src=%s，交换台 %s，%d 文件，耗时 %s）",
+			g.ID, g.Src, g.Hops[1].NodeID, nFiles, time.Since(start).Round(time.Millisecond))
+		return
+	}
 	n := g.Streams
 	if n < 1 {
 		n = 1
@@ -848,7 +926,7 @@ func runSwitchRecv(g api.TransferGrant) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			if err := switchRecvShare(ctx, g); err != nil {
+			if _, err := switchRecvShare(ctx, g); err != nil {
 				atomic.AddInt32(&fail, 1)
 				log.Printf("接收任务 %s 份额失败：%v", g.ID, err)
 			}
@@ -863,28 +941,34 @@ func runSwitchRecv(g api.TransferGrant) {
 }
 
 // switchRecvShare 接入交换台并按标准 FFJ1 逻辑接收一个连接份额。
-func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
+// 返回 ended=true 表示对端发来 FFEND 哨兵（目录树接收完毕）。
+func switchRecvShare(ctx context.Context, g api.TransferGrant) (ended bool, err error) {
 	stream, closeConn, err := transfer.DialSwitch(ctx, g.Hops[1].Addr, g.Hops[1].Proto, tlsConf, &g)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer closeConn()
 
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(stream, head); err != nil {
-		return err
+		return false, err
 	}
 	if string(head) != "FFJ1" {
-		return fmt.Errorf("非传输流 %q", head)
+		return false, fmt.Errorf("非传输流 %q", head)
 	}
 	br := bufio.NewReader(stream)
 	line, err := br.ReadString('\n')
 	if err != nil {
-		return err
+		return false, err
+	}
+	if strings.TrimSpace(line) == "FFEND" {
+		// 目录树完成哨兵：回 ACK 让源端哨兵流收尾
+		stream.Write([]byte("ACK\n"))
+		return true, nil
 	}
 	var gg api.TransferGrant
 	if err := json.Unmarshal([]byte(line), &gg); err != nil || gg.ID != g.ID {
-		return fmt.Errorf("grant 不符")
+		return false, fmt.Errorf("grant 不符")
 	}
 	transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs)
 	// ACK 已写入流：只半关写侧，等对端读走、对端关闭后再退出，
@@ -894,7 +978,7 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
 		s.SetReadDeadline(time.Now().Add(60 * time.Second))
 	}
 	io.ReadFull(stream, make([]byte, 1))
-	return nil
+	return false, nil
 }
 
 // probeLoop 探测所有目标：广播地址（节点表）+ 打洞公网映射。

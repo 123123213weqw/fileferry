@@ -130,7 +130,7 @@ func TestManifestTamper(t *testing.T) {
 	os.WriteFile(path, []byte("hello"), 0o600)
 	tlsConf := clientTLSFor(t, root, "src")
 	grant := &api.TransferGrant{ID: "x", Src: "src", Dst: "dst"}
-	mf, err := BuildManifest(grant.ID, path, tlsConf)
+	mf, err := BuildManifest(grant.ID, path, "", tlsConf)
 	if err != nil {
 		t.Fatal(err)
 	}

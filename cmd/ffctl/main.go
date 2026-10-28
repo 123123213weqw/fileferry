@@ -22,6 +22,8 @@ import (
 
 const usage = `用法：
   ffctl -cert-dir <dir> send <src-node>:<path> <dst-node>:<path>
+  ffctl -cert-dir <dir> send -r <src-node>:<dir> <dst-node>:<dir>   目录递归（保留权限/修改时间）
+  ffctl -cert-dir <dir> send -limit <MB/s> …                        整条传输限速
   ffctl -cert-dir <dir> status
 
 cert-dir 是某台已入网机器的 data-dir（复用其 mTLS 证书）。
@@ -32,6 +34,8 @@ func main() {
 	controller := "https://127.0.0.1:8443"
 	jsonOut := false
 	noWait := false
+	recursive := false
+	limitMB := int64(0)
 	args := os.Args[1:]
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -52,6 +56,20 @@ func main() {
 		}
 		if args[i] == "-nowait" {
 			noWait = true
+			continue
+		}
+		if args[i] == "-r" {
+			recursive = true
+			continue
+		}
+		if args[i] == "-limit" && i+1 < len(args) {
+			v, err := strconv.ParseFloat(args[i+1], 64)
+			if err != nil || v <= 0 {
+				fmt.Fprintln(os.Stderr, "-limit 需要 MB/s 数字，如 -limit 10")
+				os.Exit(2)
+			}
+			limitMB = int64(v * 1024 * 1024)
+			i++
 			continue
 		}
 		rest = args[i:]
@@ -78,17 +96,42 @@ func main() {
 
 	switch rest[0] {
 	case "send":
-		if len(rest) != 3 {
+		// send 后置 flag（scp/rsync 习惯）：-r 目录递归、-limit <MB/s>
+		var sendArgs []string
+		for i := 1; i < len(rest); i++ {
+			switch rest[i] {
+			case "-r":
+				recursive = true
+			case "-limit":
+				if i+1 >= len(rest) {
+					fmt.Fprintln(os.Stderr, "-limit 需要 MB/s 数字")
+					os.Exit(2)
+				}
+				v, err := strconv.ParseFloat(rest[i+1], 64)
+				if err != nil || v <= 0 {
+					fmt.Fprintln(os.Stderr, "-limit 需要 MB/s 数字，如 -limit 10")
+					os.Exit(2)
+				}
+				limitMB = int64(v * 1024 * 1024)
+				i++
+			default:
+				sendArgs = append(sendArgs, rest[i])
+			}
+		}
+		if len(sendArgs) != 2 {
 			fmt.Fprintln(os.Stderr, usage)
 			os.Exit(2)
 		}
-		srcNode, srcPath, ok1 := splitNodePath(rest[1])
-		dstNode, dstPath, ok2 := splitNodePath(rest[2])
+		srcNode, srcPath, ok1 := splitNodePath(sendArgs[0])
+		dstNode, dstPath, ok2 := splitNodePath(sendArgs[1])
 		if !ok1 || !ok2 {
 			fmt.Fprintln(os.Stderr, "路径格式应为 node:/path")
 			os.Exit(2)
 		}
-		grant, err := cl.Send(api.TransferRequest{Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath})
+		grant, err := cl.Send(api.TransferRequest{
+			Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath,
+			Dir: recursive, RateLimit: limitMB,
+		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "传输请求失败：", err)
 			os.Exit(1)
@@ -105,9 +148,9 @@ func main() {
 		}
 		// 默认等待完成：轮询任务状态，退出码反映结果（agent/脚本友好）
 		fmt.Println("；等待完成…")
-		deadline := time.Now().Add(10 * time.Minute)
+		deadline := time.Now().Add(30 * time.Minute)
 		for time.Now().Before(deadline) {
-			time.Sleep(2 * time.Second)
+			time.Sleep(250 * time.Millisecond) // 快轮询：完成检测延迟不影响吞吐只影响退出时机
 			jobs, err := cl.Jobs(grant.ID)
 			if err != nil || len(jobs) == 0 {
 				continue

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# 本地基准：fileferry vs rsync vs cp（回环，2 agent 同机不同端口）。
+# macOS 无 sshd 权限时 scp 跳过；rsync 用 daemon 模式（无 ssh 加密，
+# 是 rsync 的最快形态）。文件均为随机内容（无压缩收益，公平）。
+set -euo pipefail
+cd "$(dirname "$0")/.."
+BIN=$PWD/bin
+ROOT=$(mktemp -d /tmp/fileferry-bench.XXXXXX)
+PORT_BASE=${PORT_BASE:-18800}
+
+mkdir -p $ROOT/cfg $ROOT/n1/ff $ROOT/n2/ff $ROOT/admin $ROOT/n1/src $ROOT/n2/dst $ROOT/rsync-tmp
+cat > $ROOT/cfg/controller.yaml <<EOF
+listen: 127.0.0.1:$PORT_BASE
+data-dir: $ROOT/ctl
+enroll-tokens: [ff_enroll_t1, ff_enroll_t2]
+EOF
+cat > $ROOT/cfg/a1.yaml <<EOF
+controller: https://127.0.0.1:$PORT_BASE
+enroll-token: ff_enroll_t1
+data-port: $((PORT_BASE+10))
+data-dir: $ROOT/n1/ff
+allowed-dirs: [$ROOT/n1, $ROOT/n2]
+advertise: 127.0.0.1:$((PORT_BASE+10))
+EOF
+cat > $ROOT/cfg/a2.yaml <<EOF
+controller: https://127.0.0.1:$PORT_BASE
+enroll-token: ff_enroll_t2
+data-port: $((PORT_BASE+20))
+data-dir: $ROOT/n2/ff
+allowed-dirs: [$ROOT/n1, $ROOT/n2]
+advertise: 127.0.0.1:$((PORT_BASE+20))
+EOF
+RS_DST=$ROOT/n2/dst/  # openrsync 的 daemon 模式不可用：直接本地→本地
+cleanup() {
+  kill ${CTL_PID:-0} ${A1_PID:-0} ${A2_PID:-0} 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT
+$BIN/ff-controller -config $ROOT/cfg/controller.yaml >$ROOT/ctl.log 2>&1 & CTL_PID=$!
+$BIN/ff-agent -config $ROOT/cfg/a1.yaml >$ROOT/a1.log 2>&1 & A1_PID=$!
+$BIN/ff-agent -config $ROOT/cfg/a2.yaml >$ROOT/a2.log 2>&1 & A2_PID=$!
+sleep 2
+cp $ROOT/ctl/admin.crt $ROOT/ctl/admin.key $ROOT/admin/
+cp $ROOT/ctl/ca/ca.crt $ROOT/admin/ca.crt
+
+FFCTL() { $BIN/ffctl -cert-dir $ROOT/admin -controller https://127.0.0.1:$PORT_BASE "$@"; }
+for i in $(seq 1 45); do
+  FFCTL status 2>/dev/null | grep -q "node-1 .*出边=\[node-2" && break; sleep 2
+done
+
+# 测试数据：256MB 大文件 + 100×4MB 中文件 + 500×16KB 小文件（随机内容）
+dd if=/dev/urandom of=$ROOT/n1/src/big.bin bs=1m count=256 2>/dev/null
+mkdir -p $ROOT/n1/src/mset
+for i in $(seq 1 100); do dd if=/dev/urandom of=$ROOT/n1/src/mset/m-$i.bin bs=1k count=4096 2>/dev/null; done
+mkdir -p $ROOT/n1/src/smalls
+for i in $(seq 1 500); do dd if=/dev/urandom of=$ROOT/n1/src/smalls/s-$i.bin bs=1k count=16 2>/dev/null; done
+
+bench() { # 名称 命令...
+  local name=$1; shift
+  local t0=$(python3 -c 'import time;print(time.time())')
+  "$@" > /dev/null 2>&1
+  local rc=$?
+  local t1=$(python3 -c 'import time;print(time.time())')
+  BENCH_NAME="$name" BENCH_T0="$t0" BENCH_T1="$t1" BENCH_RC=$rc python3 <<'EOF'
+import os
+n = os.environ["BENCH_NAME"]
+d = float(os.environ["BENCH_T1"]) - float(os.environ["BENCH_T0"])
+print("%s: %.1fs rc=%s" % (n, d, os.environ["BENCH_RC"]))
+EOF
+}
+
+echo "=== 大文件 256MB ==="
+rm -f $ROOT/n2/dst/big.bin
+bench "ff    " FFCTL send node-1:$ROOT/n1/src/big.bin node-2:$ROOT/n2/dst/big.bin
+rm -f $ROOT/n2/dst/big.cp
+bench "cp    " cp $ROOT/n1/src/big.bin $ROOT/n2/dst/big.cp
+rm -f $ROOT/n2/dst/big.rsync
+bench "rsync " rsync -a $ROOT/n1/src/big.bin $RS_DST
+
+echo "=== 100×4MB = 400MB，目录递归 ==="
+rm -rf ${RS_DST}mff
+bench "rsync " rsync -a $ROOT/n1/src/mset ${RS_DST}mff
+rm -rf $ROOT/n2/dst/mcp && mkdir -p $ROOT/n2/dst/mcp
+bench "cp    " cp $ROOT/n1/src/mset/m-*.bin $ROOT/n2/dst/mcp/
+rm -rf $ROOT/n2/dst/mffdir
+bench "ff    " FFCTL send -r node-1:$ROOT/n1/src/mset node-2:$ROOT/n2/dst/mffdir
+
+echo "=== 500×16KB ≈ 8MB，目录递归（小文件风暴） ==="
+rm -rf ${RS_DST}smalls
+bench "rsync " rsync -a $ROOT/n1/src/smalls $RS_DST
+mkdir -p $ROOT/n2/dst/scp-check && rm -rf $ROOT/n2/dst/scp-check && bench "cp    " cp -R $ROOT/n1/src/smalls $ROOT/n2/dst/scp-check/
+rm -rf $ROOT/n2/dst/smalls-ff
+bench "ff    " FFCTL send -r node-1:$ROOT/n1/src/smalls node-2:$ROOT/n2/dst/smalls-ff
+echo "=== 目录：$ROOT ==="
