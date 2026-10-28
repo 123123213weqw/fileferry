@@ -227,6 +227,13 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 		if enc, key, err = newStreamCipher(); err != nil {
 			return 0, err
 		}
+		// 加密时不宣告 "seg" 能力：分段帧里的**字面量是明文**，发送侧本来
+		// 就会禁用（见 sendShareOnce），但接收端听到 "seg" 就会只回滚动
+		// 签名、不回整块复用表 —— 结果加密路径既拿不到 seg 计划、也拿不到
+		// reuseIdx，增量彻底失效（实测加密下内容相同的 32MiB 重传仍全量发
+		// 33.5MB）。不宣告 seg，接收端就回退到复用表，而引用帧只搬接收端
+		// 自己的数据、不含明文，加密下仍然安全可用。
+		mf.Cap = nil
 		if keyDeliverer == nil {
 			return 0, fmt.Errorf("grant 要求加密但未配置密钥上报")
 		}
@@ -296,6 +303,31 @@ func sendShare(ctx context.Context, f *os.File, open StreamOpener, grant *api.Tr
 // 都是字节流，分片写不改变线格式。
 const progressWriteSlice = 64 << 10
 
+// writeStallTimeout 是"连续这么久没有一次写成功"的判定阈值，**不是**整条
+// 份额的寿命上限。
+//
+// 之前这个 90 秒被当成绝对死线、在发送循环外设置一次（循环内从不续期），
+// 于是份额的**总耗时**被夹死在 90 秒：1GB@2MB/s = 500 秒的份额，从第 90 秒
+// 起每次 Write 立刻 i/o timeout。sendShare 只有 3 次尝试，每次也只能靠
+// HAVE 位图前进约 90 秒，单份额上限约 270 秒——大文件在慢链路上必然失败，
+// 而且不是"卡住才失败"，是稳定慢也失败。
+//
+// 声明为 var 便于测试覆盖（生产值 90s，与读侧 frameIdleTimeout 对称）。
+var writeStallTimeout = 90 * time.Second
+
+// armWriteDeadline 把写超时重新推到 now+writeStallTimeout，实现"停滞即失败"。
+//
+// 与读侧 idleReader（每帧静默即失败）是同一套语义：监控的是"停住了没有"，
+// 而不是"总共花了多久"。不支持 deadline 的实现（测试用 buffer 等）静默跳过。
+func armWriteDeadline(w io.Writer) {
+	if w == nil || writeStallTimeout <= 0 {
+		return
+	}
+	if d, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = d.SetWriteDeadline(time.Now().Add(writeStallTimeout))
+	}
+}
+
 // countingWriter 把**实际写出去的字节**累加进限速器与进度回调。
 type countingWriter struct {
 	w    io.Writer
@@ -312,6 +344,9 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 		if len(chunk) > progressWriteSlice {
 			chunk = chunk[:progressWriteSlice]
 		}
+		// 每一片写之前续期：写超时的语义是"这一片卡住多久算死"，
+		// 不是"整条份额最多活多久"（见 writeStallTimeout）。
+		armWriteDeadline(c.w)
 		n, err := c.w.Write(chunk)
 		if n > 0 {
 			total += n
@@ -429,8 +464,24 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	// 增量计划：整文件预扫描一次（跨分块连续匹配），各流只查表。
 	// 不能每流各扫各的——多流是按 idx%n 交错分配分块的，流内相邻块并不
 	// 相邻，跨块状态续写会错位（实测第 12~15 块重建哈希全部不符）。
+	// 如果接收端已经"全都有"（HAVE 位图覆盖本份额要发的每一块），就没必要
+	// 再跑整文件滚动预扫描——那是纯 CPU 浪费。实测 64MiB 内容完全相同的
+	// 重传：全量传 1.14s，而增量路径因为预扫描要 1.96s，越"优化"越慢。
+	// 上界取块数，不能沿用发送循环的"endCh<0 就一直加到 EOF"写法：
+	// 那个循环靠 ReadAt 返回 EOF 才 break，这里的纯计数循环没有 break 条件，
+	// 会变成死循环（空文件第一个就中）。
+	chunks := (mf.Size + int64(ChunkSize) - 1) / int64(ChunkSize)
+	pending := 0
+	for idx := startCh + int64(r); idx < chunks && (endCh < 0 || idx < endCh); idx += int64(n) {
+		if !have[idx] {
+			pending++
+		}
+	}
 	var segPlan map[int64][]byte
-	if sigIdx != nil && enc == nil {
+	if pending == 0 {
+		tracef("[tl] %s 流%d 无待发块（接收端已完整持有），跳过增量预扫描", grant.ID, r)
+	}
+	if sigIdx != nil && enc == nil && pending > 0 {
 		segPlan = getSegPlan(grant.ID, func() map[int64][]byte {
 			return planSegChunks(f, sigIdx, mf.Size)
 		})
@@ -439,9 +490,9 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 				grant.ID, len(segPlan), (mf.Size+int64(ChunkSize)-1)/int64(ChunkSize))
 		}
 	}
-	if wd, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		wd.SetWriteDeadline(time.Now().Add(90 * time.Second)) // 写阻塞自断，交给份额重试
-	}
+	// 写超时不再在这里设一次绝对死线：由 countingWriter 在**每一片**写入
+	// 之前续期（见 writeStallTimeout / armWriteDeadline），否则整条份额的
+	// 总耗时被夹死在 90 秒，慢链路必失败。
 	for idx := startCh + int64(r); endCh < 0 || idx < endCh; idx += int64(n) {
 		if have[idx] {
 			continue // 断点续传：接收端已有此块
@@ -504,6 +555,8 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	}
 	// 完成哨兵：零长度帧。接收端收齐全部份额的哨兵才落盘改名并回 ACK；
 	// QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
+	// 哨兵直写 stream（不过计数包装），所以这里也要单独续期一次写超时。
+	armWriteDeadline(stream)
 	if err := WriteFrame(stream, -1, []byte{}); err != nil {
 		return err
 	}

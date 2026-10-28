@@ -255,7 +255,7 @@ func TestRegressChunkIndexBound(t *testing.T) {
 	if err := WriteFrame(&buf, 99, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.feed(strings.NewReader(buf.String()), nil); err == nil {
+	if err := g.feed(strings.NewReader(buf.String())); err == nil {
 		t.Fatal("越界块号被接受（回归）")
 	}
 }
@@ -267,7 +267,7 @@ func TestRegressSharedDeckeyAcrossStreams(t *testing.T) {
 		mat[i] = byte(i)
 	}
 	calls := 0
-	SetKeyFetcher(func(grantID string) ([]byte, error) {
+	SetKeyFetcher(func(grantID, src string) ([]byte, error) {
 		calls++
 		if calls > 1 {
 			return nil, os.ErrNotExist // controller 侧一次性已删
@@ -279,12 +279,14 @@ func TestRegressSharedDeckeyAcrossStreams(t *testing.T) {
 	SetPathGuard(func(string) bool { return true })
 	defer SetPathGuard(nil)
 
+	// 用 t.Name() 而不是固定 ID：这些测试共用一个 recvGroups 进程级映射，
+	// 固定 ID 一旦前一个测试中途 Fatalf（跳过清理）就会串味。
 	g := &api.TransferGrant{
-		ID: "get-1", Src: "s", Dst: "d", Enc: true,
+		ID: t.Name(), Src: "s", Dst: "d", Enc: true,
 		ChunkSize: ChunkSize, ExpiresAt: time.Now().Add(time.Minute),
 		DstPath: filepath.Join(t.TempDir(), "o.bin"),
 	}
-	mf := &Manifest{GrantID: "get-1", Size: 8, SHA256: strings.Repeat("c", 64)}
+	mf := &Manifest{GrantID: t.Name(), Size: 8, SHA256: strings.Repeat("c", 64)}
 
 	first, err := groupFor(g, mf)
 	if err != nil {
@@ -300,7 +302,7 @@ func TestRegressSharedDeckeyAcrossStreams(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("取密钥次数应为 1，实际 %d", calls)
 	}
-	if first.deckey == nil || second.deckey == nil {
+	if len(first.keys) == 0 || len(second.keys) == 0 {
 		t.Fatal("解密器未共享")
 	}
 	// 清理
@@ -330,7 +332,7 @@ func TestRegressInboxMappingReceiverOnly(t *testing.T) {
 
 	grant := newGrant(t, "alpha", "beta", "inbox:payload.bin")
 	grant.SrcPath = srcPath
-	grant.ID = "get-1"
+	grant.ID = t.Name()
 	sign(grant)
 
 	// 接收端注入 inbox 根

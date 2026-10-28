@@ -321,7 +321,7 @@ func main() {
 	// 16 MiB 足够；超过直接 413，避免未认证连接把内存吃穿。
 	srv := &http.Server{
 		Addr:      cfg.Listen,
-		Handler:   http.MaxBytesHandler(mux, 16<<20),
+		Handler:   http.MaxBytesHandler(c.revokeGuard(mux), 16<<20),
 		TLSConfig: tlsCfg,
 		// 控制面不能被慢连接拖死：之前没设任何超时，未认证的慢速
 		// 请求头 + 大 JSON 就能占满连接与内存。
@@ -331,6 +331,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 	}
+	go c.pruneLoop()
 	log.Printf("controller 监听 %s（数据目录 %s，自身证书自动续期已启用）", cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
@@ -514,6 +515,46 @@ func (c *controller) lookupGrantDst(id string) api.NodeID {
 	return g.Dst
 }
 
+// retentionDays 是审计/任务历史表的保留天数。
+// events / jobs / replicas 三张表原本**没有任何 DELETE**：审计每条请求一行、
+// 任务每次状态变更一行更新，跑几个月就是几十万行，SQLite 文件只涨不落。
+const retentionDays = 30
+
+// pruneHistory 删除超过保留期的终态任务与审计事件。
+// 只删"已经结束"的任务：queued/running 的记录是重启恢复的依据，不能碰。
+func (c *controller) pruneHistory(now time.Time) (events, jobs int64, err error) {
+	cutoff := now.AddDate(0, 0, -retentionDays).Unix()
+	re, err := c.db.Exec(`DELETE FROM events WHERE ts < ?`, cutoff)
+	if err != nil {
+		return 0, 0, err
+	}
+	events, _ = re.RowsAffected()
+	rj, err := c.db.Exec(
+		`DELETE FROM jobs WHERE updated < ? AND status NOT IN ('queued','running')`, cutoff)
+	if err != nil {
+		return events, 0, err
+	}
+	jobs, _ = rj.RowsAffected()
+	return events, jobs, nil
+}
+
+// pruneLoop 启动后先清一次，之后每天一次。
+func (c *controller) pruneLoop() {
+	run := func() {
+		if ev, jb, err := c.pruneHistory(time.Now()); err != nil {
+			log.Printf("历史清理失败：%v", err)
+		} else if ev > 0 || jb > 0 {
+			log.Printf("历史清理：删除 %d 条审计事件、%d 条陈旧任务（保留 %d 天）", ev, jb, retentionDays)
+		}
+	}
+	run()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for range t.C {
+		run()
+	}
+}
+
 // rehydrate 从 SQLite 恢复未完成任务到内存队列。
 func (c *controller) rehydrate() int {
 	rows, err := c.db.Query(`SELECT grant_json FROM jobs WHERE status='queued'`)
@@ -635,6 +676,40 @@ func (c *controller) lookupReplicas(sha string, exclude map[api.NodeID]bool) map
 
 // handleJobs：仅 admin。任务列表（含状态），支持 ?id= 精确查——
 // ffctl send --wait 轮询用，也是程序化集成的任务查询接口。
+// revokeGuard 统一拒绝"证书已被吊销"的后续请求。
+//
+// 之前吊销只覆盖 4 个地方（pull/push 的目的端检查、renew、heartbeat），
+// /v1/index、/v1/jobdone、/v1/keypass、/v1/get 都不查。被吊销的节点在证书
+// 剩余有效期（节点 24 小时）内仍能：
+//   - POST /v1/index 把 handleRevoke 刚清掉的副本索引重新灌回去；
+//   - 回报 jobdone 改写任务终态，并污染 pathBW / SetEdgeBW 调度权重；
+//   - 取走自己作为目的端的 keypass 密钥。
+//
+// admin 证书同样受益：它的 TTL 是 10 年，且从未经过 heartbeat/renew，所以
+// 在加了这道闸之前，"吊销 admin"是个空操作。
+//
+// /v1/enroll 必须放行：它靠一次性 token 把关，此时还没有客户端证书。
+func (c *controller) revokeGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/enroll" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
+			c.mu.Lock()
+			revoked := c.revoked[cn]
+			c.mu.Unlock()
+			if revoked {
+				c.event("forbidden", string(cn), "revoked cert: "+r.URL.Path)
+				http.Error(w, "certificate revoked", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	b, err := os.ReadFile(path)
@@ -697,7 +772,13 @@ func (l *enrollLedger) nextAutoNodeID() string {
 func loadEnrollLedger(dir string) *enrollLedger {
 	l := &enrollLedger{Burned: map[string]string{}, NextNode: 1}
 	if b, err := os.ReadFile(dir + "/enroll-ledger.json"); err == nil {
-		json.Unmarshal(b, l)
+		// 解析失败必须硬失败，不能静默吞掉：台账被截断时 Burned 会变空，
+		// 于是所有已核销的入网 token 复活、NextNode 归 1，新节点可能拿到
+		// 旧节点编号与既有 CN 撞号（注释里"核销即废、编号绝不复用"两条
+		// 同时失效）。宁可起不来，也不能带着"全部 token 可重放"跑。
+		if uerr := json.Unmarshal(b, l); uerr != nil {
+			log.Fatalf("入网台账解析失败（%s/enroll-ledger.json）：%v；请从备份恢复，不要直接删", dir, uerr)
+		}
 	}
 	if l.Burned == nil {
 		l.Burned = map[string]string{}
@@ -720,7 +801,38 @@ func (l *enrollLedger) save(dir string) {
 	if err != nil {
 		return
 	}
-	os.WriteFile(dir+"/enroll-ledger.json", b, 0o600)
+	// tmp + fsync + rename：之前是 os.WriteFile 原地截断且**丢弃错误**。
+	// 崩在写一半或 ENOSPC 时留下的是半截 JSON，下次启动解析失败 → 见
+	// loadEnrollLedger 里的说明。这里失败必须留痕，不能静静吞掉。
+	if err := writeFileAtomic(dir+"/enroll-ledger.json", b, 0o600); err != nil {
+		log.Printf("严重：入网台账落盘失败（重启后已核销 token 可能复活）：%v", err)
+	}
+}
+
+// writeFileAtomic 以 tmp+fsync+rename 写文件，避免读者/重启看到写了一半的内容。
+func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name) // 成功 rename 后这里是无害的 no-op
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(name, perm); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // handleEnroll：一次性 token 换节点证书（角色固定为 node）。

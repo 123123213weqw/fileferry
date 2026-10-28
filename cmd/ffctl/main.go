@@ -132,6 +132,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "证书加载失败：", err)
 		os.Exit(1)
 	}
+	// ffctl 自己就是数据面的一端：put 时它是**源**（要把本次传输的密钥上报给
+	// controller，目的端才解得开），get 时它是**目的端**（要取回密钥）。
+	// 之前这两处都没接，于是 controller 一旦签发 enc=true 的授权（例如
+	// enc-default: true），put 立刻报"grant 要求加密但未配置密钥上报"，
+	// 也就是说"开了加密就没法 put"。
+	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
+		return cl.PostKeypass(grantID, material)
+	})
+	transfer.SetKeyFetcher(func(grantID, src string) ([]byte, error) {
+		return cl.GetKeypass(grantID, src)
+	})
 
 	switch rest[0] {
 	case "send":

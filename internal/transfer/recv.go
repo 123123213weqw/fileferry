@@ -21,20 +21,24 @@ import (
 	"time"
 )
 
-func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots *x509.CertPool) {
+// RecvStream 按认证清单接收一条流的份额。返回 error 表示**这个份额没有
+// 成功收下**（清单验签失败、建组失败、链路提前断开、校验不符、等待超时）。
+//
+// 为什么必须返回 error：之前它返回 void，失败只打一行日志，交换台模式的
+// switchRecvShare 于是无条件 `return nil`，上层计数永远为 0，运维看到的是
+// "接收完成"——验签失败、块不齐、哈希不符全都报成功。文件是否落盘与"这条
+// 流是否成功"必须能被上层判定，否则失败会被静默吞掉。
+func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots *x509.CertPool) error {
 	line, err := readHeaderLine(br) // manifest 行（grant 行由调用方已读）
 	if err != nil {
-		fmt.Println("manifest 读取失败：", err)
-		return
+		return fmt.Errorf("manifest 读取失败：%w", err)
 	}
 	var mf Manifest
 	if err := json.Unmarshal([]byte(line), &mf); err != nil {
-		fmt.Println("manifest 解析失败：", err)
-		return
+		return fmt.Errorf("manifest 解析失败：%w", err)
 	}
 	if err := mf.Verify(grant, roots); err != nil {
-		fmt.Printf("拒绝传输 %s：%v\n", grant.ID, err)
-		return
+		return fmt.Errorf("拒绝传输：%w", err)
 	}
 	// 解密器由接收组持有（建组时取一次，各并行流共用）。controller
 	// 对密钥是一次性发放，放在这里每流各取一次必然有流失败。
@@ -50,6 +54,13 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		// 据此跳过相同块。旧版发送端会因整行 base64 解码失败而退化为
 		// 全量发送，行为仍然正确。
 		g.reuseOnce.Do(func() {
+			// 已经全都有（断点续传的最后一条流、或内容完全相同的重传）：
+			// 不必再扫一遍旧文件算分块哈希/滚动签名。64MiB 扫描约 0.2s，
+			// 而这一轮根本没有数据要发。
+			if got, want := g.progress(); want > 0 && got >= want {
+				tracef("[tl] %s 已持有全部 %d 块，跳过增量协商扫描", grant.ID, want)
+				return
+			}
 			// 发送端声明支持分段帧时，改用 rsync 风格签名：块更小、
 			// 且可由发送端在**任意偏移**上滚动匹配，能处理错位。
 			// 不支持的话退回上一版的整块复用表（只认 4MB 对齐）。
@@ -103,42 +114,41 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		// 连接一关就是 broken pipe，重试也全撞墙（多流卡死的根因）
 		stream.Write([]byte("ACK\n"))
 		fmt.Printf("迟到流确认：%s（文件此前已完整落盘）\n", grant.ID)
-		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-			s.SetReadDeadline(time.Now().Add(10 * time.Minute))
-		}
+		// drain 到对端关闭。只设一个 deadline：之前连着设两次
+		// （10 分钟紧接 90 秒），实际生效的是后者，10 分钟那行是死代码。
 		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
 			s.SetReadDeadline(time.Now().Add(90 * time.Second))
 		}
 		io.Copy(io.Discard, stream)
-		return
+		return nil // 文件此前已完整落盘，这条迟到流本来就该成功收尾
 	}
 	if err != nil {
-		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
-		return
+		return fmt.Errorf("建组失败：%w", err)
 	}
-	if err := g.feed(br, g.deckey); err != nil {
-		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
-		return
+	if err := g.feed(br); err != nil {
+		return fmt.Errorf("收块失败：%w", err)
 	}
 	select {
 	case <-g.finished:
 	case <-time.After(10 * time.Minute):
-		fmt.Printf("接收 %s 超时：未收齐全部块\n", grant.ID)
-		return
+		got, want := g.progress()
+		return fmt.Errorf("等待收齐全部块超时（已收 %d/%d）", got, want)
 	}
 	if g.finErr != nil {
-		fmt.Printf("接收 %s 校验失败：%v（文件已丢弃）\n", grant.ID, g.finErr)
-		return
+		return fmt.Errorf("校验失败（文件已丢弃）：%w", g.finErr)
 	}
 	// ACK 单独给一个明确的超时，而不是继承 HAVE 阶段的 5 秒（见上）。
 	if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		w.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	}
 	if _, err := stream.Write([]byte("ACK\n")); err != nil {
+		// 文件已完整落盘并核验过，ACK 丢了对端会重试，重试时走
+		// ErrAlreadyDone 分支重发 ACK。这里不该把成果报成失败。
 		fmt.Printf("接收完成但 ACK 写失败 %s：%v（文件已落盘）\n", grant.ID, err)
-		return
+		return nil
 	}
 	fmt.Printf("接收完成：%s（src=%s，%d 字节）-> %s\n", grant.ID, grant.Src, mf.Size, grant.DstPath)
+	return nil
 }
 
 // recvOne 是数据面监听上的接收入口（已读 head 与 grant 行）。
@@ -147,7 +157,9 @@ func recvOne(br *bufio.Reader, stream Stream, grant *api.TransferGrant, tlsConf 
 	if tlsConf != nil {
 		roots = tlsConf.RootCAs
 	}
-	RecvStream(br, stream, grant, roots)
+	if err := RecvStream(br, stream, grant, roots); err != nil {
+		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
+	}
 }
 
 // recvGroup 按"唯一块计数"协调并行接收：收齐 manifest 声明的全部
@@ -157,6 +169,8 @@ type recvGroup struct {
 	mu        sync.Mutex
 	grantID   string
 	wantSHA   string
+	keys      map[api.NodeID]*streamCipher // 多源：每个源一把；单源只有主源
+	ranges    []api.SourceSpec             // grant 里的分片区间（块 → 源）
 	finalPath string
 	dstPath   string // 最终落盘路径（增量扫描已有文件用）
 	tmp       *os.File
@@ -225,12 +239,16 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 	}
 	recvMu.Unlock()
 
-	// 锁外取密钥：每个 grant 只取一次，各并行流共用
-	var deckey *streamCipher
+	// 锁外取密钥：每个源取一次，各并行流共用。
+	// 多源模式下每个源有自己的密钥，必须各取一把并按块区间选用。
+	keys := map[api.NodeID]*streamCipher{}
 	if grant.Enc {
-		var kerr error
-		if deckey, kerr = cipherForGrant(grant.ID); kerr != nil {
-			return nil, fmt.Errorf("取密钥失败: %w", kerr)
+		for _, src := range grant.AllSources() {
+			key, kerr := cipherForGrant(grant.ID, string(src))
+			if kerr != nil {
+				return nil, fmt.Errorf("取密钥失败（源 %s）: %w", src, kerr)
+			}
+			keys[src] = key
 		}
 	}
 
@@ -260,12 +278,13 @@ func groupFor(grant *api.TransferGrant, mf *Manifest) (*recvGroup, error) {
 		grantID:   grant.ID,
 		wantSHA:   wantSHA,
 		size:      mf.Size,
-		deckey:    deckey,
+		keys:      keys,
 		finalPath: grant.DstPath,
 		dstPath:   grant.DstPath,
 		tmp:       tmp,
 		tmpName:   tmp.Name(),
 		expected:  n,
+		ranges:    grant.Sources,
 		got:       map[int64]bool{},
 		finished:  make(chan struct{}),
 	}
@@ -295,7 +314,11 @@ func (g *recvGroup) loadProgress() {
 		return
 	}
 	if p.Size != g.size || p.SHA256 != g.wantSHA {
-		return // 目标变了，作废旧进度
+		// 目标变了：旧位图与它记录的临时文件都已无用。之前直接 return，
+		// 于是放弃的任务会在目的目录里留下与源文件等大的 .ff-* 和 .ffpart，
+		// 谁也不会再清理。
+		g.discardStaleProgress(p.TmpName)
+		return
 	}
 	// 接管旧临时文件：丢弃本次新建的，用进度里的
 	g.tmp.Close()
@@ -319,13 +342,44 @@ func (g *recvGroup) loadProgress() {
 	}
 }
 
+// discardStaleProgress 删除作废的进度 sidecar 与它记录的临时文件。
+//
+// TmpName 来自 sidecar JSON，是不可信输入：只接受"与目标文件同目录、且
+// 文件名形如 .ff-*"的路径，否则拒绝删除（不然一个伪造的 sidecar 就能让
+// 接收端删掉任意文件）。
+func (g *recvGroup) discardStaleProgress(tmpName string) {
+	if tmpName != "" {
+		dir := filepath.Dir(g.finalPath)
+		if filepath.Dir(tmpName) == dir && strings.HasPrefix(filepath.Base(tmpName), ".ff-") {
+			os.Remove(tmpName)
+		} else {
+			log.Printf("%s 进度文件记录的临时路径可疑，拒绝删除：%q", g.grantID, tmpName)
+		}
+	}
+	g.clearProgress()
+}
+
 // saveProgress 位图落盘（断点续传依据）。
 // saveProgress 必须自行加锁：多流共享同一个 recvGroup，调用点都在
 // 释放锁之后，直接遍历 g.got 会与其他流的写入并发——Go 的 map 并发
 // 读写会直接 panic（race detector 实测在 40MB 多流场景触发）。
 func (g *recvGroup) saveProgress() {
+	// 先把临时文件刷到盘，再写位图。
+	//
+	// 顺序不能反：位图声称"块 N 已收"必须以保证块 N 的数据真的落盘为前提。
+	// 之前直接写位图、数据还留在 page cache 里，断电后位图与临时文件内容
+	// 不一致 —— 续传接管临时文件时 len(got)==expected 立刻成立，直接进
+	// finalize，全文件哈希不符，白跑一整遍并硬失败一次。
+	//
+	// Sync 不持 g.mu：它可能要等磁盘，持锁会把同组其他流一起堵住。
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	tmp := g.tmp
+	g.mu.Unlock()
+	if tmp != nil {
+		_ = tmp.Sync()
+	}
+
+	g.mu.Lock()
 	bits := make([]byte, (g.expected+7)/8)
 	for i := range g.got {
 		if i >= 0 && i/8 < int64(len(bits)) {
@@ -339,7 +393,43 @@ func (g *recvGroup) saveProgress() {
 		Bits    []byte `json:"bits"`
 	}
 	b, _ := json.Marshal(progress{Size: g.size, SHA256: g.wantSHA, TmpName: g.tmpName, Bits: bits})
-	os.WriteFile(g.partPath(), b, 0o600)
+	part := g.partPath()
+	g.mu.Unlock()
+
+	// 原子写：中途崩溃/ENOSPC 时留下的是旧位图或没有位图，而不是被截断的
+	// 半行 JSON（截断的 JSON 解析失败 → 整个进度作废，等于从头再来）。
+	writeFileAtomic(part, b, 0o600)
+}
+
+// writeFileAtomic 以 tmp+rename 写入，避免读者看到写了一半的文件。
+func writeFileAtomic(path string, b []byte, perm os.FileMode) {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".ffpart-*")
+	if err != nil {
+		return
+	}
+	name := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(name)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(name)
+		return
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return
+	}
+	if err := os.Chmod(name, perm); err != nil {
+		os.Remove(name)
+		return
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+	}
 }
 
 // clearProgress 进度完成或作废时清理。
@@ -365,8 +455,35 @@ func (g *recvGroup) hasChunk(idx int64) bool {
 	return g.got[idx]
 }
 
-// feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
-// deckey 非空时先解密（端到端加密）。
+// progress 返回"已收块数 / 总块数"（持锁读，供日志与判据使用）。
+func (g *recvGroup) progress() (got, want int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.got), int(g.expected)
+}
+
+// markComplete 尝试把组标记为"已收齐全部块"，只有**唯一一个**调用者会拿到
+// true，也只有它有权调用 finalize。
+//
+// 为什么必须是"唯一一个"：finalize 第一行就是 close(g.finished)，第二次调用
+// 会 panic: close of closed channel，而 agent 没有 recover——整进程退出，
+// 不是单任务失败。
+//
+// 为什么判定和置位必须在同一个临界区：之前 fillFromLocal 在锁外读
+// len(g.got)，与并发 storeBlock/fillFromLocal 的写入竞争，会触发
+// fatal error: concurrent map read and map write（同样不可 recover）。
+// 触发形状很日常：4 条流并行，最后一块由某条流的 ref 帧补齐，同时另一条
+// 流超时重试、重发了同一条 ref 帧。
+func (g *recvGroup) markComplete() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done || len(g.got) != int(g.expected) {
+		return false
+	}
+	g.done = true
+	return true
+}
+
 // storeBlock 写入一个已就绪的明文分块，并推进进度/完成判定。
 //
 // 抽出来是因为三条路径（普通帧、引用帧、分段帧）的落盘逻辑必须完全一致，
@@ -376,28 +493,21 @@ func (g *recvGroup) storeBlock(idx int64, data []byte) error {
 		return err
 	}
 	g.mu.Lock()
-	first := !g.got[idx]
-	if first {
+	if !g.got[idx] {
 		g.got[idx] = true
 		g.dirty++
 	}
 	needFlush := g.dirty >= 8 || len(g.got) == int(g.expected)
-	pending := g.dirty
 	if needFlush {
 		g.dirty = 0
-	}
-	done := len(g.got) == int(g.expected) && !g.done
-	if done {
-		g.done = true
 	}
 	g.mu.Unlock()
 	if needFlush {
 		g.saveProgress()
 	}
-	if done {
+	if g.markComplete() {
 		g.finalize()
 	}
-	_ = pending
 	return nil
 }
 
@@ -453,21 +563,52 @@ func (g *recvGroup) fillFromLocal(idx, srcOff int64) error {
 		g.dirty -= pending
 		g.mu.Unlock()
 	}
-	if len(g.got) == int(g.expected) && !g.done {
-		g.mu.Lock()
-		if !g.done {
-			g.done = true
-		}
-		g.mu.Unlock()
+	// 完成判定必须走 markComplete：它把"最后一块是谁补上的"这个竞争
+	// 收进同一个临界区，保证 finalize 只被调用一次（见其注释）。
+	if g.markComplete() {
 		g.finalize()
 	}
 	return nil
 }
 
-func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
+// feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
+// deckey 非空时先解密（端到端加密）。
+// cipherFor 返回负责第 idx 块的源所使用的解密器。
+//
+// 块 → 源的映射来自 controller 签名钉死的 grant.Sources[].Start/End，
+// 所以它不可被中继改写；空映射（单源或未加密）返回 nil。
+func (g *recvGroup) cipherFor(idx int64) *streamCipher {
+	if len(g.keys) == 0 {
+		return nil
+	}
+	if len(g.keys) == 1 {
+		for _, c := range g.keys {
+			return c
+		}
+	}
+	g.mu.Lock()
+	ranges := g.ranges
+	g.mu.Unlock()
+	for _, sp := range ranges {
+		if idx >= sp.Start && idx < sp.End {
+			return g.keys[sp.NodeID]
+		}
+	}
+	return nil
+}
+
+func (g *recvGroup) feed(r io.Reader) error {
 	for {
 		idx, data, err := ReadFrame(r)
 		if err == io.EOF {
+			// 干净 EOF 只说明"这条连接结束了"，不等于"这个份额的数据到齐"。
+			// 之前直接返回 nil，上层就去等 g.finished：块没齐时白等 10 分钟
+			// （发送端同时卡在 10 分钟 ACK 上），把"中继重启/链路切换"这种
+			// 本该快速失败的场景变成十分钟静默。
+			got, want := g.progress()
+			if got < want {
+				return fmt.Errorf("连接在份额完成前关闭（已收 %d/%d 块，无完成哨兵）", got, want)
+			}
 			return nil
 		}
 		if err != nil {
@@ -547,7 +688,7 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 		if idx < 0 || idx >= expected {
 			return fmt.Errorf("块号 %d 超出范围 [0,%d)", idx, expected)
 		}
-		if deckey != nil {
+		if deckey := g.cipherFor(idx); deckey != nil {
 			if data, err = deckey.open(idx, data); err != nil {
 				return fmt.Errorf("块 %d 解密失败: %w", idx, err)
 			}

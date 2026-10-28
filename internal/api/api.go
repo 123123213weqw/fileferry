@@ -256,7 +256,7 @@ type TransferGrant struct {
 	Retries    int          `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
 	Enc        bool         `json:"enc,omitempty"`     // 端到端加密（密钥经 controller 专递，不进 grant）
 	Mix        bool         `json:"mix,omitempty"`     // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
-	Sig        string       `json:"sig"`               // ed25519，覆盖以上所有字段
+	Sig        string       `json:"sig"`               // ed25519 over payloadV3（见 api.go）
 }
 
 // SourceSpec 是多源 grant 中一个源的分片：负责块区间 [Start, End)。
@@ -289,8 +289,12 @@ func (g *TransferGrant) AllSources() []NodeID {
 // ',' ';' '|' 就能构造出"不同 JSON 却同一签名串"的歧义。V2 对每个
 // 变长字段前置长度，签名串与结构一一对应。
 func (g *TransferGrant) payloadV2() []byte {
+	return append([]byte("ff2|"), g.payloadBody()...)
+}
+
+// payloadBody 是 V2 的字段序列（不含版本前缀），供 V2/V3 共用。
+func (g *TransferGrant) payloadBody() []byte {
 	var sb strings.Builder
-	sb.WriteString("ff2|")
 	wStr := func(v string) {
 		fmt.Fprintf(&sb, "%d:", len(v))
 		sb.WriteString(v)
@@ -306,7 +310,7 @@ func (g *TransferGrant) payloadV2() []byte {
 	wInt(int64(len(g.Hops)))
 	for _, h := range g.Hops {
 		wStr(string(h.NodeID))
-		wStr(h.Addr) // Proto 不进签名（同 V1：拨号协议是路由提示）
+		wStr(h.Addr) // Proto 不进签名（拨号协议是路由提示，混流会按流改写）
 	}
 	wInt(int64(len(g.Sources)))
 	for _, sp := range g.Sources {
@@ -330,30 +334,27 @@ func (g *TransferGrant) payloadV2() []byte {
 	return []byte(sb.String())
 }
 
-func (g *TransferGrant) payload() []byte {
+// payloadV3 = V2 字段 + V2 漏掉的 Hop.TCPPort / SourceSpec.TCPPort / RateLimit。
+//
+// 为什么必须补：这三者都改变了数据面的实际行为——agent 真的用
+// g.Hops[1].TCPPort 拨号（cmd/agent/main.go），RateLimit 决定整任务配额。
+// 而 V2 不含它们，于是"持 grant 的中继把某一跳改指同主机另一个端口"或
+// "把限速清零"都能带着合法签名通过验签。api.go 里那句"Sig 覆盖以上所有
+// 字段"的注释在 V2 下是假的，V3 才让它是真的。
+func (g *TransferGrant) payloadV3() []byte {
+	b := append([]byte("ff3|"), g.payloadBody()...)
 	var sb strings.Builder
-	sb.WriteString("ff1|")
-	sb.WriteString(g.ID)
-	sb.WriteByte('|')
-	sb.WriteString(string(g.Src))
-	sb.WriteByte('|')
-	sb.WriteString(string(g.Dst))
-	sb.WriteByte('|')
-	sb.WriteString(g.Mode)
-	sb.WriteByte('|')
-	fmt.Fprintf(&sb, "%d|%s|%d|", g.FileSize, g.FileSHA256, g.ChunkSize)
+	wInt := func(v int64) { fmt.Fprintf(&sb, "%d;", v) }
+	wInt(int64(len(g.Hops)))
 	for _, h := range g.Hops {
-		// Proto 不进签名：混流按流改写拨号协议属路由提示，非授权语义
-		fmt.Fprintf(&sb, "h:%s,%s;", h.NodeID, h.Addr)
+		wInt(int64(h.TCPPort))
 	}
+	wInt(int64(len(g.Sources)))
 	for _, sp := range g.Sources {
-		fmt.Fprintf(&sb, "s:%s,%s,%s,%d,%d;", sp.NodeID, sp.Addr, sp.Path, sp.Start, sp.End)
+		wInt(int64(sp.TCPPort))
 	}
-	sb.WriteString(g.SrcPath)
-	sb.WriteByte('|')
-	sb.WriteString(g.DstPath)
-	fmt.Fprintf(&sb, "|%d|%d|%d|%v|%v", g.Streams, g.Retries, g.ExpiresAt.Unix(), g.Enc, g.Mix)
-	return []byte(sb.String())
+	wInt(g.RateLimit)
+	return append(b, []byte(sb.String())...)
 }
 
 // ValidateNodeName 校验显式配置的节点名。与 controller 的
@@ -381,7 +382,7 @@ func ValidateNodeName(name string) error {
 }
 
 func (g *TransferGrant) Sign(priv ed25519.PrivateKey) {
-	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payloadV2()))
+	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payloadV3()))
 }
 
 func (g *TransferGrant) Verify(pub ed25519.PublicKey) bool {
@@ -389,10 +390,20 @@ func (g *TransferGrant) Verify(pub ed25519.PublicKey) bool {
 	if err != nil {
 		return false
 	}
-	// 先按 V2 验；不通过再按 V1 验，保证 controller 先升级、agent
-	// 后升级的滚动过程中已签发的旧 grant 仍然有效。
-	return ed25519.Verify(pub, g.payloadV2(), sig) ||
-		ed25519.Verify(pub, g.payload(), sig)
+	// 先按 V3 验（当前签发版本，覆盖 TCPPort / RateLimit）。
+	//
+	// 再按 V2 验：只为"升级前已签发、还在 30 分钟 TTL 内"的旧 grant 留门。
+	// 攻击者无法把 V3 签名的 grant 降级成 V2 通过——签名是对具体字节做的，
+	// 他没有 controller 私钥就造不出 V2 签名的串。代价是每次升级后有最多
+	// 30 分钟窗口，期间旧 grant 的 TCPPort/RateLimit 仍可被改写；升级脚本
+	// 跑完即消失。
+	//
+	// V1（裸分隔符手拼）已删除：Sign 从来只签 V2/V3，所以 V1 分支只可能被
+	// "升级前的旧 controller" 命中，而那种 controller 本来就在发可碰撞的
+	// 签名串。删掉它，旧 controller + 新 agent 会失败关闭而不是接受可篡改
+	// 的授权。
+	return ed25519.Verify(pub, g.payloadV3(), sig) ||
+		ed25519.Verify(pub, g.payloadV2(), sig)
 }
 
 // Client 是 controller 的 HTTP 客户端；enroll 阶段可不带证书调用。
@@ -553,11 +564,19 @@ func (c *Client) PostKeypass(grantID string, material []byte) error {
 	}, &ignored)
 }
 
-func (c *Client) GetKeypass(grantID string) ([]byte, error) {
+// GetKeypass 取某个源为该 grant 上报的密钥材料。
+//
+// src 为空表示"主源"（旧 controller 只认 id，会忽略多出来的 src 参数，
+// 所以新 agent 对着旧 controller 单源仍然可用）。
+func (c *Client) GetKeypass(grantID, src string) ([]byte, error) {
 	var resp struct {
 		KeyB64 string `json:"key_b64"`
 	}
-	if err := c.Get("/v1/keypass?id="+url.QueryEscape(grantID), &resp); err != nil {
+	u := "/v1/keypass?id=" + url.QueryEscape(grantID)
+	if src != "" {
+		u += "&src=" + url.QueryEscape(src)
+	}
+	if err := c.Get(u, &resp); err != nil {
 		return nil, err
 	}
 	return base64.StdEncoding.DecodeString(resp.KeyB64)

@@ -34,8 +34,9 @@ func (f *failWriter) Write([]byte) (int, error) { return 0, errors.New("broken p
 func (f *failWriter) WriteHeader(int)           {}
 
 type recWriter struct {
-	h   http.Header
-	buf bytes.Buffer
+	h    http.Header
+	buf  bytes.Buffer
+	code int // 记录 WriteHeader 的状态码（测试要断言 403/413/429）
 }
 
 func (w *recWriter) Header() http.Header {
@@ -45,7 +46,15 @@ func (w *recWriter) Header() http.Header {
 	return w.h
 }
 func (w *recWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
-func (w *recWriter) WriteHeader(int)             {}
+func (w *recWriter) WriteHeader(code int)        { w.code = code }
+
+// Code 返回响应的状态码（未显式调用 WriteHeader 时按 200 记）。
+func (w *recWriter) Code() int {
+	if w.code == 0 {
+		return http.StatusOK
+	}
+	return w.code
+}
 
 func newTestController(t *testing.T) *controller {
 	t.Helper()

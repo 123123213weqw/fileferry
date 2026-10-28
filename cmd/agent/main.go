@@ -91,6 +91,9 @@ var (
 
 	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
 
+	// startedAt 用于判定冷启动窗口（见 heartbeatLoop 的短轮询）。
+	startedAt = time.Now()
+
 	cpuSamplerGlobal cpuSampler // CPU 占用率需要两次采样求差
 
 	revokedMu  sync.Mutex
@@ -116,8 +119,17 @@ func probeBackoff(fails int) time.Duration {
 	if fails <= 0 {
 		return 0
 	}
+	// 头两次失败只退避几秒：agent 刚启动时对端的数据面可能还没监听（两个
+	// agent 同时拉起），首次探测必然失败。之前一律退避 30 秒，于是"起来
+	// 就能传"变成"起等半分钟"——实测 15 秒时 send 直接报 no reachable path，
+	// 40 秒才建出边。
+	// 对端真宕机时，30 秒后的几次探测会把退避迅速推到上限，日志也不会刷屏
+	// （markProbe 只在首次失败记一行）。
+	if fails <= 2 {
+		return time.Duration(fails) * 3 * time.Second
+	}
 	d := 30 * time.Second
-	for i := 1; i < fails && d < 5*time.Minute; i++ {
+	for i := 3; i < fails && d < 5*time.Minute; i++ {
 		d *= 2
 	}
 	if d > 5*time.Minute {
@@ -247,8 +259,8 @@ func run(cfgPath string) error {
 	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
 		return hbClient.PostKeypass(grantID, material)
 	})
-	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
-		return hbClient.GetKeypass(grantID)
+	transfer.SetKeyFetcher(func(grantID, src string) ([]byte, error) {
+		return hbClient.GetKeypass(grantID, src)
 	})
 	transfer.SetInboxRoot(cfg.DataDir)
 	if len(cfg.AllowedDirs) > 0 {
@@ -602,8 +614,8 @@ func shareDir() string {
 	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
 		return hbClient.PostKeypass(grantID, material)
 	})
-	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
-		return hbClient.GetKeypass(grantID)
+	transfer.SetKeyFetcher(func(grantID, src string) ([]byte, error) {
+		return hbClient.GetKeypass(grantID, src)
 	})
 	if len(cfg.AllowedDirs) > 0 {
 		return cfg.AllowedDirs[0]
@@ -685,6 +697,16 @@ func heartbeatLoop() {
 		free := diskFree(cfg.DataDir)
 		mu.Lock()
 		active := len(running)
+		// 冷启动短轮询：探测出来的边是**随下一次心跳**上报的，而心跳最长
+		// 挂 8 秒，于是"起来就能传"要等到第二次心跳（实测 12 秒时 status
+		// 仍显示 出边=[]，15 秒时 send 直接报 no reachable path）。
+		// 还没上报过任何边、且启动不到 60 秒时，把轮询缩到 1.5 秒：建边
+		// 延迟从 ~16 秒降到 ~4 秒。上报过一次边、或已经跑了 60 秒仍无对端
+		// （孤岛节点）就回到 8 秒，避免长期空转。
+		waitMS := 8000
+		if len(edges) == 0 && time.Since(startedAt) < 60*time.Second {
+			waitMS = 1500
+		}
 		hb := api.Heartbeat{
 			NodeID:        nodeID,
 			Hostname:      hostname,
@@ -700,7 +722,7 @@ func heartbeatLoop() {
 			// 长轮询：有任务立刻回，避免每条命令白等一次心跳。
 			// 必须明显小于 topology.HeartbeatTimeout（20s），否则节点会
 			// 在两次心跳之间被判离线。
-			WaitMS: 8000,
+			WaitMS: waitMS,
 		}
 		mu.Unlock()
 		hbStart := time.Now()
@@ -1136,7 +1158,13 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
 	if err := json.Unmarshal([]byte(line), &gg); err != nil || gg.ID != g.ID {
 		return fmt.Errorf("grant 不符")
 	}
-	transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs)
+	// RecvStream 现在返回 error：之前它返回 void，失败只打一行日志，于是
+	// 本函数无条件 return nil，runSwitchRecv 的失败计数永远为 0，运维看到
+	// 的是"接收完成"——验签失败、块不齐、哈希不符全都报成功。
+	if err := transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs); err != nil {
+		transfer.CloseWrite(stream)
+		return fmt.Errorf("收流失败：%w", err)
+	}
 	// ACK 已写入流：只半关写侧，等对端读走、对端关闭后再退出，
 	// 避免 QUIC 立即关连接丢弃未送达的 ACK
 	transfer.CloseWrite(stream)
@@ -1214,6 +1242,9 @@ func probeLoop() {
 	}
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
+	// 先跑一轮：之前只等 ticker 或"节点表变化"，而节点表本身要等心跳
+	// 回来才更新，于是"刚启动就能传"退化成"起等 30~40 秒"。
+	runRound()
 	for {
 		select {
 		case <-t.C:

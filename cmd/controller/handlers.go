@@ -303,6 +303,10 @@ func (c *controller) handlePush(w http.ResponseWriter, r *http.Request) {
 		FileSHA256: req.SHA256,
 		FileSize:   req.Size,
 		ExpiresAt:  time.Now().Add(grantTTL),
+		// 端到端加密：之前这条 push 路径**没设 Enc**，于是 cfg.EncDefault
+		// 只对 send/get 生效，`ffctl put` 即使 enc-default: true 也永远发
+		// 明文——而 README 与 crypto.go 都宣称"中继只见密文"。
+		Enc: c.cfg.EncDefault,
 	}
 	g.Sign(c.signer)
 	c.mu.Unlock()
@@ -527,25 +531,35 @@ func (c *controller) handleKeypassPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if dst := c.lookupGrantDst(req.GrantID); dst == "" || dst != cn {
-		// 仅任务的目的端上报的密钥才对——此处是源端上报：应校验 CN==Src
-		if gsrc := c.lookupGrantSrc(req.GrantID); gsrc == "" || gsrc != cn {
-			http.Error(w, "not a participant", http.StatusForbidden)
-			return
-		}
+	// 上下文：上传者必须是**源**（主源或 M8 的某个分片源）。之前这里写反了
+	// ——先看 dst，dst 命中就跳过校验，于是目的端能覆盖源端的密钥（自伤），
+	// 而真正的分片源反而被 403：多源 + 加密时目的端永远取不到密钥，端到端
+	// 加密静默失效。
+	parts := c.grantParticipants(req.GrantID)
+	if parts == nil {
+		http.Error(w, "unknown grant", http.StatusNotFound)
+		return
+	}
+	if !parts[cn] || !c.grantIsSource(req.GrantID, cn) {
+		c.event("forbidden", string(cn), "keypass "+req.GrantID)
+		http.Error(w, "not a source of this grant", http.StatusForbidden)
+		return
 	}
 	if !c.limiter.allow("kp:"+string(cn), 20) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
+	// 按「grant + 源」分槽：每个源各自 newStreamCipher()，单槽会让后上报的
+	// 源覆盖前面的，目的端只能解开其中一个源的块。
+	k := keypassKey(req.GrantID, cn)
 	c.mu.Lock()
 	now := time.Now()
-	for k, v := range c.keypass { // 过期清扫：陈旧密钥材料不驻留
+	for kk, v := range c.keypass { // 过期清扫：陈旧密钥材料不驻留
 		if now.Sub(v.at) > 2*time.Hour {
-			delete(c.keypass, k)
+			delete(c.keypass, kk)
 		}
 	}
-	c.keypass[req.GrantID] = keyEntry{key: req.KeyB64, at: now}
+	c.keypass[k] = keyEntry{key: req.KeyB64, at: now}
 	c.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
@@ -558,20 +572,68 @@ func (c *controller) handleKeypassGet(w http.ResponseWriter, r *http.Request) {
 	}
 	cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
 	id := r.URL.Query().Get("id")
+	src := api.NodeID(r.URL.Query().Get("src"))
 	if dst := c.lookupGrantDst(id); dst == "" || dst != cn {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	// 只有任务目的端能取（上面已校验）。不删条目：之前是"读一次即删"，
+	// 而同一 grant 的多条并行流会各自建组、各自来取一次，运气不好第一条
+	// 取走后其余全 404；接收端崩溃重启也想再取一次。密钥对非目的端无用，
+	// 暴露面由上面的 CN==Dst 与 2 小时清扫兜住。
+	if src == "" {
+		src = c.lookupGrantSrc(id)
+	}
 	c.mu.Lock()
-	e, ok := c.keypass[id]
-	delete(c.keypass, id) // 一次性
+	e, ok := c.keypass[keypassKey(id, src)]
 	c.mu.Unlock()
-	k := e.key
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"key_b64": k})
+	json.NewEncoder(w).Encode(map[string]string{"key_b64": e.key, "src": string(src)})
+}
+
+// keypassKey 是密钥材料的存储键：单源用 grantID 本身（兼容老 agent 的
+// 无 src 查询），多源按 grantID@源 分槽。
+func keypassKey(grantID string, src api.NodeID) string {
+	if src == "" {
+		return grantID
+	}
+	return grantID + "@" + string(src)
+}
+
+// grantIsSource 从任务表读回 grant，判断 cn 是否为发送方。
+func (c *controller) grantIsSource(grantID string, cn api.NodeID) bool {
+	var gj string
+	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, grantID).Scan(&gj); err != nil {
+		return false
+	}
+	var g api.TransferGrant
+	if json.Unmarshal([]byte(gj), &g) != nil {
+		return false
+	}
+	if g.Src == cn {
+		return true
+	}
+	for _, sp := range g.Sources {
+		if sp.NodeID == cn {
+			return true
+		}
+	}
+	return false
+}
+
+// knownNode 判断这个名字是否见过（在线，或曾入网并被台账占用）。
+func (c *controller) knownNode(id api.NodeID) bool {
+	if c.graph.Addr(id) != "" {
+		return true
+	}
+	c.mu.Lock()
+	used := c.ledger.Used[strings.ToLower(string(id))] || c.ledger.Used[string(id)]
+	revoked := c.revoked[id]
+	c.mu.Unlock()
+	return used || revoked
 }
 
 // handleRevoke：仅 admin。软吊销一个节点：从拓扑/队列/索引中即刻
@@ -586,6 +648,12 @@ func (c *controller) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Node == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// 未知名字报 404，而不是静默 200：之前打错一个字母也会"吊销成功"，
+	// 运维以为挡住了，实际什么也没发生。
+	if !c.knownNode(req.Node) {
+		http.Error(w, fmt.Sprintf("unknown node %q", req.Node), http.StatusNotFound)
 		return
 	}
 	c.mu.Lock()
@@ -628,12 +696,18 @@ func (c *controller) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
 		return
 	}
-	c.db.Exec(`DELETE FROM replicas WHERE node=?`, rep.NodeID)
-	for _, e := range rep.Entries {
-		if e.SHA256 != "" {
-			c.db.Exec(`INSERT OR REPLACE INTO replicas(sha,node,path,size,mtime) VALUES(?,?,?,?,?)`,
-				e.SHA256, rep.NodeID, e.Path, e.Size, e.Mtime)
-		}
+	// 条目上限：MaxBytesHandler 只限 16 MiB 字节数，约等于 10 万条。
+	// 而 db.SetMaxOpenConns(1) 把全库串行化到一条连接上，逐条 Exec 又不在
+	// 事务里 —— 一次超大上报就能长时间独占唯一连接，jobPersist / jobdone /
+	// handleJobs 全部排队，心跳与任务投递一起卡住。
+	if len(rep.Entries) > maxIndexEntries {
+		http.Error(w, fmt.Sprintf("索引条目过多（%d，上限 %d）：请在 agent 侧收窄 scan-dirs",
+			len(rep.Entries), maxIndexEntries), http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err := c.replaceReplicas(rep.NodeID, rep.Entries); err != nil {
+		http.Error(w, "index persist failed", http.StatusInternalServerError)
+		return
 	}
 	c.mu.Lock()
 	c.indexCache[rep.NodeID] = rep.Entries
@@ -655,6 +729,39 @@ func (c *controller) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
+}
+
+// maxIndexEntries 是单节点索引上报的条目上限。
+// 取 5k：一台机器上真能被"按 sha256 复用"的文件不会更多，超过基本是
+// 扫描目录配错了（例如扫到了 /），此时应当失败并提示，而不是拖垮控制面。
+const maxIndexEntries = 5000
+
+// replaceReplicas 在**一个事务**里全量替换某节点的副本索引。
+func (c *controller) replaceReplicas(node api.NodeID, entries []api.IndexEntry) error {
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM replicas WHERE node=?`, node); err != nil {
+		tx.Rollback()
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO replicas(sha,node,path,size,mtime) VALUES(?,?,?,?,?)`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	for _, e := range entries {
+		if e.SHA256 == "" {
+			continue
+		}
+		if _, err := stmt.Exec(e.SHA256, node, e.Path, e.Size, e.Mtime); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // lookupReplicas 返回持有该哈希的其他在线节点（node -> path）。
@@ -998,10 +1105,27 @@ func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
 		return
 	}
+	// 限速：这是唯一没有限速的写接口。jobUpdate 与 event 每次调用都会
+	// 各派生一个 goroutine 去抢那条唯一的 DB 连接，单张合法证书循环打就能
+	// 堆出成千上万个阻塞 goroutine，并把无清理的 events 表写满。
+	// 正常用量是"每个任务每份额一条"，20/s 给了两个数量级余量。
+	if !c.limiter.allow("done:"+req.NodeID, 20) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	// 必须是这个 grant 的参与方：之前任何已入网节点只要猜到 grant ID
 	// （xfer-<Unix秒>，可枚举）就能把别人的任务标成 done/failed、
 	// 污染 pathBW 调度权重、并触发 autoRetry 重试风暴。
-	if parts := c.grantParticipants(req.GrantID); len(parts) > 0 && !parts[req.NodeID] {
+	// 任务行查不到时 grantParticipants 返回 nil。之前是 len(parts) > 0 才
+	// 检查，等于"查不到就放行"（fail-open）：重启恢复窗口内任何节点都能
+	// 改写任意任务终态。任务行缺失时下游 update 全是 no-op，所以没有实害，
+	// 但这是纯靠运气，应当失败关闭。
+	parts := c.grantParticipants(req.GrantID)
+	if parts == nil {
+		http.Error(w, "unknown grant", http.StatusNotFound)
+		return
+	}
+	if !parts[req.NodeID] {
 		c.event("forbidden", string(req.NodeID), "jobdone "+req.GrantID)
 		http.Error(w, "not a participant of this grant", http.StatusForbidden)
 		return

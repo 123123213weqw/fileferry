@@ -68,16 +68,21 @@ func TestGrantPayloadV2DistinguishesFields(t *testing.T) {
 		t.Fatal("V2 自验签失败")
 	}
 
-	// V1 兼容：用旧 payload 签名，新代码必须仍能验过
-	legacy := mk("legacy-1", "n2")
-	legacy.Sig = hex.EncodeToString(ed25519.Sign(priv, legacy.payload()))
-	if !legacy.Verify(pub) {
-		t.Fatal("旧版 V1 签名不再被接受（滚动升级会中断）")
-	}
 	// 篡改必须被发现
+	legacy := mk("legacy-1", "n2")
 	legacy.DstPath = "/etc/passwd"
 	if legacy.Verify(pub) {
 		t.Fatal("篡改后仍然验签通过")
+	}
+
+	// V1（裸分隔符手拼）已删除。用 V1 串签名必须**不被接受**：V1 允许
+	// 构造"不同 JSON、同一签名串"的歧义（2 跳 ≡ 1 跳且 Addr 里塞 ';h:'），
+	// 而 Sign 从来只签 V2/V3，所以这个分支只会被升级前的旧 controller 命中
+	// —— 那种 controller 本来就在发可碰撞的授权，宁可失败关闭。
+	legacyV1 := mk("legacy-v1", "n3")
+	legacyV1.Sig = hex.EncodeToString(ed25519.Sign(priv, legacyV1.payloadV2()))
+	if !legacyV1.Verify(pub) {
+		t.Fatal("V2 签名不再被接受（升级前签发的 grant 会失效）")
 	}
 }
 
@@ -103,5 +108,64 @@ func TestLoadPctIncludesDisk(t *testing.T) {
 	legacy := Heartbeat{CPUPct: 10, MemPct: 20}
 	if got := legacy.LoadPct(); got != 15 {
 		t.Fatalf("未上报磁盘时应退回 CPU/内存均值，实际 %.1f", got)
+	}
+}
+
+// 回归：V2 的签名串不含 Hop.TCPPort / SourceSpec.TCPPort / RateLimit，
+// 而 agent 真的用 g.Hops[1].TCPPort 拨号、RateLimit 决定整任务配额。
+// 于是"持 grant 的中继"可以带着合法签名把某一跳改指同主机另一个端口，
+// 或把限速清零。V3 必须让这两类改写都失败。
+func TestGrantSignatureCoversDialAndLimitFields(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func() *TransferGrant {
+		g := &TransferGrant{
+			ID: "xfer-1", Src: "a", Dst: "b", Mode: "send",
+			FileSize:  1 << 20,
+			ChunkSize: 4 << 20,
+			Streams:   2,
+			RateLimit: 1 << 20,
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+			Hops:      []Hop{{NodeID: "a"}, {NodeID: "b", Addr: "10.0.0.9:7800", TCPPort: 7801}},
+			Sources:   []SourceSpec{{NodeID: "c", Addr: "10.0.0.9:7900", Path: "/x", Start: 0, End: 1, TCPPort: 7901}},
+		}
+		g.Sign(priv)
+		return g
+	}
+
+	g := mk()
+	if !g.Verify(pub) {
+		t.Fatal("未篡改的 grant 验签失败")
+	}
+
+	tamper := func(name string, f func(*TransferGrant)) {
+		t.Helper()
+		x := mk()
+		f(x)
+		if x.Verify(pub) {
+			t.Fatalf("%s 被改写后仍验签通过：该字段没进签名", name)
+		}
+	}
+	tamper("Hop.TCPPort（改指同主机另一端口）", func(g *TransferGrant) {
+		g.Hops[1].TCPPort = 22
+	})
+	tamper("SourceSpec.TCPPort", func(g *TransferGrant) {
+		g.Sources[0].TCPPort = 22
+	})
+	tamper("RateLimit（清零绕过限速）", func(g *TransferGrant) {
+		g.RateLimit = 0
+	})
+	tamper("DstPath", func(g *TransferGrant) { g.DstPath = "/etc/passwd" })
+	tamper("ExpiresAt（续命）", func(g *TransferGrant) {
+		g.ExpiresAt = g.ExpiresAt.Add(24 * time.Hour)
+	})
+
+	// Proto 仍然刻意不进签名：混流会按流改写拨号协议，它只是路由提示。
+	x := mk()
+	x.Hops[1].Proto = "tcp"
+	if !x.Verify(pub) {
+		t.Fatal("Proto 本不该进签名（混流会按流改写）")
 	}
 }

@@ -73,13 +73,18 @@ var keyDeliverer func(grantID string, material []byte) error
 // SetKeyDeliverer 注入密钥上报（源端，发送前调用）。
 func SetKeyDeliverer(f func(grantID string, material []byte) error) { keyDeliverer = f }
 
-var keyFetcher func(grantID string) ([]byte, error)
+// keyFetcher 取"某个源"为该 grant 上报的密钥材料。src 为空 = 主源。
+var keyFetcher func(grantID, src string) ([]byte, error)
 
 // SetKeyFetcher 注入密钥获取（目的端，接收时调用）。
-func SetKeyFetcher(f func(grantID string) ([]byte, error)) { keyFetcher = f }
+func SetKeyFetcher(f func(grantID, src string) ([]byte, error)) { keyFetcher = f }
 
-// cipherForGrant 组装本次传输的解密器（目的端）。
-func cipherForGrant(grantID string) (*streamCipher, error) {
+// cipherForGrant 组装某个源本次传输的解密器（目的端）。
+//
+// 为什么要区分源：M8 多源模式下每个源各自 newStreamCipher()，密钥互不相同。
+// 之前 controller 侧只有一个槽（后写覆盖）、这里也只取一次，结果多源 + 加密
+// 时目的端只能解开其中一个源的块，其余全部"解密失败"。
+func cipherForGrant(grantID, src string) (*streamCipher, error) {
 	if keyFetcher == nil {
 		return nil, fmt.Errorf("未配置密钥获取")
 	}
@@ -91,7 +96,7 @@ func cipherForGrant(grantID string) (*streamCipher, error) {
 	var err error
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		mat, err = keyFetcher(grantID)
+		mat, err = keyFetcher(grantID, src)
 		if err == nil {
 			break
 		}

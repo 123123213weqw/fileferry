@@ -376,7 +376,7 @@ func TestEndToEndEncrypted(t *testing.T) {
 		keyMu.Unlock()
 		return nil
 	})
-	SetKeyFetcher(func(id string) ([]byte, error) {
+	SetKeyFetcher(func(id, src string) ([]byte, error) {
 		keyMu.Lock()
 		defer keyMu.Unlock()
 		m, ok := keybox[id]
