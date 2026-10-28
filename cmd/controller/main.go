@@ -1,8 +1,3 @@
-// ff-controller：控制面单实例。职责：CA 与一次性 enrollment、
-// 心跳汇聚进拓扑图、为按需传输选链并签发授权（grant）、任务下发、
-// 任务记录落 SQLite。权限模型：admin 角色（操作者本人）才能发起
-// 传输与查看状态；node 角色只能心跳与执行。跑在一台能同时够到
-// 内外网的机器上，且只有操作者可登录。
 package main
 
 import (
@@ -13,9 +8,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/pem"
+	"fileferry/internal/api"
+	"fileferry/internal/ca"
+	"fileferry/internal/nat"
+	"fileferry/internal/topology"
 	"flag"
 	"fmt"
+	"gopkg.in/yaml.v3"
+
+	// 空导入：注册 sqlite 驱动（重构把这类"无引用的导入"弄丢过，
+	// 编译器不会报错，但运行时报 unknown driver）
 	"log"
+	_ "modernc.org/sqlite"
 	"net"
 	"net/http"
 	"os"
@@ -24,14 +28,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"gopkg.in/yaml.v3"
-	_ "modernc.org/sqlite"
-
-	"fileferry/internal/api"
-	"fileferry/internal/ca"
-	"fileferry/internal/nat"
-	"fileferry/internal/topology"
 )
 
 type Config struct {
@@ -49,30 +45,40 @@ type controller struct {
 	graph   *topology.Graph
 	db      *sql.DB
 
-	mu           sync.Mutex
-	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
-	nextID       int64 // 初始化为 Unix 秒，重启后天然错开、永不重复
+	mu      sync.Mutex
+	pending map[api.NodeID][]api.TransferGrant // 源节点待执行任务
+	nextID  int64                              // 初始化为 Unix 秒，重启后天然错开、永不重复
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
 	punchTried   map[[2]api.NodeID]time.Time
 	pendingPunch map[api.NodeID][]api.PunchDirective // 待下发给另一端的打洞指令
-	ledger       *enrollLedger                        // 持久化核销台账
+	ledger       *enrollLedger                       // 持久化核销台账
 	limiter      *rateLimiter
+	wakeMu       sync.Mutex
+	wake         map[api.NodeID]chan struct{} // 长轮询：有待办任务时唤醒挂住的心跳
 
-	replicas   map[string]map[api.NodeID]string   // sha256 -> nodeID -> path（M8 多源副本索引）
-	pathBW     map[[2]api.NodeID]float64          // 实测路径吞吐 MB/s（jobdone 回填）
-	indexCache map[api.NodeID][]api.IndexEntry    // 各节点最近索引（查源文件哈希/大小）
-	revoked    map[api.NodeID]bool                // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
-	keypass    map[string]string                  // grantID -> 密钥材料（端到端加密专递，一次性）
-	shares     map[string]*shareEntry             // 取件码 hash -> 分享（M11 临时取件）
+	replicas   map[string]map[api.NodeID]string     // sha256 -> nodeID -> path（M8 多源副本索引）
+	pathBW     map[[2]api.NodeID]float64            // 实测路径吞吐 MB/s（jobdone 回填）
+	protoBW    map[[2]api.NodeID]map[string]float64 // 每条边每种协议的实测吞吐
+	indexCache map[api.NodeID][]api.IndexEntry      // 各节点最近索引（查源文件哈希/大小）
+	revoked    map[api.NodeID]bool                  // 吊销名单（软吊销：拒心跳/续期，旧授权 30min 自然过期）
+	keypass    map[string]keyEntry                  // grantID -> 密钥材料（端到端加密专递，一次性）
+	shares     map[string]*shareEntry               // 取件码 hash -> 分享（M11 临时取件）
+}
+
+// keyEntry 是待到取密钥材料及其落库时间（用于过期清扫：源端上报了
+// 但目的端始终没来取的任务，之前会永久驻留 map）。
+type keyEntry struct {
+	key string
+	at  time.Time
 }
 
 // shareEntry 临时取件：短时效 + 次数限制的定向取文件授权。
 type shareEntry struct {
-	Src   api.NodeID
-	Path  string
-	Exp   time.Time
-	Uses  int
+	Src  api.NodeID
+	Path string
+	Exp  time.Time
+	Uses int
 }
 
 type pubEntry struct {
@@ -132,11 +138,13 @@ func main() {
 		nextID:       time.Now().Unix(),
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
+		wake:         map[api.NodeID]chan struct{}{},
 		replicas:     map[string]map[api.NodeID]string{},
 		pathBW:       map[[2]api.NodeID]float64{},
+		protoBW:      map[[2]api.NodeID]map[string]float64{},
 		indexCache:   map[api.NodeID][]api.IndexEntry{},
 		revoked:      map[api.NodeID]bool{},
-		keypass:      map[string]string{},
+		keypass:      map[string]keyEntry{},
 		shares:       map[string]*shareEntry{},
 		publics:      map[api.NodeID]pubEntry{},
 		punchTried:   map[[2]api.NodeID]time.Time{},
@@ -288,6 +296,9 @@ func main() {
 	mux.HandleFunc("POST /v1/enroll", c.handleEnroll)
 	mux.HandleFunc("POST /v1/heartbeat", c.handleHeartbeat)
 	mux.HandleFunc("POST /v1/transfer", c.handleTransfer)
+	mux.HandleFunc("POST /v1/push", c.handlePush)
+	mux.HandleFunc("POST /v1/pullcert", c.handlePullCert)
+	mux.HandleFunc("POST /v1/pull", c.handlePull)
 	mux.HandleFunc("POST /v1/jobdone", c.handleJobDone)
 	mux.HandleFunc("POST /v1/renew", c.handleRenew)
 	mux.HandleFunc("GET /v1/status", c.handleStatus)
@@ -306,11 +317,21 @@ func main() {
 		defer selfMu.Unlock()
 		return &selfCert, nil
 	}
+	// 请求体上限：最大的合法请求是节点索引上报（每文件一条），
+	// 16 MiB 足够；超过直接 413，避免未认证连接把内存吃穿。
 	srv := &http.Server{
 		Addr:      cfg.Listen,
-		Handler:   mux,
+		Handler:   http.MaxBytesHandler(c.revokeGuard(mux), 16<<20),
 		TLSConfig: tlsCfg,
+		// 控制面不能被慢连接拖死：之前没设任何超时，未认证的慢速
+		// 请求头 + 大 JSON 就能占满连接与内存。
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
+	go c.pruneLoop()
 	log.Printf("controller 监听 %s（数据目录 %s，自身证书自动续期已启用）", cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
@@ -353,28 +374,119 @@ func (c *controller) autoRetry(oldID string) {
 	g.Sign(c.signer)
 	for _, t := range g.AllSources() {
 		c.pending[t] = append(c.pending[t], g)
+		c.notifyPending(t)
 	}
 	c.mu.Unlock()
 	c.jobPersist(&g)
 	log.Printf("断点续传：重签发 %s（原 %s，接收端将跳过已收块）", g.ID, oldID)
 }
 
-func retryDepth(id string) int {
-	n := 0
-	for strings.HasPrefix(id, "retry-") {
-		i := strings.Index(id, "-")
-		if i < 0 {
-			break
-		}
-		rest := id[i+1:]
-		j := strings.Index(rest, "-")
-		if j < 0 {
-			break
-		}
-		id = rest[j+1:]
-		n++
+// grantParticipants 返回该 grant 的全部合法参与方（源、目的、各分片源）。
+// 任务表里查不到时返回 nil——表示"无从校验"，由调用方决定放行（兼容
+// 重启恢复期间的窗口）还是拒绝。
+func (c *controller) grantParticipants(id string) map[api.NodeID]bool {
+	var gj string
+	if err := c.db.QueryRow(`SELECT grant_json FROM jobs WHERE id=?`, id).Scan(&gj); err != nil {
+		return nil
 	}
-	return n
+	var g api.TransferGrant
+	if json.Unmarshal([]byte(gj), &g) != nil {
+		return nil
+	}
+	m := map[api.NodeID]bool{g.Src: true, g.Dst: true}
+	for _, sp := range g.Sources {
+		m[sp.NodeID] = true
+	}
+	for _, h := range g.Hops { // 中继也要能回报（失败时用于换链）
+		m[h.NodeID] = true
+	}
+	return m
+}
+
+// NormalizeNodeName 校验节点名，规则与 api.ValidateNodeName 一致
+// （任意 UTF-8，禁止 ':' '/' 控制字符，长度 ≤64 字节）。
+//
+// 为什么单独拆一层：'：' 与 `node:/path` 语法冲突，而
+// splitNodePath 取第一个冒号，名字带冒号时 "a:b:/data/x" 会被静默
+// 解析成 node="a"、path="b:/data/x"——不报错、传到错的地方。所以
+// 这里明确拒绝而不是静默替换。X.509 CN 与 V2 签名串都能容纳 UTF-8，
+// 不构成限制（实测 "数据库-主" 可原样进 CN）。
+func NormalizeNodeName(raw string) (string, error) {
+	if err := api.ValidateNodeName(raw); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+// claimName 占用一个节点名（大小写不敏感去重，避免 Node-1 / node-1
+// 在舰队长里看起来像两台不同的机器却难以区分）。返回实际使用的名字。
+func (l *enrollLedger) claimName(name string) (string, bool) {
+	if l.Used == nil {
+		l.Used = map[string]bool{}
+	}
+	key := strings.ToLower(name)
+	if l.Used[key] {
+		return "", false
+	}
+	l.Used[key] = true
+	return name, true
+}
+
+const (
+	// grantChunkSize 与 transfer.ChunkSize 对齐（4 MiB）。集中定义，
+	// 避免三处授权构造各写一遍魔法数、日后改块大小漏掉其中一处。
+	grantChunkSize = 4 << 20
+	// grantTTL 是签发后的有效期；超时视为失效（防重放）。
+	grantTTL = 30 * time.Minute
+)
+
+// handlePullCert：给 ffctl 签发一张**可作 TLS 服务器**的短时效传输证书。
+// 仅 admin。管理员证书只带 ClientAuth，无法在 pull 场景里充当服务端。
+// pushProto 给出优先拨号协议：先看该边有没有"实测更快"的协议记录，
+// 再看探测结果，都没有则默认 quic。
+//
+// 之前只用探测结果，而探测只测握手 RTT，看不出 QUIC 在高丢包下的稳态
+// 吞吐塌陷（实测 2% 丢包慢 60 倍），于是每次都挑慢的那条。
+func pushProto(c *controller, id api.NodeID) string {
+	hint := ""
+	for _, hb := range c.graph.Snapshot() {
+		for _, e := range hb.Edges {
+			if e.To == id && e.Proto != "" {
+				hint = e.Proto
+				break
+			}
+		}
+		if hint != "" {
+			break
+		}
+	}
+	if hint == "" {
+		hint = "quic"
+	}
+	// 按"对端 → 本机"这条边学到的实测结果修正；caller 是本机管理员，
+	// 不算节点，所以 from 用空串（等价"没有源端记录"）。
+	return c.bestProto("", id, hint)
+}
+
+// handlePush：本机(管理员) → 远端节点 直推。仅 admin。
+//
+// 设计要点：controller 只签授权 + 给出目标拨号地址，**数据不经过
+// controller**，也没有"先上传到某源节点再转"的中转开销。授权里的
+// Src 就是调用者的证书 CN，接收端靠它校验 manifest 签名者，所以
+// 完整性保证与节点间传输完全一致（mTLS + 逐块 SHA256 + 全文件摘要）。
+func normalizeDstPath(dst, srcPath string) string {
+	if dst == "" {
+		return dst
+	}
+	if strings.HasSuffix(dst, "/") || strings.HasSuffix(dst, "\\") ||
+		strings.HasSuffix(dst, string(filepath.Separator)) {
+		base := filepath.Base(srcPath)
+		if base == "" || base == "." || base == string(filepath.Separator) {
+			return dst
+		}
+		return filepath.Join(dst, base)
+	}
+	return dst
 }
 
 // lookupGrantSrc 从任务表反查源端（密钥上报校验用）。
@@ -401,6 +513,46 @@ func (c *controller) lookupGrantDst(id string) api.NodeID {
 		return ""
 	}
 	return g.Dst
+}
+
+// retentionDays 是审计/任务历史表的保留天数。
+// events / jobs / replicas 三张表原本**没有任何 DELETE**：审计每条请求一行、
+// 任务每次状态变更一行更新，跑几个月就是几十万行，SQLite 文件只涨不落。
+const retentionDays = 30
+
+// pruneHistory 删除超过保留期的终态任务与审计事件。
+// 只删"已经结束"的任务：queued/running 的记录是重启恢复的依据，不能碰。
+func (c *controller) pruneHistory(now time.Time) (events, jobs int64, err error) {
+	cutoff := now.AddDate(0, 0, -retentionDays).Unix()
+	re, err := c.db.Exec(`DELETE FROM events WHERE ts < ?`, cutoff)
+	if err != nil {
+		return 0, 0, err
+	}
+	events, _ = re.RowsAffected()
+	rj, err := c.db.Exec(
+		`DELETE FROM jobs WHERE updated < ? AND status NOT IN ('queued','running')`, cutoff)
+	if err != nil {
+		return events, 0, err
+	}
+	jobs, _ = rj.RowsAffected()
+	return events, jobs, nil
+}
+
+// pruneLoop 启动后先清一次，之后每天一次。
+func (c *controller) pruneLoop() {
+	run := func() {
+		if ev, jb, err := c.pruneHistory(time.Now()); err != nil {
+			log.Printf("历史清理失败：%v", err)
+		} else if ev > 0 || jb > 0 {
+			log.Printf("历史清理：删除 %d 条审计事件、%d 条陈旧任务（保留 %d 天）", ev, jb, retentionDays)
+		}
+	}
+	run()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for range t.C {
+		run()
+	}
 }
 
 // rehydrate 从 SQLite 恢复未完成任务到内存队列。
@@ -462,14 +614,32 @@ func (c *controller) jobUpdate(id, status string) {
 
 // rateLimiter 每身份滑动窗口限速（防合法证书节点刷爆 controller）。
 type rateLimiter struct {
-	mu   sync.Mutex
-	seen map[string][]time.Time
+	mu    sync.Mutex
+	seen  map[string][]time.Time
+	calls uint64
 }
 
 func (l *rateLimiter) allow(key string, perSec int) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// 每 1k 次调用做一次全局清扫：之前空列表的 key 永不回收，
+	// 公网扫端口每个 SourceIP:port 留一条，map 无界增长。
+	if l.calls++; l.calls%1024 == 0 {
+		for k, v := range l.seen {
+			if len(v) == 0 || now.Sub(v[len(v)-1]) > 2*time.Second {
+				delete(l.seen, k)
+			}
+		}
+	}
+	if len(l.seen) > 100000 { // 兜底上限，防清扫跟不上时的内存膨胀
+		for k := range l.seen {
+			delete(l.seen, k)
+			if len(l.seen) <= 50000 {
+				break
+			}
+		}
+	}
 	list := l.seen[key]
 	kept := list[:0]
 	for _, t := range list {
@@ -485,318 +655,13 @@ func (l *rateLimiter) allow(key string, perSec int) bool {
 	return true
 }
 
-// handleRenew：节点证书临期续期。身份由现有 mTLS 证书证明，
-// 新证书沿用同一 nodeID 与 node 角色。
-func (c *controller) handleRenew(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
-	}
-	cert := r.TLS.PeerCertificates[0]
-	role := ""
-	if ous := cert.Subject.OrganizationalUnit; len(ous) > 0 {
-		role = ous[0]
-	}
-	if role != ca.RoleNode {
-		http.Error(w, "node role only", http.StatusForbidden)
-		return
-	}
-	nodeID := cert.Subject.CommonName
-	c.mu.Lock()
-	revoked := c.revoked[api.NodeID(nodeID)]
-	c.mu.Unlock()
-	if revoked {
-		http.Error(w, "revoked", http.StatusForbidden)
-		return
-	}
-	if !c.limiter.allow("renew:"+nodeID, 1) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
-	}
-	// SAN 沿用该节点最近心跳上报的地址与主机名
-	sans := []string{nodeID}
-	for _, hb := range c.graph.Snapshot() {
-		if hb.NodeID == api.NodeID(nodeID) {
-			sans = append(sans, hb.Hostname)
-			if host, _, err := net.SplitHostPort(hb.Addr); err == nil && net.ParseIP(host) != nil {
-				sans = append(sans, host)
-			}
-			break
-		}
-	}
-	certPEM, keyPEM, _, err := c.ca.Issue(nodeID, true, ca.RoleNode, sans...)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	c.event("renew", nodeID, "")
-	json.NewEncoder(w).Encode(api.RenewResponse{NodeID: nodeID, CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
-}
-
-// handleShare：仅 admin。生成临时取件码：{src, path, ttl_min}。
-// 台账只存哈希；过期/用尽自动作废。
-func (c *controller) handleShare(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, ca.RoleAdmin) {
-		return
-	}
-	var req struct {
-		Src    api.NodeID `json:"src"`
-		Path   string     `json:"path"`
-		TTLMin int        `json:"ttl_min"`
-	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Src == "" || req.Path == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if req.TTLMin <= 0 || req.TTLMin > 24*60 {
-		req.TTLMin = 10
-	}
-	tok, err := ca.NewEnrollToken() // 复用随机码生成器（前缀 ff_enroll_，做分享够用）
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	code := "ff_get_" + tok[len("ff_enroll_"):]
-	c.mu.Lock()
-	c.shares[api.TokenHash(code)] = &shareEntry{Src: req.Src, Path: req.Path, Exp: time.Now().Add(time.Duration(req.TTLMin) * time.Minute), Uses: 3}
-	c.mu.Unlock()
-	c.event("share", string(req.Src), req.Path)
-	json.NewEncoder(w).Encode(map[string]any{"code": code, "expires_in_min": req.TTLMin, "max_uses": 3})
-}
-
-// handleGet：node 角色。凭码取文件：生成"存件节点 → 请求节点"的
-// 定向 grant，落盘限定请求节点收件目录。
-func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
-	}
-	dst := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
-	var req struct {
-		Code string `json:"code"`
-	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Code == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if !c.limiter.allow("get:"+string(dst), 3) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
-	}
-	c.mu.Lock()
-	se, ok := c.shares[api.TokenHash(req.Code)]
-	if !ok || time.Now().After(se.Exp) {
-		delete(c.shares, api.TokenHash(req.Code))
-		c.mu.Unlock()
-		http.Error(w, "invalid or expired code", http.StatusUnauthorized)
-		return
-	}
-	se.Uses--
-	if se.Uses <= 0 {
-		defer delete(c.shares, api.TokenHash(req.Code))
-	}
-	c.mu.Unlock()
-	if dst == se.Src {
-		http.Error(w, "source cannot fetch itself", http.StatusBadRequest)
-		return
-	}
-	// 组 grant：源=存件节点，目的=取件节点
-	if _, _, ok := c.graph.EdgeDetail(dst, se.Src); !ok {
-		_, _, ok2 := c.graph.EdgeDetail(se.Src, dst)
-		if !ok2 {
-			http.Error(w, "no path to source", http.StatusUnprocessableEntity)
-			return
-		}
-	}
-	path := c.graph.Path(dst, se.Src)
-	if path == nil || len(path) < 2 {
-		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
-		return
-	}
-	hops := make([]api.Hop, 0, len(path))
-	for i, id := range path {
-		hop := api.Hop{NodeID: id}
-		if i > 0 {
-			proto, addr, _ := c.graph.EdgeDetail(path[i-1], id)
-			hop.Addr, hop.Proto = addr, proto
-			if hop.Addr == "" {
-				hop.Addr = c.graph.Addr(id)
-			}
-			if hop.Proto == "" {
-				hop.Proto = "quic"
-			}
-		}
-		hops = append(hops, hop)
-	}
-	name := filepath.Base(se.Path)
-	c.mu.Lock()
-	c.nextID++
-	id := c.nextID
-	c.mu.Unlock()
-	grant := api.TransferGrant{
-		ID:        fmt.Sprintf("get-%d", id),
-		Src:       se.Src,
-		Dst:       dst,
-		Hops:      hops,
-		SrcPath:   se.Path,
-		DstPath:   filepath.Join(shareInbox(dst), name),
-		ChunkSize: 4 << 20,
-		Streams:   2,
-		Enc:       true,
-		ExpiresAt: time.Now().Add(30 * time.Minute),
-	}
-	grant.Sign(c.signer)
-	c.mu.Lock()
-	c.pending[grant.Src] = append(c.pending[grant.Src], grant)
-	c.mu.Unlock()
-	c.jobPersist(&grant)
-	c.event("get", string(dst), se.Path)
-	json.NewEncoder(w).Encode(grant)
-}
-
-// shareInbox 取件落盘目录标记：agent 侧映射到其 data-dir/inbox。
+// clientIP 取限速用的客户端标识。enroll 之前没有证书，只能用 IP——
+// 之前用 r.RemoteAddr（含临时端口），换条连接就换一个桶，限速形同
+// 虚设（实测坏 token 连发：401 401 429 429 429 429 401 401 429 429）。
 func shareInbox(node api.NodeID) string { return "inbox:" }
 
 // handleKeypassPost：源端上报端到端加密密钥材料（验证其为任务源端）。
 // 密钥只在 controller 内存停留至目的端取走（一次性）。
-func (c *controller) handleKeypassPost(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
-	}
-	cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
-	var req struct {
-		GrantID string `json:"grant_id"`
-		KeyB64  string `json:"key_b64"`
-	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil || req.GrantID == "" || req.KeyB64 == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if dst := c.lookupGrantDst(req.GrantID); dst == "" || dst != cn {
-		// 仅任务的目的端上报的密钥才对——此处是源端上报：应校验 CN==Src
-		if gsrc := c.lookupGrantSrc(req.GrantID); gsrc == "" || gsrc != cn {
-			http.Error(w, "not a participant", http.StatusForbidden)
-			return
-		}
-	}
-	if !c.limiter.allow("kp:"+string(cn), 20) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
-	}
-	c.mu.Lock()
-	c.keypass[req.GrantID] = req.KeyB64
-	c.mu.Unlock()
-	w.WriteHeader(http.StatusOK)
-}
-
-// handleKeypassGet：目的端取密钥（校验 CN==Dst，一次性发放）。
-func (c *controller) handleKeypassGet(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
-	}
-	cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
-	id := r.URL.Query().Get("id")
-	if dst := c.lookupGrantDst(id); dst == "" || dst != cn {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	c.mu.Lock()
-	k, ok := c.keypass[id]
-	delete(c.keypass, id) // 一次性
-	c.mu.Unlock()
-	if !ok {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]string{"key_b64": k})
-}
-
-// handleRevoke：仅 admin。软吊销一个节点：从拓扑/队列/索引中即刻
-// 剔除，拒绝其后续心跳与续期；已签发的旧 grant 在 30 分钟内自然
-// 过期。节点证书作废靠"无处可用"实现（无需 CRL 分发）。
-func (c *controller) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, ca.RoleAdmin) {
-		return
-	}
-	var req struct {
-		Node api.NodeID `json:"node"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Node == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	c.mu.Lock()
-	c.revoked[req.Node] = true
-	delete(c.pending, req.Node)
-	delete(c.pendingPunch, req.Node)
-	delete(c.publics, req.Node)
-	delete(c.indexCache, req.Node)
-	for sha, m := range c.replicas {
-		delete(m, req.Node)
-		if len(m) == 0 {
-			delete(c.replicas, sha)
-		}
-	}
-	c.mu.Unlock()
-	c.graph.Remove(req.Node)
-	c.db.Exec(`INSERT OR REPLACE INTO revoked(node,ts) VALUES(?,?)`, req.Node, time.Now().Unix())
-	c.event("revoke", string(req.Node), "")
-	w.WriteHeader(http.StatusOK)
-}
-
-// handleIndex：node 角色上报共享目录索引（全量替换该节点条目）。
-// 副本索引是 M8 多源并行的数据源：同一 sha256 出现在多台 → 可多源。
-func (c *controller) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
-	}
-	cn := r.TLS.PeerCertificates[0].Subject.CommonName
-	if !c.limiter.allow("index:"+cn, 1) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
-	}
-	var rep api.IndexReport
-	if err := json.NewDecoder(r.Body).Decode(&rep); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if rep.NodeID != api.NodeID(cn) {
-		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
-		return
-	}
-	c.db.Exec(`DELETE FROM replicas WHERE node=?`, rep.NodeID)
-	for _, e := range rep.Entries {
-		if e.SHA256 != "" {
-			c.db.Exec(`INSERT OR REPLACE INTO replicas(sha,node,path,size,mtime) VALUES(?,?,?,?,?)`,
-				e.SHA256, rep.NodeID, e.Path, e.Size, e.Mtime)
-		}
-	}
-	c.mu.Lock()
-	c.indexCache[rep.NodeID] = rep.Entries
-	// 全量替换：先移除该节点旧条目，再插入新条目
-	for sha, m := range c.replicas {
-		delete(m, rep.NodeID)
-		if len(m) == 0 {
-			delete(c.replicas, sha)
-		}
-	}
-	for _, e := range rep.Entries {
-		if e.SHA256 == "" {
-			continue
-		}
-		if c.replicas[e.SHA256] == nil {
-			c.replicas[e.SHA256] = map[api.NodeID]string{}
-		}
-		c.replicas[e.SHA256][rep.NodeID] = e.Path
-	}
-	c.mu.Unlock()
-	w.WriteHeader(http.StatusOK)
-}
-
-// lookupReplicas 返回持有该哈希的其他在线节点（node -> path）。
 func (c *controller) lookupReplicas(sha string, exclude map[api.NodeID]bool) map[api.NodeID]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -811,36 +676,38 @@ func (c *controller) lookupReplicas(sha string, exclude map[api.NodeID]bool) map
 
 // handleJobs：仅 admin。任务列表（含状态），支持 ?id= 精确查——
 // ffctl send --wait 轮询用，也是程序化集成的任务查询接口。
-func (c *controller) handleJobs(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, ca.RoleAdmin) {
-		return
-	}
-	id := r.URL.Query().Get("id")
-	rows, err := c.db.Query(`SELECT id,src,dst,mode,status,updated FROM jobs WHERE (?1='' OR id=?1) ORDER BY updated DESC LIMIT 100`, id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-	type jobRow struct {
-		ID      string `json:"id"`
-		Src     string `json:"src"`
-		Dst     string `json:"dst"`
-		Mode    string `json:"mode,omitempty"`
-		Status  string `json:"status"`
-		Updated int64  `json:"updated"`
-	}
-	var out []jobRow
-	for rows.Next() {
-		var j jobRow
-		if rows.Scan(&j.ID, &j.Src, &j.Dst, &j.Mode, &j.Status, &j.Updated) == nil {
-			out = append(out, j)
+// revokeGuard 统一拒绝"证书已被吊销"的后续请求。
+//
+// 之前吊销只覆盖 4 个地方（pull/push 的目的端检查、renew、heartbeat），
+// /v1/index、/v1/jobdone、/v1/keypass、/v1/get 都不查。被吊销的节点在证书
+// 剩余有效期（节点 24 小时）内仍能：
+//   - POST /v1/index 把 handleRevoke 刚清掉的副本索引重新灌回去；
+//   - 回报 jobdone 改写任务终态，并污染 pathBW / SetEdgeBW 调度权重；
+//   - 取走自己作为目的端的 keypass 密钥。
+//
+// admin 证书同样受益：它的 TTL 是 10 年，且从未经过 heartbeat/renew，所以
+// 在加了这道闸之前，"吊销 admin"是个空操作。
+//
+// /v1/enroll 必须放行：它靠一次性 token 把关，此时还没有客户端证书。
+func (c *controller) revokeGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/enroll" {
+			next.ServeHTTP(w, r)
+			return
 		}
-	}
-	if out == nil {
-		out = []jobRow{}
-	}
-	json.NewEncoder(w).Encode(out)
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			cn := api.NodeID(r.TLS.PeerCertificates[0].Subject.CommonName)
+			c.mu.Lock()
+			revoked := c.revoked[cn]
+			c.mu.Unlock()
+			if revoked {
+				c.event("forbidden", string(cn), "revoked cert: "+r.URL.Path)
+				http.Error(w, "certificate revoked", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func loadConfig(path string) (Config, error) {
@@ -862,25 +729,6 @@ func loadConfig(path string) (Config, error) {
 }
 
 // clientRole 从 mTLS 客户端证书取角色（OU 字段）。
-func clientRole(r *http.Request) string {
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		return ""
-	}
-	ous := r.TLS.PeerCertificates[0].Subject.OrganizationalUnit
-	if len(ous) == 0 {
-		return ""
-	}
-	return ous[0]
-}
-
-func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
-	if clientRole(r) != role {
-		http.Error(w, fmt.Sprintf("requires %s role", role), http.StatusForbidden)
-		return false
-	}
-	return true
-}
-
 func signPubPEM(pub ed25519.PublicKey) string {
 	b, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
@@ -894,15 +742,53 @@ func signPubPEM(pub ed25519.PublicKey) string {
 type enrollLedger struct {
 	Burned   map[string]string `json:"burned"`    // tokenHash -> nodeID
 	NextNode int               `json:"next_node"` // 下一节点编号
+	Used     map[string]bool   `json:"used"`      // 已占用的 nodeID（防撞号）
+}
+
+// claim 占用一个 nodeID：返回 false 表示已被别人占用。
+func (l *enrollLedger) claim(id string) bool {
+	if l.Used == nil {
+		l.Used = map[string]bool{}
+	}
+	key := strings.ToLower(id)
+	if l.Used[key] {
+		return false
+	}
+	l.Used[key] = true
+	return true
+}
+
+// nextAutoNodeID 取下一个未被占用的 node-N。
+func (l *enrollLedger) nextAutoNodeID() string {
+	for {
+		id := fmt.Sprintf("node-%d", l.NextNode)
+		l.NextNode++
+		if l.Used == nil || !l.Used[strings.ToLower(id)] {
+			return id
+		}
+	}
 }
 
 func loadEnrollLedger(dir string) *enrollLedger {
 	l := &enrollLedger{Burned: map[string]string{}, NextNode: 1}
 	if b, err := os.ReadFile(dir + "/enroll-ledger.json"); err == nil {
-		json.Unmarshal(b, l)
+		// 解析失败必须硬失败，不能静默吞掉：台账被截断时 Burned 会变空，
+		// 于是所有已核销的入网 token 复活、NextNode 归 1，新节点可能拿到
+		// 旧节点编号与既有 CN 撞号（注释里"核销即废、编号绝不复用"两条
+		// 同时失效）。宁可起不来，也不能带着"全部 token 可重放"跑。
+		if uerr := json.Unmarshal(b, l); uerr != nil {
+			log.Fatalf("入网台账解析失败（%s/enroll-ledger.json）：%v；请从备份恢复，不要直接删", dir, uerr)
+		}
 	}
 	if l.Burned == nil {
 		l.Burned = map[string]string{}
+	}
+	if l.Used == nil {
+		l.Used = map[string]bool{}
+	}
+	// 从核销台账回填已占用 ID（老版本 ledger 没有 used 字段）
+	for _, id := range l.Burned {
+		l.Used[strings.ToLower(id)] = true
 	}
 	if l.NextNode < 1 {
 		l.NextNode = 1
@@ -915,120 +801,98 @@ func (l *enrollLedger) save(dir string) {
 	if err != nil {
 		return
 	}
-	os.WriteFile(dir+"/enroll-ledger.json", b, 0o600)
+	// tmp + fsync + rename：之前是 os.WriteFile 原地截断且**丢弃错误**。
+	// 崩在写一半或 ENOSPC 时留下的是半截 JSON，下次启动解析失败 → 见
+	// loadEnrollLedger 里的说明。这里失败必须留痕，不能静静吞掉。
+	if err := writeFileAtomic(dir+"/enroll-ledger.json", b, 0o600); err != nil {
+		log.Printf("严重：入网台账落盘失败（重启后已核销 token 可能复活）：%v", err)
+	}
+}
+
+// writeFileAtomic 以 tmp+fsync+rename 写文件，避免读者/重启看到写了一半的内容。
+func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name) // 成功 rename 后这里是无害的 no-op
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(name, perm); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // handleEnroll：一次性 token 换节点证书（角色固定为 node）。
 // 核销即废且**跨重启持久**；节点编号单调递增，绝不复用。
 // 无证书也可访问（ServerTLS 用 VerifyClientCertIfGiven 放行）。
-func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	if !c.limiter.allow("enroll:"+r.RemoteAddr, 2) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
+func (c *controller) notifyPending(id api.NodeID) {
+	c.wakeMu.Lock()
+	if ch, ok := c.wake[id]; ok {
+		close(ch)
+		delete(c.wake, id)
 	}
-	var req api.EnrollRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	c.mu.Lock()
-	valid := false
-	for _, t := range c.cfg.EnrollTokens {
-		if _, burned := c.ledger.Burned[api.TokenHash(t)]; t == req.Token && !burned {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		c.mu.Unlock()
-		http.Error(w, "invalid or used token", http.StatusUnauthorized)
-		return
-	}
-	nodeID := fmt.Sprintf("node-%d", c.ledger.NextNode)
-	c.ledger.NextNode++
-	c.ledger.Burned[api.TokenHash(req.Token)] = nodeID
-	c.ledger.save(c.cfg.DataDir)
-	c.mu.Unlock()
-	// 证书 SAN：enrollment 报上来的数据面 IP + 主机名
-	sans := []string{req.Hostname}
-	if host, _, err := net.SplitHostPort(req.Addr); err == nil && net.ParseIP(host) != nil {
-		sans = append(sans, host)
-	}
-	certPEM, keyPEM, _, err := c.ca.Issue(nodeID, true, ca.RoleNode, sans...)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	c.event("enroll", nodeID, r.RemoteAddr)
-	json.NewEncoder(w).Encode(api.EnrollResponse{
-		NodeID:     nodeID,
-		CertPEM:    string(certPEM),
-		KeyPEM:     string(keyPEM),
-		RootPEM:    string(c.ca.RootPEM()),
-		SignPubPEM: signPubPEM(c.signPub),
-	})
+	c.wakeMu.Unlock()
 }
 
-// handleHeartbeat：要求 node 证书；节点身份以证书 CN 为准，不可谎报。
-// 响应携带该节点的待执行任务与全网在线节点表。
-func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
+// awaitPending 在最多 d 内等待该节点出现待办任务。
+// 返回 true 表示已有任务（或被唤醒）。
+//
+// 顺序很重要：**先注册唤醒通道，再复查一次队列**。反过来的话存在
+// 丢唤醒竞态——任务恰好落在"查完队列、还没注册"之间时 notifyPending
+// 找不到通道，心跳会白等到超时（实测表现为延迟随机变成 5~8 秒）。
+func (c *controller) awaitPending(id api.NodeID, d time.Duration) bool {
+	c.wakeMu.Lock()
+	ch, ok := c.wake[id]
+	if !ok {
+		ch = make(chan struct{})
+		c.wake[id] = ch
 	}
-	if !c.limiter.allow("hb:"+r.TLS.PeerCertificates[0].Subject.CommonName, 10) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
-	}
-	var hb api.Heartbeat
-	if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if cn := r.TLS.PeerCertificates[0].Subject.CommonName; cn != hb.NodeID {
-		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
-		return
-	}
+	c.wakeMu.Unlock()
+
+	// 注册之后再查一次：若这期间已入队，直接返回，不进入等待
 	c.mu.Lock()
-	revoked := c.revoked[hb.NodeID]
+	n := len(c.pending[id])
 	c.mu.Unlock()
-	if revoked {
-		http.Error(w, "revoked", http.StatusForbidden)
-		return
+	if n > 0 {
+		return true
 	}
-	// 公网映射以 controller 回声口的观测为准，agent 上报值仅作参考
-	c.mu.Lock()
-	if pe, ok := c.publics[hb.NodeID]; ok && time.Since(pe.seen) < 90*time.Second {
-		hb.Public = pe.addr
-	}
-	c.mu.Unlock()
-	c.graph.Apply(hb)
-	c.mu.Lock()
-	jobs := c.pending[hb.NodeID]
-	delete(c.pending, hb.NodeID)
-	c.mu.Unlock()
-	fresh := jobs[:0]
-	for _, j := range jobs {
-		if time.Now().Before(j.ExpiresAt) {
-			fresh = append(fresh, j)
+
+	tm := time.NewTimer(d)
+	defer tm.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-tm.C:
+		c.wakeMu.Lock()
+		if cur, exists := c.wake[id]; exists && cur == ch {
+			delete(c.wake, id) // 超时回收，避免 map 泄漏
 		}
+		c.wakeMu.Unlock()
+		return false
 	}
-	jobs = fresh
-	directives := c.pickPunches(&hb)
+}
+
+// requeueJobs 把没送达的任务放回该节点的待投递队列（保持原顺序在前）。
+func (c *controller) requeueJobs(id api.NodeID, jobs []api.TransferGrant) {
+	if len(jobs) == 0 {
+		return
+	}
 	c.mu.Lock()
-	// 另一端排队中的指令（对端发牌时给本端登记的）一并下发，
-	// 保证打洞双方同时行动
-	if queued := c.pendingPunch[hb.NodeID]; len(queued) > 0 {
-		log.Printf("下发排队指令给 %s x%d", hb.NodeID, len(queued))
-		directives = append(directives, queued...)
-	}
-	delete(c.pendingPunch, hb.NodeID)
+	c.pending[id] = append(append([]api.TransferGrant{}, jobs...), c.pending[id]...)
 	c.mu.Unlock()
-	json.NewEncoder(w).Encode(api.HeartbeatResponse{
-		Jobs:    jobs,
-		Peers:   c.graph.Peers(),
-		Punches: directives,
-	})
 }
 
 // pickPunches 挑选打洞配对：双方都有新鲜公网映射、互相都没有直连边、
@@ -1080,102 +944,6 @@ func (c *controller) pickPunches(hb *api.Heartbeat) []api.PunchDirective {
 }
 
 // handleTransfer：仅 admin。选链 + 签发 grant 并投递到源节点任务队列。
-func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, ca.RoleAdmin) {
-		c.event("forbidden", clientRole(r), "transfer")
-		return
-	}
-	var req api.TransferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	path := c.graph.Path(req.Src, req.Dst)
-	if (path == nil || len(path) < 2) && c.trySwitch(w, req) {
-		return // 走交换台模式（响应已写）
-	}
-	if path == nil || len(path) < 2 {
-		http.Error(w, "no reachable path", http.StatusUnprocessableEntity)
-		return
-	}
-	// 组装完整逐跳路径：每跳的地址与协议取自**前驱节点探测该边成功
-	// 的实际值**（打洞边=公网映射，直连边=广播地址；谁探测的谁去拨）
-	hops := make([]api.Hop, 0, len(path))
-	for i, id := range path {
-		hop := api.Hop{NodeID: id}
-		if i > 0 {
-			if proto, addr, ok := c.graph.EdgeDetail(path[i-1], id); ok && addr != "" {
-				hop.Addr = addr
-				hop.Proto = proto
-			} else {
-				hop.Addr = c.graph.Addr(id)
-				hop.Proto = "quic"
-			}
-			if hop.Addr == "" {
-				http.Error(w, fmt.Sprintf("%s 无可用地址", id), http.StatusUnprocessableEntity)
-				return
-			}
-		}
-		hops = append(hops, hop)
-	}
-	c.mu.Lock()
-	c.nextID++
-	id := c.nextID
-	c.mu.Unlock()
-	grant := api.TransferGrant{
-		ID:        fmt.Sprintf("xfer-%d", id),
-		Src:       req.Src,
-		Dst:       req.Dst,
-		Hops:      hops,
-		Relays:    path[1 : len(path)-1],
-		SrcPath:   req.SrcPath,
-		DstPath:   req.DstPath,
-		ChunkSize: 4 << 20,
-		Streams:   4, // TODO(M4)：按路径质量与负载动态定
-		RateLimit: req.RateLimit,
-		ExpiresAt: time.Now().Add(30 * time.Minute),
-		Enc:       c.cfg.EncDefault, // 端到端加密（真机密钥专递链路待修，默认关；单测已验证）
-	}
-	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
-	if len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
-		grant.Mix = true
-	}
-	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
-	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。
-	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4
-	if sz := c.indexedSize(req.Src, req.SrcPath); sz > 0 {
-		switch {
-		case sz >= 256<<20:
-			grant.Streams = 6
-		case sz >= 64<<20:
-			grant.Streams = 4
-		case sz >= 16<<20:
-			grant.Streams = 3
-		default:
-			grant.Streams = 1
-		}
-	}
-	c.applyMultiSource(&grant)
-	grant.Sign(c.signer)
-	targets := grant.AllSources()
-	c.mu.Lock()
-	for _, t := range targets {
-		c.pending[t] = append(c.pending[t], grant) // 每个源各收一份，各取自己的区间
-	}
-	npend := len(c.pending[req.Src])
-	c.mu.Unlock()
-	log.Printf("[trace] 签发 %s：sources=%d streams=%d 投递=%v 源队列长度=%d",
-		grant.ID, len(grant.Sources), grant.Streams, targets, npend)
-	c.jobPersist(&grant)
-	srcs := make([]string, 0, len(targets))
-	for _, t := range targets {
-		srcs = append(srcs, string(t))
-	}
-	c.event("transfer", req.Src, strings.Join(srcs, "+")+" -> "+req.Dst)
-	json.NewEncoder(w).Encode(grant)
-}
-
-// indexedSize 查源文件大小（索引）。
 func (c *controller) indexedSize(node api.NodeID, path string) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1256,6 +1024,7 @@ func (c *controller) applyMultiSource(g *api.TransferGrant) {
 		}
 		g.Sources = append(g.Sources, api.SourceSpec{
 			NodeID: cd.id, Addr: cd.addr, Proto: cd.proto, Path: cd.path, Start: cursor, End: end,
+			TCPPort: c.graph.TCPPort(cd.id),
 		})
 		cursor = end
 		if cursor >= totalChunks {
@@ -1282,51 +1051,6 @@ func (c *controller) score(from, to api.NodeID, defBW float64) float64 {
 }
 
 // handleJobDone：agent 回报任务结果，node 角色。
-func (c *controller) handleJobDone(w http.ResponseWriter, r *http.Request) {
-	if len(r.TLS.PeerCertificates) == 0 {
-		http.Error(w, "client cert required", http.StatusUnauthorized)
-		return
-	}
-	var req api.DoneRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if cn := r.TLS.PeerCertificates[0].Subject.CommonName; cn != req.NodeID {
-		http.Error(w, "node_id does not match certificate", http.StatusForbidden)
-		return
-	}
-	if req.OK {
-		log.Printf("任务 %s 完成（%s）", req.GrantID, req.NodeID)
-		c.jobUpdate(req.GrantID, "done")
-		if req.Bytes > 0 && req.Duration > 0 {
-			if dst := c.lookupGrantDst(req.GrantID); dst != "" {
-				c.mu.Lock()
-				c.pathBW[[2]api.NodeID{req.NodeID, dst}] = float64(req.Bytes) / req.Duration / 1e6
-				c.mu.Unlock()
-			}
-		}
-	} else {
-		log.Printf("任务 %s 失败（%s）：%s", req.GrantID, req.NodeID, req.Err)
-		c.jobUpdate(req.GrantID, "failed")
-		c.event("job-fail", string(req.NodeID), req.GrantID+": "+req.Err)
-		c.autoRetry(req.GrantID) // 断点续传：失败自动重签发（网络恢复后从断点继续）
-	}
-	// TODO(M1)：结果落 SQLite
-}
-
-// handleStatus：仅 admin，返回全图快照。
-func (c *controller) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, ca.RoleAdmin) {
-		return
-	}
-	json.NewEncoder(w).Encode(c.graph.Snapshot())
-}
-
-// trySwitch 交换台模式：常规路径不存在时，选举一台"源和目的都
-// 能出站够到"的最闲节点当交换台（DERP 式——两端各自出站拨入，
-// 交换台把两条现成连接对接，NAT 不构成障碍）。grant 同时投递给
-// 源和目的两端。
 func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) bool {
 	snap := c.graph.Snapshot()
 	best := api.NodeID("")
@@ -1375,16 +1099,18 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 		Mode:      "switch",
 		Hops:      []api.Hop{{NodeID: req.Src}, {NodeID: best, Addr: addr, Proto: proto}, {NodeID: req.Dst}},
 		SrcPath:   req.SrcPath,
-		DstPath:   req.DstPath,
-		ChunkSize: 4 << 20,
+		DstPath:   normalizeDstPath(req.DstPath, req.SrcPath),
+		ChunkSize: grantChunkSize,
 		Streams:   4,
 		RateLimit: req.RateLimit,
-		ExpiresAt: time.Now().Add(30 * time.Minute),
+		ExpiresAt: time.Now().Add(grantTTL),
 	}
 	grant.Sign(c.signer)
 	c.mu.Lock()
 	c.pending[req.Src] = append(c.pending[req.Src], grant) // 源端：发送
 	c.pending[req.Dst] = append(c.pending[req.Dst], grant) // 目的端：出站接入交换台
+	c.notifyPending(req.Src)
+	c.notifyPending(req.Dst)
 	c.mu.Unlock()
 	log.Printf("交换台模式：%s -> %s 经 %s 对接", req.Src, req.Dst, best)
 	c.jobPersist(&grant)

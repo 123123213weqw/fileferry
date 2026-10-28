@@ -24,17 +24,17 @@ import (
 // CertTTL 是节点证书的有效期；到期前由持有方向 controller 续期（M1 TODO）。
 // 管理员证书用 AdminCertTTL：操作者不便每天换证书，靠妥善保管弥补。
 const (
-	CertTTL     = 24 * time.Hour
+	CertTTL      = 24 * time.Hour
 	AdminCertTTL = 10 * 365 * 24 * time.Hour
 )
 
 type CA struct {
-	mu        sync.Mutex
-	priv      ed25519.PrivateKey
-	rootCert  *x509.Certificate
-	rootPEM   []byte
-	pool      *x509.CertPool
-	serial    int64
+	mu       sync.Mutex
+	priv     ed25519.PrivateKey
+	rootCert *x509.Certificate
+	rootPEM  []byte
+	pool     *x509.CertPool
+	serial   int64
 }
 
 // LoadOrCreate 读取 dir 下的 ca.key/ca.crt，不存在则生成新的根。
@@ -149,12 +149,12 @@ func (c *CA) Issue(nodeID string, server bool, role string, sans ...string) (cer
 		ttl = AdminCertTTL
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(c.serial + 1),
-		Subject:               pkix.Name{CommonName: nodeID, Organization: []string{"fileferry"}, OrganizationalUnit: []string{role}},
-		NotBefore:             time.Now().Add(-5 * time.Minute),
-		NotAfter:              time.Now().Add(ttl),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           eku,
+		SerialNumber: big.NewInt(c.serial + 1),
+		Subject:      pkix.Name{CommonName: nodeID, Organization: []string{"fileferry"}, OrganizationalUnit: []string{role}},
+		NotBefore:    time.Now().Add(-5 * time.Minute),
+		NotAfter:     time.Now().Add(ttl),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  eku,
 	}
 	for _, s := range sans {
 		if ip := net.ParseIP(s); ip != nil {
@@ -205,6 +205,5 @@ func NewEnrollToken() (string, error) {
 	return "ff_enroll_" + hex.EncodeToString(b), nil
 }
 
-func (c *CA) RootPEM() []byte       { return c.rootPEM }
-func (c *CA) Pool() *x509.CertPool  { return c.pool }
-func (c *CA) RootCert() *x509.Certificate { return c.rootCert }
+func (c *CA) RootPEM() []byte      { return c.rootPEM }
+func (c *CA) Pool() *x509.CertPool { return c.pool }

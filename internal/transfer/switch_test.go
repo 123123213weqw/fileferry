@@ -1,19 +1,19 @@
 package transfer
 
 import (
-	"fmt"
-	"crypto/tls"
-	"net"
-	"strconv"
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -21,7 +21,6 @@ import (
 	"fileferry/internal/api"
 	"fileferry/internal/ca"
 )
-
 
 // waitForFile 轮询等待文件落盘（份额级 ACK 后 rename 是异步终态）。
 func waitForFile(t *testing.T, path string) []byte {
@@ -76,7 +75,7 @@ func TestSwitchTransfer(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			stream, closeConn, err := DialSwitch(ctx, swQ, "quic", clientTLSFor(t, root, "dst"), grant)
+			stream, closeConn, err := DialSwitch(ctx, swQ, "quic", 0, clientTLSFor(t, root, "dst"), grant)
 			if err != nil {
 				t.Errorf("目的端接入交换台失败：%v", err)
 				return
@@ -377,7 +376,7 @@ func TestEndToEndEncrypted(t *testing.T) {
 		keyMu.Unlock()
 		return nil
 	})
-	SetKeyFetcher(func(id string) ([]byte, error) {
+	SetKeyFetcher(func(id, src string) ([]byte, error) {
 		keyMu.Lock()
 		defer keyMu.Unlock()
 		m, ok := keybox[id]
@@ -437,7 +436,7 @@ func TestConcurrentTransfers(t *testing.T) {
 		src := filepath.Join(dir, fmt.Sprintf("c%d.bin", i))
 		os.WriteFile(src, payload, 0o600)
 		grant := &api.TransferGrant{
-			ID: fmt.Sprintf("xfer-conc-%d-%d", i, time.Now().UnixNano()),
+			ID:  fmt.Sprintf("xfer-conc-%d-%d", i, time.Now().UnixNano()),
 			Src: "src", Dst: "dst", Streams: 4,
 			Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
 			SrcPath: src, DstPath: filepath.Join(dir, fmt.Sprintf("out%d", i), "d.bin"),
@@ -512,7 +511,7 @@ func TestConcurrentTransfersTCP(t *testing.T) {
 		src := filepath.Join(dir, fmt.Sprintf("t%d.bin", i))
 		os.WriteFile(src, payload, 0o600)
 		grant := &api.TransferGrant{
-			ID: fmt.Sprintf("xfer-conc-tcp-%d-%d", i, time.Now().UnixNano()),
+			ID:  fmt.Sprintf("xfer-conc-tcp-%d-%d", i, time.Now().UnixNano()),
 			Src: "src", Dst: "dst", Streams: 4,
 			Hops: []api.Hop{
 				{NodeID: "src"},

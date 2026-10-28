@@ -14,7 +14,13 @@ set -euo pipefail
 HOST="${1:?用法: deploy-agent.sh <ssh别名> <enroll-token> [data-dir]}"
 TOKEN="${2:?缺少 enroll-token（先跑 ffctl token 并加入 controller 配置）}"
 DATADIR="${3:-\$HOME/ff}"
-CONTROLLER="${FF_CONTROLLER:-https://222.186.10.53:9443}"
+# controller 地址必须显式给出，不再内置任何真实地址（之前把生产 IP
+# 写死在脚本里，随仓库一起公开）。
+CONTROLLER="${FF_CONTROLLER:-}"
+if [ -z "$CONTROLLER" ]; then
+  echo "用法：FF_CONTROLLER=https://<controller地址>:9443 $0 <ssh别名> <enroll-token> [data-dir]" >&2
+  exit 2
+fi
 
 echo "==> 传输二进制到 $HOST"
 # 先停旧进程（二进制正被运行时无法覆盖）

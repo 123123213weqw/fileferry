@@ -3,5 +3,9 @@ controller: https://ctl.example.internal:8443
 enroll-token: ff_enroll_replace-me   # 首次入网用，核销即废；入网后可删
 data-port: 7800                      # UDP(QUIC)；探测到只放 TCP 时回退 7801/tcp
 data-dir: /var/lib/ff                # 本节点证书、断点清单缓存
+# 稳定节点名：首次入网占用该名字，重装后身份不变。
+# 不填则用主机名；重名/非法时 controller 才退回自增的 node-N。
+node-name: ff-node-a
 allowed-dirs:                    # 落盘白名单（空 = 不限制）
-  - /home/wzu/ff
+  - /srv/ff
+# advertise: 1.2.3.4:7800        # 公网机 / 与 controller 同机时必须显式指定

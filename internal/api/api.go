@@ -3,17 +3,17 @@
 package api
 
 import (
-	"encoding/base64"
-	"strings"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -25,10 +25,11 @@ type NodeID = string
 // 对端的公网 NAT 映射，直连边是对端广播的地址，controller 构建
 // 传输路径时以此为准（谁探测的谁去拨）。
 type EdgeReport struct {
-	To    NodeID  `json:"to"`
-	RTTms float64 `json:"rtt_ms"`
-	Proto string  `json:"proto"`
-	Addr  string  `json:"addr"`
+	To      NodeID  `json:"to"`
+	RTTms   float64 `json:"rtt_ms"`
+	Proto   string  `json:"proto"`
+	Addr    string  `json:"addr"`
+	TCPPort int     `json:"tcp_port,omitempty"`
 	// AltProto：两种协议都通时的副协议（混流用：并行流各占一条
 	// 协议通道，叠加两种限速配额）。空 = 只有一种可用。
 	AltProto string `json:"alt_proto,omitempty"`
@@ -39,26 +40,62 @@ type EdgeReport struct {
 // UDP 回声口得知的自身公网 NAT 映射（agent 不自行声称，controller
 // 回填校验），供打洞配对用。
 type Heartbeat struct {
-	NodeID        NodeID       `json:"node_id"`
-	Hostname      string       `json:"hostname"`
-	Addr          string       `json:"addr"` // 数据面地址 host:port（QUIC）
+	NodeID   NodeID `json:"node_id"`
+	Hostname string `json:"hostname"`
+	Addr     string `json:"addr"` // 数据面地址 host:port（QUIC）
+	// TCPPort 是本节点 TCP 数据面的实际端口（0 = 未上报，按 addr 端口+1
+	// 推断）。被墙网络里 TCP 常被挪到 443，各节点端口未必相同，所以必须
+	// 由节点自己上报，不能靠全局约定。
+	TCPPort int `json:"tcp_port,omitempty"`
+	// WaitMS 让控制面做长轮询：没有待办任务时不要立刻返回，而是挂住
+	// 最多这么多毫秒，一有任务就马上回。没有长轮询时，`ffctl send`
+	// 必须等下一次心跳（5s）才会被投递——实测 200MB 传输总耗时 6s，
+	// 其中 5s 纯粹是在等心跳。scp 是立即开始的，这里必须对齐。
+	WaitMS        int          `json:"wait_ms,omitempty"`
 	Public        string       `json:"public,omitempty"`
 	CPUPct        float64      `json:"cpu_pct"`
 	MemPct        float64      `json:"mem_pct"`
 	DiskFreeBytes uint64       `json:"disk_free_bytes"`
-	NICBps        float64      `json:"nic_bps"`
 	ActiveXfers   int          `json:"active_xfers"`
 	Edges         []EdgeReport `json:"edges"`
 	TS            time.Time    `json:"ts"`
 }
 
 // LoadPct 汇总负载水位，供拓扑调度作边权。
-func (h Heartbeat) LoadPct() float64 { return (h.CPUPct + h.MemPct) / 2 }
+// LoadPct 返回节点负载水位（0-100+）。
+//
+// 之前只算 CPU 与内存的均值，磁盘水位完全不参与调度——一个磁盘快满的
+// 节点照样会被选成中继与目的端，写满后传输失败。现在把"磁盘余量"当
+// 一维水位纳入：
+//
+//	diskPct = 100 - free/2GiB*100   （低于 2GiB 余量开始告警）
+//
+// 2GiB 是经验阈值：小于它时再大的文件也可能写不进去。
+func (h Heartbeat) LoadPct() float64 {
+	base := (h.CPUPct + h.MemPct) / 2
+	if h.DiskFreeBytes > 0 {
+		const reserve = 2 << 30 // 2 GiB
+		diskPct := 100.0
+		if h.DiskFreeBytes < uint64(reserve) {
+			// 余量越少越接近 100；完全没有余量时封顶 100
+			diskPct = 100 - float64(h.DiskFreeBytes)/float64(reserve)*100
+		} else {
+			diskPct = 0
+		}
+		// 取三者最大：任一维吃紧都应当降低该节点的吸引力
+		if diskPct > base {
+			return diskPct
+		}
+	}
+	return base
+}
 
 // PeerInfo 是心跳响应里下发的在线节点信息，供 agent 互相探测。
 type PeerInfo struct {
 	ID   NodeID `json:"id"`
 	Addr string `json:"addr"` // 数据面地址 host:port（QUIC）
+	// TCPPort 是该节点 TCP 数据面的实际端口（0 = 用 Addr 端口+1）。
+	TCPPort int `json:"tcp_port,omitempty"`
 }
 
 // PunchDirective 是 controller 随心跳下发的打洞指令：对端 Peer 的
@@ -66,18 +103,22 @@ type PeerInfo struct {
 // （Private，同网段时直接可通）。双方同时向对方发包即可在两个
 // NAT 上留下放行记录。指令经 mTLS 心跳信道到达，无需额外签名。
 type PunchDirective struct {
-	Peer     NodeID `json:"peer"`
-	Addr     string `json:"addr"`     // 对端公网映射 host:port
-	Private  string `json:"private"`  // 对端广播地址 host:port
+	Peer    NodeID `json:"peer"`
+	Addr    string `json:"addr"`    // 对端公网映射 host:port
+	Private string `json:"private"` // 对端广播地址 host:port
 }
 
 // HeartbeatResponse 是心跳的响应：下发给该节点的待执行任务、
 // 全网在线节点表（agent 只需出站连接 controller，天然过 NAT）、
 // 以及打洞指令。
 type HeartbeatResponse struct {
-	Jobs    []TransferGrant   `json:"jobs"`
-	Peers   []PeerInfo        `json:"peers"`
-	Punches []PunchDirective  `json:"punches"`
+	Jobs    []TransferGrant  `json:"jobs"`
+	Peers   []PeerInfo       `json:"peers"`
+	Punches []PunchDirective `json:"punches"`
+	// Revoked 是已撤销节点名单（全量下发，几十个 ID 的量级）。
+	// 数据面据此拒收/拒发：之前撤销只体现在控制面（心跳/续期被拒），
+	// 被撤销节点的证书在 24h 内仍能直接把流推向任何目的端。
+	Revoked []NodeID `json:"revoked,omitempty"`
 }
 
 // EnrollRequest / EnrollResponse：一次性 token 换取本节点证书与根证书。
@@ -87,6 +128,10 @@ type EnrollRequest struct {
 	Token    string `json:"token"`
 	Hostname string `json:"hostname"`
 	Addr     string `json:"addr"`
+	// NodeName 是 agent 请求的稳定节点名（来自 node-name 配置，缺省
+	// 取主机名）。controller 可用则用之，不可用（重名/非法）才自增编号，
+	// 保证重装后身份不漂移。
+	NodeName string `json:"node_name,omitempty"`
 }
 
 type EnrollResponse struct {
@@ -100,12 +145,59 @@ type EnrollResponse struct {
 // DoneRequest 是 agent 回报任务执行结果。Bytes/Duration 用于
 // controller 回填路径实测吞吐（多源调度按带宽分配块区间）。
 type DoneRequest struct {
-	GrantID  string `json:"grant_id"`
-	NodeID   NodeID `json:"node_id"`
-	OK       bool   `json:"ok"`
-	Err      string `json:"err,omitempty"`
-	Bytes    int64  `json:"bytes,omitempty"`
+	GrantID  string  `json:"grant_id"`
+	NodeID   NodeID  `json:"node_id"`
+	OK       bool    `json:"ok"`
+	Err      string  `json:"err,omitempty"`
+	Bytes    int64   `json:"bytes,omitempty"`
 	Duration float64 `json:"duration_s,omitempty"`
+	// Proto 是这条数据实际走的协议（"quic"/"tcp"）。controller 据此
+	// 记录"每条边每种协议的实测吞吐"，用于后续选路——QUIC 在高丢包
+	// 链路上会被基于丢包的拥塞控制压塌（实测 2% 丢包时慢 60 倍），
+	// 只有按协议分开记才能学出"这条边该用 tcp"。
+	Proto string `json:"proto,omitempty"`
+}
+
+// PullEndpoint 是 ffctl 作为**数据面接收端**所需的凭据。
+//
+// 与 put 相反，pull 时 ffctl 要监听 TLS 并充当服务器，因此需要一张带
+// ServerAuth 的证书——管理员证书只带 ClientAuth，直接用会在 TLS 握手
+// 阶段被发送方拒绝。controller 为此按需签发一张短时效的传输端点证书。
+type PullEndpoint struct {
+	NodeID     NodeID `json:"node_id"` // ffctl 的身份（证书 CN）
+	CertPEM    string `json:"cert_pem"`
+	KeyPEM     string `json:"key_pem"`
+	SignPubPEM string `json:"sign_pub_pem"` // 校验授权签名用
+	ExpiresAt  int64  `json:"expires_at"`
+}
+
+// PullRequest 申请"从远端节点拉取到本机"的授权。
+type PullRequest struct {
+	NodeID     NodeID `json:"node_id"` // 上面拿到的 ffctl 身份
+	Src        NodeID `json:"src"`
+	SrcPath    string `json:"src_path"`
+	DstPath    string `json:"dst_path"`    // 本机保存路径（目录会自动补源文件名）
+	ListenAddr string `json:"listen_addr"` // ffctl 数据面监听地址 host:port
+	ListenPort int    `json:"listen_port"` // 实际 TCP 端口
+	Streams    int    `json:"streams,omitempty"`
+	// PinHash 要求把源节点索引里的摘要钉进授权（强校验）。
+	// 默认关闭：索引是定期上报的，文件在两次上报之间被改动就会让
+	// 合法传输被拒（实测踩到——agent 启动时索引了同名旧文件）。
+	PinHash bool `json:"pin_hash,omitempty"`
+}
+
+// PushRequest 是"本机 → 远端节点"直推的申请（等价 scp local host:/path）。
+// ffctl 在本地算好摘要与大小一起提交，controller 只负责签授权、给出
+// 目标的拨号地址——数据面由 ffctl 直接连目标节点，不经过 controller，
+// 也没有"先上传到某个源节点"的中转开销。
+type PushRequest struct {
+	Dst       NodeID `json:"dst"`
+	DstPath   string `json:"dst_path"`
+	LocalPath string `json:"local_path"` // 仅用于目标写成目录时补文件名
+	SHA256    string `json:"sha256"`
+	Size      int64  `json:"size"`
+	Streams   int    `json:"streams,omitempty"` // 0 = 默认
+	RateLimit int64  `json:"rate_limit_bps"`
 }
 
 // TransferRequest 是 ffctl 发起的按需传输请求。
@@ -115,6 +207,12 @@ type TransferRequest struct {
 	Dst       NodeID `json:"dst"`
 	DstPath   string `json:"dst_path"`
 	RateLimit int64  `json:"rate_limit_bps"` // 0 = 不限速
+	// Proto 强制数据面协议（"tcp"/"quic"，空=按探测/学习结果）。
+	//
+	// 存在的理由：被墙网络里 UDP 常被丢包或拦截，QUIC 会静默变慢或不通。
+	// 没有这个字段时，`ffctl -proto tcp send ...` 会被**静默忽略**——用户
+	// 以为强制了 TCP，实际仍按默认走，排查时会误判成"TCP 也慢"。
+	Proto string `json:"proto,omitempty"`
 }
 
 // TransferGrant 是 controller 签名的单次传输授权：写明源、目的、
@@ -127,36 +225,38 @@ type Hop struct {
 	NodeID NodeID `json:"node_id"`
 	Addr   string `json:"addr"`
 	Proto  string `json:"proto"`
+	// TCPPort 是该跳 TCP 数据面的实际端口（0 = 用 Addr 端口+1）。
+	TCPPort int `json:"tcp_port,omitempty"`
 }
 
 type TransferGrant struct {
-	ID         string    `json:"id"`
-	Src        NodeID    `json:"src"`
-	Dst        NodeID    `json:"dst"`
+	ID  string `json:"id"`
+	Src NodeID `json:"src"`
+	Dst NodeID `json:"dst"`
 	// Mode 为空 = 常规模式（直连或逐跳中继，前驱拨下一跳）；
 	// "switch" = 交换台模式：两端各自**出站**拨向 Hops[1] 指定的
 	// 交换台节点（DERP 式），交换台把两条现成连接对接。适用于
 	// 任何一方都拨不进对方 NAT 的场景。
-	Mode       string    `json:"mode,omitempty"`
-	Hops       []Hop     `json:"hops"` // 完整路径：源端、各中继/交换台、目的端
-	Relays     []NodeID  `json:"relays"`
+	Mode   string   `json:"mode,omitempty"`
+	Hops   []Hop    `json:"hops"` // 完整路径：源端、各中继/交换台、目的端
+	Relays []NodeID `json:"relays"`
 	// Sources 是 M8 多源并行：文件存在多份副本时，controller 把块
 	// 区间按路径带宽分配给各源，目的端同时从多台拉不同块——叠加
 	// 各"源-目的对"独立的限速配额。为空时单源（Hops[1]）。每个源
 	// 节点收到同一份 grant，各取自己的区间发送。
 	Sources    []SourceSpec `json:"sources,omitempty"`
-	SrcPath    string    `json:"src_path"`
-	DstPath    string    `json:"dst_path"`
-	FileSHA256 string    `json:"file_sha256"`
-	FileSize   int64     `json:"file_size"`
-	ChunkSize  int       `json:"chunk_size"`
-	Streams    int       `json:"streams"` // 每源的并行连接数：绕 per-flow 限速、填满带宽延迟积
-	RateLimit  int64     `json:"rate_limit_bps"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	Retries    int       `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
-	Enc        bool      `json:"enc,omitempty"`    // 端到端加密（密钥经 controller 专递，不进 grant）
-	Mix        bool      `json:"mix,omitempty"`    // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
-	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
+	SrcPath    string       `json:"src_path"`
+	DstPath    string       `json:"dst_path"`
+	FileSHA256 string       `json:"file_sha256"`
+	FileSize   int64        `json:"file_size"`
+	ChunkSize  int          `json:"chunk_size"`
+	Streams    int          `json:"streams"` // 每源的并行连接数：绕 per-flow 限速、填满带宽延迟积
+	RateLimit  int64        `json:"rate_limit_bps"`
+	ExpiresAt  time.Time    `json:"expires_at"`
+	Retries    int          `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
+	Enc        bool         `json:"enc,omitempty"`     // 端到端加密（密钥经 controller 专递，不进 grant）
+	Mix        bool         `json:"mix,omitempty"`     // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
+	Sig        string       `json:"sig"`               // ed25519 over payloadV3（见 api.go）
 }
 
 // SourceSpec 是多源 grant 中一个源的分片：负责块区间 [Start, End)。
@@ -167,6 +267,8 @@ type SourceSpec struct {
 	Path   string `json:"path"`  // 该源本地的文件路径（各副本路径可不同）
 	Start  int64  `json:"start"` // 起始块号（含）
 	End    int64  `json:"end"`   // 结束块号（不含）
+	// TCPPort 是该副本节点 TCP 数据面的实际端口（0 = Addr 端口+1）。
+	TCPPort int `json:"tcp_port,omitempty"`
 }
 
 // AllSources 返回参与发送的全部节点 ID（含主源）。
@@ -183,34 +285,104 @@ func (g *TransferGrant) AllSources() []NodeID {
 // payload 返回待签名的规范串（不含 Sig）。手工拼接而非 json.Marshal
 // 整个 struct——未来新增字段不进签名，新旧版本互验不破（曾因新增
 // Retries 字段导致新旧混编时全网验签失败）。
-func (g *TransferGrant) payload() []byte {
+// payloadV2 是长度前缀版本：手拼分隔符的旧格式里，NodeID / 路径若含
+// ',' ';' '|' 就能构造出"不同 JSON 却同一签名串"的歧义。V2 对每个
+// 变长字段前置长度，签名串与结构一一对应。
+func (g *TransferGrant) payloadV2() []byte {
+	return append([]byte("ff2|"), g.payloadBody()...)
+}
+
+// payloadBody 是 V2 的字段序列（不含版本前缀），供 V2/V3 共用。
+func (g *TransferGrant) payloadBody() []byte {
 	var sb strings.Builder
-	sb.WriteString("ff1|")
-	sb.WriteString(g.ID)
-	sb.WriteByte('|')
-	sb.WriteString(string(g.Src))
-	sb.WriteByte('|')
-	sb.WriteString(string(g.Dst))
-	sb.WriteByte('|')
-	sb.WriteString(g.Mode)
-	sb.WriteByte('|')
-	fmt.Fprintf(&sb, "%d|%s|%d|", g.FileSize, g.FileSHA256, g.ChunkSize)
+	wStr := func(v string) {
+		fmt.Fprintf(&sb, "%d:", len(v))
+		sb.WriteString(v)
+	}
+	wInt := func(v int64) { fmt.Fprintf(&sb, "%d;", v) }
+	wStr(g.ID)
+	wStr(string(g.Src))
+	wStr(string(g.Dst))
+	wStr(g.Mode)
+	wInt(g.FileSize)
+	wStr(g.FileSHA256)
+	wInt(int64(g.ChunkSize))
+	wInt(int64(len(g.Hops)))
 	for _, h := range g.Hops {
-		// Proto 不进签名：混流按流改写拨号协议属路由提示，非授权语义
-		fmt.Fprintf(&sb, "h:%s,%s;", h.NodeID, h.Addr)
+		wStr(string(h.NodeID))
+		wStr(h.Addr) // Proto 不进签名（拨号协议是路由提示，混流会按流改写）
 	}
+	wInt(int64(len(g.Sources)))
 	for _, sp := range g.Sources {
-		fmt.Fprintf(&sb, "s:%s,%s,%s,%d,%d;", sp.NodeID, sp.Addr, sp.Path, sp.Start, sp.End)
+		wStr(string(sp.NodeID))
+		wStr(sp.Addr)
+		wStr(sp.Path)
+		wInt(sp.Start)
+		wInt(sp.End)
 	}
-	sb.WriteString(g.SrcPath)
-	sb.WriteByte('|')
-	sb.WriteString(g.DstPath)
-	fmt.Fprintf(&sb, "|%d|%d|%d|%v|%v", g.Streams, g.Retries, g.ExpiresAt.Unix(), g.Enc, g.Mix)
+	wStr(g.SrcPath)
+	wStr(g.DstPath)
+	wInt(int64(g.Streams))
+	wInt(int64(g.Retries))
+	wInt(g.ExpiresAt.Unix())
+	if g.Enc {
+		wStr("enc")
+	}
+	if g.Mix {
+		wStr("mix")
+	}
 	return []byte(sb.String())
 }
 
+// payloadV3 = V2 字段 + V2 漏掉的 Hop.TCPPort / SourceSpec.TCPPort / RateLimit。
+//
+// 为什么必须补：这三者都改变了数据面的实际行为——agent 真的用
+// g.Hops[1].TCPPort 拨号（cmd/agent/main.go），RateLimit 决定整任务配额。
+// 而 V2 不含它们，于是"持 grant 的中继把某一跳改指同主机另一个端口"或
+// "把限速清零"都能带着合法签名通过验签。api.go 里那句"Sig 覆盖以上所有
+// 字段"的注释在 V2 下是假的，V3 才让它是真的。
+func (g *TransferGrant) payloadV3() []byte {
+	b := append([]byte("ff3|"), g.payloadBody()...)
+	var sb strings.Builder
+	wInt := func(v int64) { fmt.Fprintf(&sb, "%d;", v) }
+	wInt(int64(len(g.Hops)))
+	for _, h := range g.Hops {
+		wInt(int64(h.TCPPort))
+	}
+	wInt(int64(len(g.Sources)))
+	for _, sp := range g.Sources {
+		wInt(int64(sp.TCPPort))
+	}
+	wInt(g.RateLimit)
+	return append(b, []byte(sb.String())...)
+}
+
+// ValidateNodeName 校验显式配置的节点名。与 controller 的
+// NormalizeNodeName 同一套规则：任意 UTF-8，但禁止 ':'（与
+// `node:/path` 语法冲突）、'/'、控制字符、前后空白与超长。
+func ValidateNodeName(name string) error {
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("节点名首尾不能有空白")
+	}
+	if name == "" {
+		return fmt.Errorf("节点名为空")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("节点名过长（%d 字节，上限 64）", len(name))
+	}
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("节点名不能含控制字符")
+		case r == ':' || r == '/' || r == '\\':
+			return fmt.Errorf("节点名不能含 %q（与 node:/path 语法冲突）", r)
+		}
+	}
+	return nil
+}
+
 func (g *TransferGrant) Sign(priv ed25519.PrivateKey) {
-	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payload()))
+	g.Sig = hex.EncodeToString(ed25519.Sign(priv, g.payloadV3()))
 }
 
 func (g *TransferGrant) Verify(pub ed25519.PublicKey) bool {
@@ -218,7 +390,20 @@ func (g *TransferGrant) Verify(pub ed25519.PublicKey) bool {
 	if err != nil {
 		return false
 	}
-	return ed25519.Verify(pub, g.payload(), sig)
+	// 先按 V3 验（当前签发版本，覆盖 TCPPort / RateLimit）。
+	//
+	// 再按 V2 验：只为"升级前已签发、还在 30 分钟 TTL 内"的旧 grant 留门。
+	// 攻击者无法把 V3 签名的 grant 降级成 V2 通过——签名是对具体字节做的，
+	// 他没有 controller 私钥就造不出 V2 签名的串。代价是每次升级后有最多
+	// 30 分钟窗口，期间旧 grant 的 TCPPort/RateLimit 仍可被改写；升级脚本
+	// 跑完即消失。
+	//
+	// V1（裸分隔符手拼）已删除：Sign 从来只签 V2/V3，所以 V1 分支只可能被
+	// "升级前的旧 controller" 命中，而那种 controller 本来就在发可碰撞的
+	// 签名串。删掉它，旧 controller + 新 agent 会失败关闭而不是接受可篡改
+	// 的授权。
+	return ed25519.Verify(pub, g.payloadV3(), sig) ||
+		ed25519.Verify(pub, g.payloadV2(), sig)
 }
 
 // Client 是 controller 的 HTTP 客户端；enroll 阶段可不带证书调用。
@@ -346,7 +531,6 @@ func (c *Client) Renew() (*RenewResponse, error) {
 	return &resp, nil
 }
 
-
 // IndexEntry 是 agent 上报的共享目录文件索引（M8 多源副本发现）。
 // SHA256 由 agent 后台计算并缓存（size+mtime 不变不重算）。
 type IndexEntry struct {
@@ -380,11 +564,19 @@ func (c *Client) PostKeypass(grantID string, material []byte) error {
 	}, &ignored)
 }
 
-func (c *Client) GetKeypass(grantID string) ([]byte, error) {
+// GetKeypass 取某个源为该 grant 上报的密钥材料。
+//
+// src 为空表示"主源"（旧 controller 只认 id，会忽略多出来的 src 参数，
+// 所以新 agent 对着旧 controller 单源仍然可用）。
+func (c *Client) GetKeypass(grantID, src string) ([]byte, error) {
 	var resp struct {
 		KeyB64 string `json:"key_b64"`
 	}
-	if err := c.Get("/v1/keypass?id="+url.QueryEscape(grantID), &resp); err != nil {
+	u := "/v1/keypass?id=" + url.QueryEscape(grantID)
+	if src != "" {
+		u += "&src=" + url.QueryEscape(src)
+	}
+	if err := c.Get(u, &resp); err != nil {
 		return nil, err
 	}
 	return base64.StdEncoding.DecodeString(resp.KeyB64)

@@ -53,6 +53,16 @@ jobs:
       - name: go vet
         run: GOFLAGS=-mod=readonly go vet ./...
 
+      # 之前 13/13 个文件都不符合 gofmt，说明没有任何地方守这件事
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未按 gofmt 格式化："
+            echo "$unformatted"
+            exit 1
+          fi
+
       # README「快速开始」的第一条命令，别让它悄悄坏掉
       - name: make build
         run: make build

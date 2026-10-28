@@ -9,11 +9,11 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +45,17 @@ type Config struct {
 	Controller  string `yaml:"controller"`
 	EnrollToken string `yaml:"enroll-token"`
 	DataPort    int    `yaml:"data-port"`
-	DataDir     string `yaml:"data-dir"`
+	// BindAddr 是数据面监听地址（默认空 = 所有接口）。多网卡主机可用它
+	// 只绑某个内网口；也用于测试里把流量引入延迟代理。
+	BindAddr string `yaml:"bind-addr"`
+	// TCPAdvertisePort 是**对外公布**的 TCP 端口（0 = 与 tcp-port 相同）。
+	// 用于数据面在 NAT / 端口转发 / 代理之后时：自己监听 tcp-port，
+	// 但对端应按这个端口拨号。
+	TCPAdvertisePort int `yaml:"tcp-advertise-port"`
+	// TCPPort 让 TCP 数据面使用固定端口（0 = data-port+1）。
+	// 被墙网络只放行 443 时，写 443 即可用纯 TCP 打通。
+	TCPPort int    `yaml:"tcp-port"`
+	DataDir string `yaml:"data-dir"`
 	// Advertise 显式声明对外的数据面地址（host:port）。controller 与
 	// agent 同机时自动探测会得到 127.0.0.1，公网机必须手工指定。
 	Advertise string `yaml:"advertise"`
@@ -55,6 +66,9 @@ type Config struct {
 	// 并上报文件索引（后台算哈希，mtime 不变不重算）。空 = 用第一
 	// 个 allowed-dir；再为空则不参与多源。
 	ShareDir string `yaml:"share-dir"`
+	// NodeName 请求的稳定节点名（缺省取主机名）。同名的第一次入网
+	// 占用该名字，之后的入网/重装沿用同一身份。
+	NodeName string `yaml:"node-name"`
 }
 
 var (
@@ -67,21 +81,115 @@ var (
 	signPub  ed25519.PublicKey // grant 验签公钥
 	udpConn  *sniffConn        // 数据面共享 socket（监听+拨号+打洞+WHOAMI）
 
-	mu      sync.Mutex
-	peers    []api.PeerInfo   // 最近一次心跳响应下发的在线节点
-	edges    []api.EdgeReport // 最近一轮探测的可达边
+	mu       sync.Mutex
+	peers    []api.PeerInfo    // 最近一次心跳响应下发的在线节点
+	edges    []api.EdgeReport  // 最近一轮探测的可达边
 	punched  map[string]string // 打洞成功的对端 -> 公网映射地址
 	myPublic string            // controller 回声口告知的本机公网映射
 	running  map[string]bool   // 去重：正在执行的 grant ID
-	dueRep  []dueReport        // 待补发的任务回报（带时效，陈年丢弃）
+	dueRep   []dueReport       // 待补发的任务回报（带时效，陈年丢弃）
 
 	probeNow = make(chan struct{}, 1) // 节点表变化时立即触发一轮探测
+
+	// startedAt 用于判定冷启动窗口（见 heartbeatLoop 的短轮询）。
+	startedAt = time.Now()
+
+	cpuSamplerGlobal cpuSampler // CPU 占用率需要两次采样求差
+
+	revokedMu  sync.Mutex
+	revokedIDs = map[api.NodeID]bool{} // controller 下发的撤销名单（数据面自保）
+
+	// probeFail 记录每个对端的连续探测失败次数与下次允许时间。
+	// 之前每 30s 无差别重试所有 peer：对端宕机时，一台死节点会让其余
+	// 所有节点每 30s 各发 2 次失败连接（QUIC+TCP）并各写一行日志，
+	// 在对端/IDS 看来就是分布式端口扫描。现在指数退避 + 状态变化才记
+	// 日志。
+	probeFailMu sync.Mutex
+	probeFail   = map[api.NodeID]*peerBackoff{}
 )
+
+// peerBackoff 单个对端的退避状态。
+type peerBackoff struct {
+	fails int
+	next  time.Time
+}
+
+// probeBackoff 返回该 peer 允许下次探测的等待时长（0 = 立即可探）。
+func probeBackoff(fails int) time.Duration {
+	if fails <= 0 {
+		return 0
+	}
+	// 头两次失败只退避几秒：agent 刚启动时对端的数据面可能还没监听（两个
+	// agent 同时拉起），首次探测必然失败。之前一律退避 30 秒，于是"起来
+	// 就能传"变成"起等半分钟"——实测 15 秒时 send 直接报 no reachable path，
+	// 40 秒才建出边。
+	// 对端真宕机时，30 秒后的几次探测会把退避迅速推到上限，日志也不会刷屏
+	// （markProbe 只在首次失败记一行）。
+	if fails <= 2 {
+		return time.Duration(fails) * 3 * time.Second
+	}
+	d := 30 * time.Second
+	for i := 3; i < fails && d < 5*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
+// allowProbe 判断该 peer 现在是否可以探测。
+func allowProbe(id api.NodeID) bool {
+	probeFailMu.Lock()
+	defer probeFailMu.Unlock()
+	b, ok := probeFail[id]
+	if !ok {
+		return true
+	}
+	return !time.Now().Before(b.next)
+}
+
+// markProbe 记录一次探测结果：成功清零，失败累加并排下次时间。
+// 返回 true 表示"状态发生了变化"，调用方据此决定是否打日志。
+func markProbe(id api.NodeID, ok bool) bool {
+	probeFailMu.Lock()
+	defer probeFailMu.Unlock()
+	if ok {
+		if _, had := probeFail[id]; had {
+			delete(probeFail, id)
+			return true // 从失败恢复：值得记一行
+		}
+		return false
+	}
+	b, had := probeFail[id]
+	if !had {
+		b = &peerBackoff{}
+		probeFail[id] = b
+	}
+	b.fails++
+	b.next = time.Now().Add(probeBackoff(b.fails))
+	return b.fails == 1 // 只在"第一次失败"时记日志
+}
 
 // sniffConn 在数据面 UDP socket 外截流 WHOAMI 回复，其余包交给 QUIC。
 type sniffConn struct {
 	*net.UDPConn
 	whoamiCh chan []byte
+}
+
+// sniff 判断一个数据包是不是 controller 的 WHOAMI 回声，是则投进
+// whoamiCh 并返回 true（该包不应再交给 QUIC）。
+func (c *sniffConn) sniff(p []byte) bool {
+	if len(p) < 6 || string(p[:6]) != "FFWHO1" {
+		return false
+	}
+	b := make([]byte, len(p))
+	copy(b, p)
+	select {
+	case c.whoamiCh <- b:
+	default:
+	}
+	return true
 }
 
 func (c *sniffConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -90,16 +198,28 @@ func (c *sniffConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if err != nil {
 			return n, addr, err
 		}
-		if n >= 6 && string(p[:6]) == "FFWHO1" {
-			b := make([]byte, n)
-			copy(b, p[:n])
-			select {
-			case c.whoamiCh <- b:
-			default:
-			}
+		if c.sniff(p[:n]) {
 			continue // 不交给 QUIC
 		}
 		return n, addr, err
+	}
+}
+
+// ReadMsgUDP 必须显式实现：sniffConn 内嵌 *net.UDPConn，ReadMsgUDP 会被
+// 提升，于是它满足 quic-go 的 OOBCapablePacketConn，quic-go 会**直接
+// 调用 ReadMsgUDP** 而完全绕过上面的 ReadFrom——WHOAMI 回声因此被当成
+// QUIC 垃圾包丢弃，myPublic 永远为空（每个 agent 每 25s 刷一行超时）。
+// 这里显式覆盖，既保留 ECN/批量读优化，又让嗅探真正生效。
+func (c *sniffConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
+	for {
+		n, oobn, flags, addr, err = c.UDPConn.ReadMsgUDP(b, oob)
+		if err != nil {
+			return
+		}
+		if c.sniff(b[:n]) {
+			continue
+		}
+		return
 	}
 }
 
@@ -139,43 +259,54 @@ func run(cfgPath string) error {
 	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
 		return hbClient.PostKeypass(grantID, material)
 	})
-	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
-		return hbClient.GetKeypass(grantID)
+	transfer.SetKeyFetcher(func(grantID, src string) ([]byte, error) {
+		return hbClient.GetKeypass(grantID, src)
 	})
+	transfer.SetInboxRoot(cfg.DataDir)
 	if len(cfg.AllowedDirs) > 0 {
-		transfer.SetPathGuard(func(p string) bool {
-			for _, dir := range cfg.AllowedDirs {
-				if strings.HasPrefix(p, dir) {
-					return true
-				}
-			}
-			return false
-		})
+		guard, gerr := transfer.NewPathGuard(cfg.AllowedDirs)
+		if gerr != nil {
+			return gerr
+		}
+		transfer.SetPathGuard(guard)
 		log.Printf("路径白名单：%v", cfg.AllowedDirs)
 	}
-	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}}
+	// 给控制面请求设总超时：之前没有 Timeout，TCP 半开时心跳 goroutine
+	// 会永久阻塞——节点被判离线且永远不会自愈（连重连都不做）。
+	hbClient = &api.Client{Base: cfg.Controller, HC: &http.Client{
+		// 必须大于长轮询等待（8s）+ RTT，否则心跳会自己超时
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConf, IdleConnTimeout: 90 * time.Second},
+	}}
 	running = map[string]bool{}
 	punched = map[string]string{}
+	if cfg.TCPPort > 0 {
+		// 被墙网络只放行 443 时用这条：UDP(QUIC) 通常被干扰，走纯 TCP。
+		// 注意：tcp-port 是**全网统一**的端口（如同 ssh 全网用 22），
+		// 各节点必须配成同一个值，否则会把对端地址拨到自己身上。
+		log.Printf("数据面：UDP %d（QUIC）/ TCP %d（固定端口，需全网一致）",
+			cfg.DataPort, cfg.TCPPort)
+	} else {
+		log.Printf("数据面：UDP %d（QUIC）/ TCP %d（默认 data-port+1）",
+			cfg.DataPort, cfg.DataPort+1)
+	}
 	log.Printf("agent %s 就绪（controller=%s）", nodeID, cfg.Controller)
 
 	if shareDir() != "" {
 		go indexLoop()
 	}
 
-	// 2. 心跳 / 探测 / WHOAMI 保活 / 证书续期
-	go heartbeatLoop()
-	go probeLoop()
-	go whoamiLoop()
-	go certRenewLoop()
-
-	// 3. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）
+	// 2. 数据面：共享 Transport（同一 UDP socket 上监听与拨号）。
+	//    必须**先**把 udpConn 建好再起后台循环——whoamiLoop/tryPunch
+	//    都直接用 udpConn；之前先起 goroutine 后赋值，启动瞬间是 nil，
+	//    实测 30 次启动有 19 次 nil 解引用 panic（约 63%）。
 	serverTLS := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		ClientCAs:    rootPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		MinVersion:   tls.VersionTLS13,
 	}
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", cfg.DataPort))
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.DataPort)))
 	if err != nil {
 		return err
 	}
@@ -193,23 +324,37 @@ func run(cfgPath string) error {
 	tr := &quic.Transport{Conn: udpConn}
 	transfer.SetTransport(tr)
 	ln, err := tr.Listen(serverTLS, &quic.Config{
-		MaxIdleTimeout:                  30 * time.Second,
-		InitialStreamReceiveWindow:      8 << 20,
-		MaxStreamReceiveWindow:          16 << 20,
-		InitialConnectionReceiveWindow:  16 << 20,
-		MaxConnectionReceiveWindow:      32 << 20,
+		MaxIdleTimeout:                 30 * time.Second,
+		InitialStreamReceiveWindow:     8 << 20,
+		MaxStreamReceiveWindow:         16 << 20,
+		InitialConnectionReceiveWindow: 16 << 20,
+		MaxConnectionReceiveWindow:     32 << 20,
 	})
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
 	defer rawUDP.Close()
-	tcpLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", cfg.DataPort+1), serverTLS)
+	tcpPort := cfg.DataPort + 1
+	if cfg.TCPPort > 0 {
+		tcpPort = cfg.TCPPort
+	}
+	if cfg.TCPPort > 0 && cfg.TCPPort == cfg.DataPort {
+		log.Printf("⚠ tcp-port(%d) 与 data-port 相同：UDP 与 TCP 抢同一端口号，请改开", cfg.TCPPort)
+	}
+	tcpLn, err := tls.Listen("tcp", net.JoinHostPort(cfg.BindAddr, strconv.Itoa(tcpPort)), serverTLS)
 	if err != nil {
 		log.Printf("TCP 回退监听失败（仅 QUIC 可用）：%v", err)
 	} else {
 		defer tcpLn.Close()
 	}
+
+	// 3. 后台循环：心跳 / 探测 / WHOAMI 保活 / 证书续期。
+	//    放在数据面就绪之后，保证它们用到的 udpConn 一定非 nil。
+	go heartbeatLoop()
+	go probeLoop()
+	go whoamiLoop()
+	go certRenewLoop()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -272,10 +417,22 @@ func loadOrCreateCert() (*tls.Certificate, *x509.CertPool, error) {
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}},
 	}}
+	// 请求一个稳定节点名：优先 node-name 配置，否则用主机名。
+	// 显式配置时严格校验、非法直接失败——静默改名会让运维以为节点叫
+	// A 而实际叫 B。主机名不受我们控制，交给 controller 侧宽松处理。
+	wantName := cfg.NodeName
+	if wantName != "" {
+		if err := api.ValidateNodeName(wantName); err != nil {
+			return nil, nil, fmt.Errorf("agent.yaml 的 node-name 非法: %w", err)
+		}
+	} else {
+		wantName = hostname
+	}
 	resp, err := cl.Enroll(api.EnrollRequest{
 		Token:    cfg.EnrollToken,
 		Hostname: hostname,
 		Addr:     advertisedAddr(),
+		NodeName: wantName,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("enroll: %w", err)
@@ -341,7 +498,30 @@ func loadSignPub() error {
 
 // verifyGrant 在数据面本地验签：签名有效、未过期。身份匹配由各
 // 路径自查：接收端查 Dst==selfID，中继查在路径上，交换台查参与方。
+// isRevoked 报告节点是否已被 controller 撤销。
+func isRevoked(id api.NodeID) bool {
+	revokedMu.Lock()
+	defer revokedMu.Unlock()
+	return revokedIDs[id]
+}
+
 func verifyGrant(g *api.TransferGrant) bool {
+	if isRevoked(g.Src) || isRevoked(g.Dst) {
+		log.Printf("[verify] 拒绝 %s：参与方已撤销（src=%q dst=%q）", g.ID, g.Src, g.Dst)
+		return false
+	}
+	for _, sp := range g.Sources {
+		if isRevoked(sp.NodeID) {
+			log.Printf("[verify] 拒绝 %s：源 %q 已撤销", g.ID, sp.NodeID)
+			return false
+		}
+	}
+	for _, h := range g.Hops {
+		if isRevoked(h.NodeID) {
+			log.Printf("[verify] 拒绝 %s：路径节点 %q 已撤销", g.ID, h.NodeID)
+			return false
+		}
+	}
 	ok := g.Verify(signPub)
 	exp := time.Now().Before(g.ExpiresAt)
 	if !ok || !exp {
@@ -434,8 +614,8 @@ func shareDir() string {
 	transfer.SetKeyDeliverer(func(grantID string, material []byte) error {
 		return hbClient.PostKeypass(grantID, material)
 	})
-	transfer.SetKeyFetcher(func(grantID string) ([]byte, error) {
-		return hbClient.GetKeypass(grantID)
+	transfer.SetKeyFetcher(func(grantID, src string) ([]byte, error) {
+		return hbClient.GetKeypass(grantID, src)
 	})
 	if len(cfg.AllowedDirs) > 0 {
 		return cfg.AllowedDirs[0]
@@ -506,36 +686,66 @@ func indexLoop() {
 }
 
 func heartbeatLoop() {
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for range t.C {
+	// 长轮询链：每次心跳都会在控制面挂住最多 8 秒（WaitMS）。返回后
+	// 若这次明显是"挂满了才回"（没有任务），立刻续下一次轮询，而不是
+	// 等 5 秒 ticker——否则任务恰好落在两次轮询之间时，投递延迟会随机
+	// 变成 5 秒（实测 4MB 传输偶发 4.7s，正常应为 0.1s）。
+	// 只有心跳失败（快速返回）时才退到 5 秒间隔，避免把控制面打爆。
+	for {
+		cpu := cpuSamplerGlobal.pct()
+		mem := memPct()
+		free := diskFree(cfg.DataDir)
 		mu.Lock()
+		active := len(running)
+		// 冷启动短轮询：探测出来的边是**随下一次心跳**上报的，而心跳最长
+		// 挂 8 秒，于是"起来就能传"要等到第二次心跳（实测 12 秒时 status
+		// 仍显示 出边=[]，15 秒时 send 直接报 no reachable path）。
+		// 还没上报过任何边、且启动不到 60 秒时，把轮询缩到 1.5 秒：建边
+		// 延迟从 ~16 秒降到 ~4 秒。上报过一次边、或已经跑了 60 秒仍无对端
+		// （孤岛节点）就回到 8 秒，避免长期空转。
+		waitMS := 8000
+		if len(edges) == 0 && time.Since(startedAt) < 60*time.Second {
+			waitMS = 1500
+		}
 		hb := api.Heartbeat{
-			NodeID:   nodeID,
-			Hostname: hostname,
-			Addr:     advertisedAddr(),
-			Public:   myPublic,
-			Edges:    edges,
-			TS:       time.Now(),
-			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
+			NodeID:        nodeID,
+			Hostname:      hostname,
+			Addr:          advertisedAddr(),
+			TCPPort:       tcpPortAdvertised(),
+			Public:        myPublic,
+			Edges:         edges,
+			TS:            time.Now(),
+			CPUPct:        cpu,
+			MemPct:        mem,
+			DiskFreeBytes: free,
+			ActiveXfers:   active,
+			// 长轮询：有任务立刻回，避免每条命令白等一次心跳。
+			// 必须明显小于 topology.HeartbeatTimeout（20s），否则节点会
+			// 在两次心跳之间被判离线。
+			WaitMS: waitMS,
 		}
 		mu.Unlock()
+		hbStart := time.Now()
 		resp, err := hbClient.Heartbeat(hb)
 		if err != nil {
 			log.Println("心跳失败：", err)
+			// 失败后必须退让，否则会成为紧循环
+			time.Sleep(3 * time.Second)
 			continue
 		}
 		mu.Lock()
 		backlog := dueRep
 		dueRep = nil
 		mu.Unlock()
-		for _, r := range backlog { // 网络恢复：补发新鲜积压，丢弃陈年
+		for i, r := range backlog { // 网络恢复：补发新鲜积压，丢弃陈年
 			if time.Since(r.at) > 10*time.Minute {
 				continue
 			}
 			if err := hbClient.JobDone(r.req); err != nil {
+				// 只把当前一条放回会让后面未发的整段凭空消失
+				// （之前 break 之前没有把 backlog[i+1:] 收回来）。
 				mu.Lock()
-				dueRep = append(dueRep, r)
+				dueRep = append(append([]dueReport{}, backlog[i:]...), dueRep...)
 				mu.Unlock()
 				break
 			}
@@ -544,6 +754,15 @@ func heartbeatLoop() {
 		changed := !samePeerSet(peers, resp.Peers)
 		peers = resp.Peers
 		mu.Unlock()
+		if resp.Revoked != nil { // 全量替换
+			revokedMu.Lock()
+			fresh := make(map[api.NodeID]bool, len(resp.Revoked))
+			for _, id := range resp.Revoked {
+				fresh[id] = true
+			}
+			revokedIDs = fresh
+			revokedMu.Unlock()
+		}
 		if changed {
 			select {
 			case probeNow <- struct{}{}:
@@ -556,6 +775,13 @@ func heartbeatLoop() {
 		for _, d := range resp.Punches {
 			log.Printf("收到打洞指令：对端 %s（%s）", d.Peer, d.Addr)
 			go tryPunch(d)
+		}
+		// 只有"什么也没收到且快速返回"（429 限速/异常）才退让；正常
+		// 情况（长轮询挂满才回，或刚收到任务）都立即续下一次轮询，
+		// 保证任意时刻都有一条心跳挂在控制面等着接任务。
+		if len(resp.Jobs) == 0 && len(resp.Punches) == 0 &&
+			time.Since(hbStart) < time.Second {
+			time.Sleep(1500 * time.Millisecond)
 		}
 	}
 }
@@ -589,6 +815,9 @@ func whoamiLoop() {
 	t := time.NewTicker(25 * time.Second)
 	defer t.Stop()
 	send := func() {
+		if udpConn == nil { // 防御：数据面尚未就绪
+			return
+		}
 		pkt, err := nat.Build(nodeID, nodeCert, time.Now())
 		if err != nil {
 			return
@@ -596,6 +825,15 @@ func whoamiLoop() {
 		raddr, err := net.ResolveUDPAddr("udp", echoAddr)
 		if err != nil {
 			return
+		}
+		// 丢弃上一轮遗留的回声，避免读到陈旧的公网映射
+	drain:
+		for {
+			select {
+			case <-udpConn.whoamiCh:
+			default:
+				break drain
+			}
 		}
 		if _, err := udpConn.WriteTo(pkt, raddr); err != nil {
 			log.Println("WHOAMI 发送失败：", err)
@@ -647,11 +885,27 @@ func strconvAtoi(s string) (int, error) {
 	return n, nil
 }
 
-func hostOf(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
+// tcpPortAdvertised 返回本节点对外公布的 TCP 数据面端口。
+func tcpPortAdvertised() int {
+	if cfg.TCPAdvertisePort > 0 {
+		return cfg.TCPAdvertisePort
 	}
-	return hostport
+	if cfg.TCPPort > 0 {
+		return cfg.TCPPort
+	}
+	return cfg.DataPort + 1
+}
+
+// peerTCPPort 返回对端上报的 TCP 数据面端口（0 = 未上报/未知）。
+func peerTCPPort(id api.NodeID) int {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range peers {
+		if p.ID == id {
+			return p.TCPPort
+		}
+	}
+	return 0
 }
 
 // tryPunch 执行一次打洞：向对方公网映射持续发开洞包（本 socket 的
@@ -665,15 +919,22 @@ func tryPunch(d api.PunchDirective) {
 	}
 	mu.Unlock()
 
-	go transfer.SendOpeners(udpConn, d.Addr, 8*time.Second)
+	if udpConn == nil { // 防御：数据面尚未就绪
+		return
+	}
+	// d.Addr 来自 controller 的 WHOAMI 观测，是对方的**精确公网映射**：
+	// 只打这一个端口（exact=true），不扩散。
+	go transfer.SendOpeners(udpConn, d.Addr, 8*time.Second, true)
 	targets := []string{d.Addr}
 	if d.Private != "" && d.Private != d.Addr {
+		// 内网广播地址的端口只是猜测，此时才允许少量扩散。
+		go transfer.SendOpeners(udpConn, d.Private, 8*time.Second, false)
 		targets = append(targets, d.Private)
 	}
 	for i := 0; i < 10; i++ {
 		for _, tgt := range targets {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			rtt, _, err := transfer.Probe(ctx, tgt, tlsConf)
+			rtt, _, err := transfer.Probe(ctx, tgt, peerTCPPort(d.Peer), tlsConf)
 			cancel()
 			if err == nil {
 				mu.Lock()
@@ -727,11 +988,13 @@ func runJob(g api.TransferGrant) {
 
 	startTime := time.Now()
 	sentBytes := int64(0)
+	usedProto := "" // 本次实际使用的数据面协议，随 jobdone 上报
 	done := func(ok bool, errStr string) {
 		d := time.Since(startTime).Seconds()
 		reportDone(api.DoneRequest{
 			GrantID: g.ID, NodeID: nodeID, OK: ok, Err: errStr,
 			Bytes: sentBytes, Duration: d,
+			Proto: usedProto, // 实际走的协议（OpenerDirect 只会失败时回退）
 		})
 	}
 
@@ -745,8 +1008,14 @@ func runJob(g api.TransferGrant) {
 	}
 	// 取件落盘映射：inbox: 前缀 → 本机 data-dir/inbox/（安全：不能让
 	// 远端指定任意本机路径）
+	// 注意：inbox: 映射只在接收端做（transfer.groupFor）。源端绝不能
+	// 改写 DstPath——grant 是要原样转发给目的端验签的。
 	if strings.HasPrefix(g.DstPath, "inbox:") {
-		g.DstPath = filepath.Join(cfg.DataDir, "inbox", strings.TrimPrefix(g.DstPath, "inbox:"))
+		if _, err := transfer.SafeInboxPath(cfg.DataDir, g.DstPath); err != nil {
+			log.Printf("[trace] 任务 %s 被拒：%v", g.ID, err)
+			done(false, err.Error())
+			return
+		}
 	}
 	log.Printf("[trace] 任务 %s 开始执行：sources=%d mode=%q", g.ID, len(g.Sources), g.Mode)
 	timeout := time.Until(g.ExpiresAt)
@@ -763,6 +1032,7 @@ func runJob(g api.TransferGrant) {
 	// 发全文件。找不到自己的分片则忽略（这份 grant 是发给别的源的）。
 	var startCh, endCh int64 = 0, -1
 	var hopAddr, hopProto, sendPath string
+	var hopTCP int
 	sendPath = g.SrcPath
 	via := ""
 	switch {
@@ -773,13 +1043,14 @@ func runJob(g api.TransferGrant) {
 		}
 		startCh, endCh = g.Sources[mineIdx].Start, g.Sources[mineIdx].End
 		hopAddr, hopProto = g.Sources[mineIdx].Addr, g.Sources[mineIdx].Proto
+		hopTCP = g.Sources[mineIdx].TCPPort
 		sendPath = g.Sources[mineIdx].Path // 各副本本地路径不同
 		via = fmt.Sprintf("（多源分片 [%d,%d)）", startCh, endCh)
 	case g.Mode == "switch":
-		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
+		hopAddr, hopProto, hopTCP = g.Hops[1].Addr, g.Hops[1].Proto, g.Hops[1].TCPPort
 		via = fmt.Sprintf("（经 %s 交换台对接）", g.Hops[1].NodeID)
 	default:
-		hopAddr, hopProto = g.Hops[1].Addr, g.Hops[1].Proto
+		hopAddr, hopProto, hopTCP = g.Hops[1].Addr, g.Hops[1].Proto, g.Hops[1].TCPPort
 		if len(g.Hops) > 2 {
 			ids := make([]string, 0, len(g.Hops)-2)
 			for _, h := range g.Hops[1 : len(g.Hops)-1] {
@@ -798,7 +1069,8 @@ func runJob(g api.TransferGrant) {
 	if g.Mode == "switch" {
 		open = transfer.OpenerSwitch(ctx, g.Hops[1], tlsConf, &g)
 	} else {
-		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto}
+		hop := api.Hop{NodeID: g.Dst, Addr: hopAddr, Proto: hopProto, TCPPort: hopTCP}
+		usedProto = hopProto
 		open = transfer.OpenerDirect(ctx, hop, tlsConf)
 	}
 	sentBytes, err := transfer.SendFileRange(ctx, sendPath, open, tlsConf, &g, startCh, endCh)
@@ -864,7 +1136,7 @@ func runSwitchRecv(g api.TransferGrant) {
 
 // switchRecvShare 接入交换台并按标准 FFJ1 逻辑接收一个连接份额。
 func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
-	stream, closeConn, err := transfer.DialSwitch(ctx, g.Hops[1].Addr, g.Hops[1].Proto, tlsConf, &g)
+	stream, closeConn, err := transfer.DialSwitch(ctx, g.Hops[1].Addr, g.Hops[1].Proto, g.Hops[1].TCPPort, tlsConf, &g)
 	if err != nil {
 		return err
 	}
@@ -886,7 +1158,13 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
 	if err := json.Unmarshal([]byte(line), &gg); err != nil || gg.ID != g.ID {
 		return fmt.Errorf("grant 不符")
 	}
-	transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs)
+	// RecvStream 现在返回 error：之前它返回 void，失败只打一行日志，于是
+	// 本函数无条件 return nil，runSwitchRecv 的失败计数永远为 0，运维看到
+	// 的是"接收完成"——验签失败、块不齐、哈希不符全都报成功。
+	if err := transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs); err != nil {
+		transfer.CloseWrite(stream)
+		return fmt.Errorf("收流失败：%w", err)
+	}
 	// ACK 已写入流：只半关写侧，等对端读走、对端关闭后再退出，
 	// 避免 QUIC 立即关连接丢弃未送达的 ACK
 	transfer.CloseWrite(stream)
@@ -902,11 +1180,13 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) error {
 func probeLoop() {
 	runRound := func() {
 		type target struct {
-			id   api.NodeID
-			addr string
+			id      api.NodeID
+			addr    string
+			tcpPort int
 		}
 		mu.Lock()
 		byID := make(map[api.NodeID]string, len(peers)+len(punched))
+		portOf := make(map[api.NodeID]int, len(peers))
 		for id, addr := range punched {
 			byID[id] = addr // 打洞地址优先（已知可通）
 		}
@@ -915,11 +1195,12 @@ func probeLoop() {
 				if _, ok := byID[p.ID]; !ok {
 					byID[p.ID] = p.Addr
 				}
+				portOf[p.ID] = p.TCPPort
 			}
 		}
 		targets := make([]target, 0, len(byID))
 		for id, addr := range byID {
-			targets = append(targets, target{id, addr})
+			targets = append(targets, target{id, addr, portOf[id]})
 		}
 		mu.Unlock()
 		var (
@@ -928,15 +1209,26 @@ func probeLoop() {
 			found   []api.EdgeReport
 		)
 		for _, tg := range targets {
+			if !allowProbe(tg.id) {
+				continue // 仍在退避期：本轮跳过，不再捶打对端
+			}
 			wg.Add(1)
 			go func(tg target) {
 				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 				defer cancel()
-				rtt, proto, alt, err := transfer.ProbeWithAlt(ctx, tg.addr, tlsConf)
+				rtt, proto, alt, err := transfer.ProbeWithAlt(ctx, tg.addr, tg.tcpPort, tlsConf)
 				if err != nil {
-					log.Printf("探测 %s(%s) 失败：%v", tg.id, tg.addr, err)
+					// 只在状态变化时打日志：之前对端宕机时每 30s 一行，
+					// 一台死节点一天刷 2880 行，既淹没有用信息，也容易
+					// 被 fail2ban 的自定义 jail 当成攻击源。
+					if markProbe(tg.id, false) {
+						log.Printf("探测 %s(%s) 失败（转入退避）：%v", tg.id, tg.addr, err)
+					}
 					return
+				}
+				if markProbe(tg.id, true) {
+					log.Printf("探测 %s 恢复", tg.id)
 				}
 				muEdges.Lock()
 				found = append(found, api.EdgeReport{To: tg.id, RTTms: float64(rtt.Microseconds()) / 1000.0, Proto: proto, Addr: tg.addr, AltProto: alt})
@@ -950,6 +1242,9 @@ func probeLoop() {
 	}
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
+	// 先跑一轮：之前只等 ticker 或"节点表变化"，而节点表本身要等心跳
+	// 回来才更新，于是"刚启动就能传"退化成"起等 30~40 秒"。
+	runRound()
 	for {
 		select {
 		case <-t.C:
