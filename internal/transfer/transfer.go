@@ -488,43 +488,96 @@ func SendTree(ctx context.Context, root string, open StreamOpener, tlsConf *tls.
 			//（省逐文件握手）；TCP/交换台退化为逐文件直拨
 			var op *dirOpener
 			if grant.Mode == "switch" {
-				op = newDirOpener(ctx, api.Hop{}, tlsConf, open) // 交换台：逐文件经台配对
+				op = newDirOpener(ctx, api.Hop{}, tlsConf, open) // 交换台：经台配对
 			} else {
 				op = newDirOpener(ctx, grant.Hops[1], tlsConf, nil) // 直连/中继：池化 QUIC
 			}
 			defer op.closeAll()
+			// 批量打包：本 worker 的全部文件在**同一条流**上依次发段
+			//（清单+数据+哨兵+ACK），省掉逐文件建流/握手——TCP 回退
+			// 与交换台模式收益最大（免逐文件 TLS/配对），WAN 上小文件
+			// 每文件 4 RTT → 2 RTT。流断则重拨续发（HAVE 位图跳块）。
+			var st Stream
+			var stClose func()
+			stAlive := false
+			openTree := func() error {
+				s, c, err := op.openFor()
+				if err != nil {
+					return err
+				}
+				st, stClose, stAlive = s, c, true
+				return nil
+			}
+			closeTree := func() {
+				if stAlive {
+					stClose()
+				}
+				st, stClose, stAlive = nil, nil, false
+			}
+			defer closeTree()
+			if err := openTree(); err != nil {
+				errCh <- fmt.Errorf("建树流失败: %w", err)
+				return
+			}
 			for it := range items {
 				if ctx.Err() != nil {
 					return
 				}
-				f, err := os.Open(it.path)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				mf, err := BuildManifest(grant.ID, it.path, it.rel, tlsConf)
-				if err != nil {
-					f.Close()
-					errCh <- err
-					return
-				}
-				var enc *streamCipher
-				if grant.Enc {
-					if enc, err = cipherFromMaterial(DeriveFileKey(masterKey, it.rel), prefix); err != nil {
+				var delivered bool
+				var lastSize int64
+				for attempt := 0; attempt < 3 && !delivered; attempt++ {
+					f, err := os.Open(it.path)
+					if err != nil {
+						errCh <- err
+						return
+					}
+					mf, err := BuildManifest(grant.ID, it.path, it.rel, tlsConf)
+					if err != nil {
 						f.Close()
 						errCh <- err
 						return
 					}
+					var enc *streamCipher
+					if grant.Enc {
+						if enc, err = cipherFromMaterial(DeriveFileKey(masterKey, it.rel), prefix); err != nil {
+							f.Close()
+							errCh <- err
+							return
+						}
+					}
+					serr := sendFileOnStream(ctx, st, f, grant, mf, enc, 0, -1, 0, 1, lim)
+					f.Close()
+					if serr == nil {
+						delivered = true
+						lastSize = mf.Size
+						break
+					}
+					// 流已坏：重拨整树流重发本文件（接收端 HAVE 跳过已收块）
+					closeTree()
+					op.drop()
+					if aerr := openTree(); aerr != nil {
+						errCh <- fmt.Errorf("%s: %w（重拨失败: %v）", it.rel, serr, aerr)
+						return
+					}
 				}
-				serr := sendShare(ctx, f, op.openFor, grant, mf, enc, 0, -1, 0, 1, lim)
-				f.Close()
-				if serr != nil {
-					op.drop() // 流/连接可能已坏：后续文件重新建连
-					errCh <- fmt.Errorf("%s: %w", it.rel, serr)
+				if !delivered {
+					errCh <- fmt.Errorf("%s: 3 次尝试均失败", it.rel)
 					return
 				}
-				atomic.AddInt64(&bytes, mf.Size)
+				atomic.AddInt64(&bytes, lastSize)
 				atomic.AddInt64(&count, 1)
+			}
+			// 树收尾哨兵：接收端读到 FFEND 即知全树完成（交换台目的端
+			// 据此停止建连）。ACK 尽力读，读不到无妨。
+			if stAlive {
+				if wd, ok := st.(interface{ SetWriteDeadline(time.Time) error }); ok {
+					wd.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				}
+				st.Write([]byte("FFEND\n"))
+				if rd, ok := st.(interface{ SetReadDeadline(time.Time) error }); ok {
+					rd.SetReadDeadline(time.Now().Add(10 * time.Second))
+				}
+				_, _ = io.ReadFull(st, make([]byte, 4))
 			}
 		}(w)
 	}
@@ -540,29 +593,6 @@ func SendTree(ctx context.Context, root string, open StreamOpener, tlsConf *tls.
 		}
 	}
 	return bytes, int(count), nil
-}
-
-// SendEndMarker 目录+交换台模式的收尾哨兵：目的端按"连接数"逐个
-// 接收，它无法从 grant 得知文件总数（Files 由源端树枚举决定）。
-// 树发完后拨一条哨兵流，目的端读到 FFEND 行即知全树完成，停止
-// 继续建连。直连/中继模式不需要（目的端被动接受流）。
-func SendEndMarker(ctx context.Context, open StreamOpener, grant *api.TransferGrant) {
-	stream, closer, err := open()
-	if err != nil {
-		return
-	}
-	defer closer()
-	gj, err := json.Marshal(grant)
-	if err != nil {
-		return
-	}
-	if _, err := fmt.Fprintf(stream, "FFJ1%s\nFFEND\n", gj); err != nil {
-		return
-	}
-	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-		s.SetReadDeadline(time.Now().Add(10 * time.Second))
-	}
-	_, _ = io.ReadFull(stream, make([]byte, 4)) // 期待 ACK（读不到也无妨）
 }
 
 // dirOpener 目录模式的每 worker 连接池：QUIC 下第一条文件流时建连，
@@ -759,14 +789,18 @@ func (b *bandwidth) wait(n int) {
 }
 
 func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, lim *bandwidth) error {
-	tA := time.Now()
 	stream, closeConn, err := open()
 	if err != nil {
 		return fmt.Errorf("建流失败: %w", err)
 	}
 	defer closeConn()
-	tB := time.Now()
+	return sendFileOnStream(ctx, stream, f, grant, mf, enc, startCh, endCh, r, n, lim)
+}
 
+// sendFileOnStream 在**既有流**上发送一个文件段：FFJ1 头（grant+清单）、
+// HAVE 交换、数据帧、完成哨兵、等 ACK。批量打包时同一流上依次发多个
+// 文件段（各段 ACK 独立），最后由调用方写 FFEND 收尾。
+func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api.TransferGrant, mf *Manifest, enc *streamCipher, startCh, endCh int64, r, n int, lim *bandwidth) error {
 	gj, err := json.Marshal(grant)
 	if err != nil {
 		return err
@@ -778,7 +812,6 @@ func sendShareOnce(ctx context.Context, f *os.File, open StreamOpener, grant *ap
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
-	log.Printf("[tl] %s 流%d 建流%v 写头完成", grant.ID, r, tB.Sub(tA))
 	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
 	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
 	have := map[int64]bool{}
@@ -1088,77 +1121,81 @@ func groupKey(grant *api.TransferGrant, mf *Manifest) string {
 	return grant.ID + "\x00" + mf.Path
 }
 
-// RecvStream 按认证清单接收：读 manifest 行并验签，然后进组收块。
-// 这是接收端（直连与交换台路径共用的入口）。
-func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots *x509.CertPool) {
-	line, err := br.ReadString('\n') // manifest 行（grant 行由调用方已读）
-	if err != nil {
-		fmt.Println("manifest 读取失败：", err)
-		return
-	}
-	var mf Manifest
-	if err := json.Unmarshal([]byte(line), &mf); err != nil {
-		fmt.Println("manifest 解析失败：", err)
-		return
-	}
-	if err := mf.Verify(grant, roots); err != nil {
-		fmt.Printf("拒绝传输 %s：%v\n", grant.ID, err)
-		return
-	}
-	var deckey *streamCipher
-	if grant.Enc {
-		var kerr error
-		// 目录模式按清单相对路径派生文件密钥（与发送端 SendTree 对称）
-		if deckey, kerr = cipherForGrant(grant.ID, mf.Path); kerr != nil {
-			fmt.Printf("接收 %s 取密钥失败：%v\n", grant.ID, kerr)
-			return
+// RecvStream 按认证清单接收：循环读 manifest 行并验签、进组收块，
+// 直到对端发 FFEND（批量树的收尾哨兵）或关流（EOF，旧版单文件发送端）。
+// 一条流可依次承载多个文件（批量打包）：目录模式发送端在同一流上
+// 连发多个 清单+数据+哨兵+ACK 段，省掉逐文件建流/握手。
+// 返回 ended=true 表示读到 FFEND（树接收完毕）。
+func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots *x509.CertPool) (ended bool) {
+	for {
+		line, err := br.ReadString('\n') // manifest 行（grant 行由调用方已读）
+		if err == io.EOF {
+			return false // 对端关流：旧版单文件发送端，或树已发完
 		}
-	}
-	g, err := groupFor(grant, &mf, deckey)
-	if err == nil {
+		if err != nil {
+			fmt.Println("manifest 读取失败：", err)
+			return false
+		}
+		if strings.TrimSpace(line) == "FFEND" {
+			stream.Write([]byte("ACK\n")) // 让源端哨兵流尽快收尾（尽力而为）
+			return true
+		}
+		var mf Manifest
+		if err := json.Unmarshal([]byte(line), &mf); err != nil {
+			fmt.Println("manifest 解析失败：", err)
+			return false
+		}
+		if err := mf.Verify(grant, roots); err != nil {
+			fmt.Printf("拒绝传输 %s：%v\n", grant.ID, err)
+			return false
+		}
+		var deckey *streamCipher
+		if grant.Enc {
+			var kerr error
+			// 目录模式按清单相对路径派生文件密钥（与发送端 SendTree 对称）
+			if deckey, kerr = cipherForGrant(grant.ID, mf.Path); kerr != nil {
+				fmt.Printf("接收 %s 取密钥失败：%v\n", grant.ID, kerr)
+				return false
+			}
+		}
+		g, err := groupFor(grant, &mf, deckey)
+		if err == ErrAlreadyDone {
+			// 文件此前已完整落盘（重试流的迟到份额）：回 ACK 后继续
+			// 读下一文件——批量流上不能整流 drain（流上还有后续文件）
+			stream.Write([]byte("ACK\n"))
+			fmt.Printf("迟到流确认：%s %q（文件此前已完整落盘）\n", grant.ID, mf.Path)
+			continue
+		}
+		if err != nil {
+			fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
+			return false
+		}
 		// 断点续传握手：告知发送端已收块位图（HAVE 行），对端跳块；
 		// 旧版发送端不读此行也无碍（多写一行被当数据丢弃的风险——
-		// 发送端在写头后主动读一行，见 sendShareOnce）
+		// 发送端在写头后主动读一行，见 sendFileOnStream）
 		if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
 			w.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		}
 		fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
-	}
-	if err == ErrAlreadyDone {
-		// 先 ACK 让对端收尾，再 drain 到对端关闭——否则对端仍在写数据，
-		// 连接一关就是 broken pipe，重试也全撞墙（多流卡死的根因）
+		if err := g.feed(br, g.deckey); err != nil {
+			fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
+			return false
+		}
+		select {
+		case <-g.finished:
+		case <-time.After(10 * time.Minute):
+			fmt.Printf("接收 %s 超时：未收齐全部块\n", grant.ID)
+			return false
+		}
+		if g.finErr != nil {
+			fmt.Printf("接收 %s 校验失败：%v（文件已丢弃）\n", grant.ID, g.finErr)
+			return false
+		}
 		stream.Write([]byte("ACK\n"))
-		fmt.Printf("迟到流确认：%s（文件此前已完整落盘）\n", grant.ID)
-		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-			s.SetReadDeadline(time.Now().Add(10 * time.Minute))
-		}
-		if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-			s.SetReadDeadline(time.Now().Add(90 * time.Second))
-		}
-		io.Copy(io.Discard, stream)
-		return
+		fmt.Printf("接收完成：%s（src=%s，%d 字节）-> %s\n", grant.ID, grant.Src, mf.Size, g.finalPath)
 	}
-	if err != nil {
-		fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
-		return
-	}
-	if err := g.feed(br, g.deckey); err != nil {
-		fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
-		return
-	}
-	select {
-	case <-g.finished:
-	case <-time.After(10 * time.Minute):
-		fmt.Printf("接收 %s 超时：未收齐全部块\n", grant.ID)
-		return
-	}
-	if g.finErr != nil {
-		fmt.Printf("接收 %s 校验失败：%v（文件已丢弃）\n", grant.ID, g.finErr)
-		return
-	}
-	stream.Write([]byte("ACK\n"))
-	fmt.Printf("接收完成：%s（src=%s，%d 字节）-> %s\n", grant.ID, grant.Src, mf.Size, grant.DstPath)
 }
+
 
 // recvOne 是数据面监听上的接收入口（已读 head 与 grant 行）。
 func recvOne(br *bufio.Reader, stream Stream, grant *api.TransferGrant, tlsConf *tls.Config) {
@@ -1306,19 +1343,25 @@ func (g *recvGroup) loadProgress() {
 
 // saveProgress 位图落盘（断点续传依据）。
 func (g *recvGroup) saveProgress() {
+	// g.got 会被并行流并发写（多份额交错收块），迭代必须持锁——
+	// 否则 runtime fatal: concurrent map iteration and map write，
+	// 进程直接死亡（压测 1GB 多流实锤）。快照后立即放锁再落盘。
+	g.mu.Lock()
 	bits := make([]byte, (g.expected+7)/8)
 	for i := range g.got {
 		if i >= 0 && i/8 < int64(len(bits)) {
 			bits[i/8] |= 1 << (i % 8)
 		}
 	}
+	size, sha, tmpName := g.size, g.wantSHA, g.tmpName
+	g.mu.Unlock()
 	type progress struct {
 		Size    int64  `json:"size"`
 		SHA256  string `json:"sha256"`
 		TmpName string `json:"tmp"`
 		Bits    []byte `json:"bits"`
 	}
-	b, _ := json.Marshal(progress{Size: g.size, SHA256: g.wantSHA, TmpName: g.tmpName, Bits: bits})
+	b, _ := json.Marshal(progress{Size: size, SHA256: sha, TmpName: tmpName, Bits: bits})
 	os.WriteFile(g.partPath(), b, 0o600)
 }
 

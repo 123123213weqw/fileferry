@@ -150,7 +150,7 @@ func main() {
 		fmt.Println("；等待完成…")
 		deadline := time.Now().Add(30 * time.Minute)
 		for time.Now().Before(deadline) {
-			time.Sleep(250 * time.Millisecond) // 快轮询：完成检测延迟不影响吞吐只影响退出时机
+			time.Sleep(150 * time.Millisecond) // 快轮询：完成检测延迟不影响吞吐只影响退出时机
 			jobs, err := cl.Jobs(grant.ID)
 			if err != nil || len(jobs) == 0 {
 				continue

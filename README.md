@@ -169,10 +169,24 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       socket 就绪前启动 → nil panic 崩进程；改为就绪后启动 + 判空兜底）
       ✅ enroll 指数退避重试（controller 未起不再 crash-loop）
       ✅ 空文件死锁修复（0 块文件哨兵即完成，旧版单文件路径同样受累）
-      ✅ 心跳周期默认 2s→1s + ffctl 完成轮询 250ms（grant 投递与
-      完成感知延迟减半以上）✅ 本地 e2e/基准/soak 脚本（scripts/local-e2e.sh、
-      scripts/bench-local.sh）：回环 256MB 单文件 ≈1s、400MB 目录
-      1.0s（rsync 1.9s）、500×16KB 小文件 0.5s
+      ✅ 接收端并发 map 崩溃修复（saveProgress 无锁迭代 got 表，
+      多流并行收块时 runtime fatal 进程死亡——压测 1GB 实锤）
+      ✅ 心跳周期默认 1s→500ms + ffctl 完成轮询 150ms（grant 投递与
+      完成感知延迟持续压缩）
+- [x] 批量文件单流打包：目录模式同一流上依次发多文件段（各段独立
+      清单/ACK），FFEND 哨兵收尾——每文件 4 RTT → 2 RTT；TCP 回退
+      与交换台模式免逐文件 TLS 握手/配对，WAN 小文件吞吐提升一倍
+- [x] 对标基准（scripts/bench-local.sh，macOS 回环；scp 走用户态
+      sshd 对照通道）：256MB 单文件 ff 1.2s / scp 0.4s / cp 0.1s；
+      400MB 目录 ff 0.9s / scp 0.6s / rsync 1.7s（ff 胜 rsync）；
+      500×16KB ff 0.8s / scp 0.2s（差距=协调层固定延迟 ~0.5s，
+      真实舰队场景无此对照意义——scp/rsync 需两两配钥，ff 不需要）
+- [x] 强化压测（scripts/stress-local.sh，镜像真实压测三阶段 + 中断
+      续传）：5×100MB 并发 5/5（聚合 55MB/s）、1GB 102MB/s、
+      20×5MB 风暴 20/20、kill -9 源 agent 后 autoRetry+HAVE 位图
+      1 轮内续传恢复且哈希一致；race 全绿
+      （注：真实舰队压测 scripts/stress-test.sh 因 222.186.10.53 /
+      v100_222 不可达未能复跑，环境恢复后可直接执行）
 - [x] 安全加固（自渗透驱动）：✅ token 核销持久化 ✅ 管理员证书 10 年
       ✅ 认证清单 manifest（源端签名 文件哈希+大小，唯一块计数判定
       完成 + 全文件验哈希——防重放、防恶意中继篡改内容）

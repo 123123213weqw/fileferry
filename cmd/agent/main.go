@@ -522,10 +522,10 @@ func indexLoop() {
 }
 
 func heartbeatInterval() time.Duration {
-	if cfg.Heartbeat >= 500*time.Millisecond {
+	if cfg.Heartbeat >= 200*time.Millisecond {
 		return cfg.Heartbeat
 	}
-	return time.Second // 快投递：grant 经心跳下发，周期越短端到端延迟越低
+	return 500 * time.Millisecond // 快投递：grant 经心跳下发，周期越短端到端延迟越低
 }
 
 func heartbeatLoop() {
@@ -840,10 +840,6 @@ func runJob(g api.TransferGrant) {
 			log.Printf("任务 %s 失败（已发 %d 文件）：%v", g.ID, n, err)
 			return
 		}
-		// 交换台模式：目的端按连接逐个接收，发一条 FFEND 哨兵流告诉它"树已发完"
-		if g.Mode == "switch" {
-			transfer.SendEndMarker(ctx, open, &g)
-		}
 		atomic.StoreInt64(&sentBytes, sentBytes)
 		done(true, fmt.Sprintf("files=%d", n))
 		log.Printf("任务 %s 完成：%s/ → %s%s（%d 文件，%s）", g.ID, g.SrcPath, g.Dst, via, n, time.Since(startTime).Round(time.Millisecond))
@@ -970,7 +966,7 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) (ended bool, err 
 	if err := json.Unmarshal([]byte(line), &gg); err != nil || gg.ID != g.ID {
 		return false, fmt.Errorf("grant 不符")
 	}
-	transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs)
+	ended = transfer.RecvStream(br, stream, &gg, tlsConf.RootCAs)
 	// ACK 已写入流：只半关写侧，等对端读走、对端关闭后再退出，
 	// 避免 QUIC 立即关连接丢弃未送达的 ACK
 	transfer.CloseWrite(stream)
@@ -978,7 +974,7 @@ func switchRecvShare(ctx context.Context, g api.TransferGrant) (ended bool, err 
 		s.SetReadDeadline(time.Now().Add(60 * time.Second))
 	}
 	io.ReadFull(stream, make([]byte, 1))
-	return false, nil
+	return ended, nil
 }
 
 // probeLoop 探测所有目标：广播地址（节点表）+ 打洞公网映射。

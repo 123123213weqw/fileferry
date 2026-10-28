@@ -33,6 +33,7 @@ EOF
 RS_DST=$ROOT/n2/dst/  # openrsync 的 daemon 模式不可用：直接本地→本地
 cleanup() {
   kill ${CTL_PID:-0} ${A1_PID:-0} ${A2_PID:-0} 2>/dev/null || true
+  [ -n "${SSHD_PID:-}" ] && kill $SSHD_PID 2>/dev/null || true
   wait 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -42,6 +43,21 @@ $BIN/ff-agent -config $ROOT/cfg/a2.yaml >$ROOT/a2.log 2>&1 & A2_PID=$!
 sleep 2
 cp $ROOT/ctl/admin.crt $ROOT/ctl/admin.key $ROOT/admin/
 cp $ROOT/ctl/ca/ca.crt $ROOT/admin/ca.crt
+
+# scp 对照：macOS 无 root 起不了系统 sshd，用**用户态 sshd**（2222 端口，
+# 仅回环 + 公钥白名单）。scp 走 ssh 加密，是 scp 的正常形态。
+SSHD_PORT=$((PORT_BASE+7))
+if ssh-keygen -t ed25519 -N "" -f $ROOT/hostkey -q 2>/dev/null; then
+  /usr/sbin/sshd -D -p $SSHD_PORT -h $ROOT/hostkey \
+    -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
+    -o PubkeyAuthentication=yes >$ROOT/sshd.log 2>&1 &
+  SSHD_PID=$!
+  SCP="scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $HOME/.ssh/id_ed25519"
+  echo "scp 对照通道：用户态 sshd 127.0.0.1:$SSHD_PORT"
+else
+  SCP=""
+  echo "（ssh-keygen 不可用，跳过 scp 对照）"
+fi
 
 FFCTL() { $BIN/ffctl -cert-dir $ROOT/admin -controller https://127.0.0.1:$PORT_BASE "$@"; }
 for i in $(seq 1 45); do
@@ -76,6 +92,10 @@ rm -f $ROOT/n2/dst/big.cp
 bench "cp    " cp $ROOT/n1/src/big.bin $ROOT/n2/dst/big.cp
 rm -f $ROOT/n2/dst/big.rsync
 bench "rsync " rsync -a $ROOT/n1/src/big.bin $RS_DST
+if [ -n "$SCP" ]; then
+  rm -f $ROOT/n2/dst/big.scp
+  bench "scp   " $SCP $ROOT/n1/src/big.bin 127.0.0.1:$ROOT/n2/dst/big.scp
+fi
 
 echo "=== 100×4MB = 400MB，目录递归 ==="
 rm -rf ${RS_DST}mff
@@ -84,6 +104,10 @@ rm -rf $ROOT/n2/dst/mcp && mkdir -p $ROOT/n2/dst/mcp
 bench "cp    " cp $ROOT/n1/src/mset/m-*.bin $ROOT/n2/dst/mcp/
 rm -rf $ROOT/n2/dst/mffdir
 bench "ff    " FFCTL send -r node-1:$ROOT/n1/src/mset node-2:$ROOT/n2/dst/mffdir
+if [ -n "$SCP" ]; then
+  rm -rf $ROOT/n2/dst/mset.scp
+  bench "scp   " $SCP -r $ROOT/n1/src/mset 127.0.0.1:$ROOT/n2/dst/mset.scp
+fi
 
 echo "=== 500×16KB ≈ 8MB，目录递归（小文件风暴） ==="
 rm -rf ${RS_DST}smalls
@@ -91,4 +115,8 @@ bench "rsync " rsync -a $ROOT/n1/src/smalls $RS_DST
 mkdir -p $ROOT/n2/dst/scp-check && rm -rf $ROOT/n2/dst/scp-check && bench "cp    " cp -R $ROOT/n1/src/smalls $ROOT/n2/dst/scp-check/
 rm -rf $ROOT/n2/dst/smalls-ff
 bench "ff    " FFCTL send -r node-1:$ROOT/n1/src/smalls node-2:$ROOT/n2/dst/smalls-ff
+if [ -n "$SCP" ]; then
+  rm -rf $ROOT/n2/dst/smalls.scp
+  bench "scp   " $SCP -r $ROOT/n1/src/smalls 127.0.0.1:$ROOT/n2/dst/smalls.scp
+fi
 echo "=== 目录：$ROOT ==="
