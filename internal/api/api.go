@@ -50,6 +50,7 @@ type Heartbeat struct {
 	ActiveXfers   int          `json:"active_xfers"`
 	Edges         []EdgeReport `json:"edges"`
 	TS            time.Time    `json:"ts"`
+	Running  []string `json:"running,omitempty"` // 正在执行的任务 ID（卡死巡检用）
 }
 
 // LoadPct 汇总负载水位，供拓扑调度作边权。

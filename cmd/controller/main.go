@@ -51,6 +51,7 @@ type controller struct {
 
 	mu           sync.Mutex
 	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
+	runningSets  map[api.NodeID]map[string]bool     // 各节点最近心跳上报的执行中任务
 	nextID       int64 // 初始化为 Unix 秒，重启后天然错开、永不重复
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
@@ -129,6 +130,7 @@ func main() {
 		graph:        topology.New(),
 		db:           db,
 		pending:      map[api.NodeID][]api.TransferGrant{},
+		runningSets:  map[api.NodeID]map[string]bool{},
 		nextID:       time.Now().Unix(),
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
@@ -312,7 +314,57 @@ func main() {
 		TLSConfig: tlsCfg,
 	}
 	log.Printf("controller 监听 %s（数据目录 %s，自身证书自动续期已启用）", cfg.Listen, cfg.DataDir)
+	go c.sweepStuckJobs()
 	log.Fatal(srv.ListenAndServeTLS("", ""))
+}
+
+// sweepStuckJobs 卡死任务巡检：状态 'sent'（已投递）但**所有源节点
+// 的最近心跳都不再报告它在执行** → 源 agent 死了且没来得及上报失败
+//（kill -9 / 断电），重签发续传。宽限 60s 区分慢任务（执行中的任务
+// 会持续出现在心跳 running 集里）。autoRetry 自带去重与次数上限。
+func (c *controller) sweepStuckJobs() {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		rows, err := c.db.Query(`SELECT id, grant_json, updated FROM jobs WHERE status='sent'`)
+		if err != nil {
+			continue
+		}
+		type stuck struct {
+			id, gj string
+		}
+		var candidates []stuck
+		now := time.Now().Unix()
+		for rows.Next() {
+			var it stuck
+			var updated int64
+			if err := rows.Scan(&it.id, &it.gj, &updated); err != nil {
+				continue
+			}
+			if now-updated < 60 {
+				continue // 宽限期：刚投递的任务不算卡死
+			}
+			candidates = append(candidates, it)
+		}
+		rows.Close()
+		for _, it := range candidates {
+			var g api.TransferGrant
+			if json.Unmarshal([]byte(it.gj), &g) != nil {
+				continue
+			}
+			alive := false
+			for _, src := range g.AllSources() {
+				if set, ok := c.runningSets[src]; ok && (set[it.id] || set["recv-"+it.id]) {
+					alive = true
+					break
+				}
+			}
+			if !alive {
+				log.Printf("[sweep] 任务 %s 无任何源节点在执行，判定卡死", it.id)
+				c.autoRetry(it.id)
+			}
+		}
+	}
 }
 
 // autoRetry 失败任务自动重签发（同一文件，新 grant ID）：接收端按
@@ -1006,6 +1058,14 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	jobs := c.pending[hb.NodeID]
 	delete(c.pending, hb.NodeID)
+	for _, j := range jobs {
+		c.jobUpdate(j.ID, "sent") // 已投递：卡死巡检的状态依据（带 updated 时间戳）
+	}
+	set := make(map[string]bool, len(hb.Running))
+	for _, id := range hb.Running {
+		set[id] = true
+	}
+	c.runningSets[hb.NodeID] = set
 	c.mu.Unlock()
 	fresh := jobs[:0]
 	for _, j := range jobs {

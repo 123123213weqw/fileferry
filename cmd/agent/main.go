@@ -542,6 +542,14 @@ func heartbeatLoop() {
 			TS:       time.Now(),
 			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
 		}
+		for id := range running { // 正在执行的任务上报：controller 巡检
+			// 卡死任务用（源 agent 被 kill -9 无失败上报时，重启后的
+			// 空 running 集让它被识别并重签发）
+			if strings.HasPrefix(id, "recv-") {
+				id = strings.TrimPrefix(id, "recv-")
+			}
+			hb.Running = append(hb.Running, id)
+		}
 		mu.Unlock()
 		resp, err := hbClient.Heartbeat(hb)
 		if err != nil {
