@@ -29,39 +29,35 @@ func TestRollingSumSlide(t *testing.T) {
 	}
 }
 
-// recEmi 记录型配方发射器，并支持按 basis 应用。
+// recEmi 记录型配方发射器：统一事件序列（COPY 前可有 0..N 个字面量帧），
+// apply 按事件顺序重建——与线上协议语义一致。
 type recEmi struct {
-	lits   [][]byte
-	copies [][2]int64
+	events []ev
+}
+
+type ev struct {
+	lit      []byte
+	off, len int64
+	isCopy   bool
 }
 
 func (r *recEmi) literal(b []byte) error {
 	cp := append([]byte{}, b...)
-	r.lits = append(r.lits, cp)
+	r.events = append(r.events, ev{lit: cp})
 	return nil
 }
 func (r *recEmi) copy(off, length int64) error {
-	r.copies = append(r.copies, [2]int64{off, length})
+	r.events = append(r.events, ev{off: off, len: length, isCopy: true})
 	return nil
 }
 
 func (r *recEmi) apply(basis []byte) []byte {
 	var out []byte
-	ci := 0
-	for _, l := range r.lits {
-		out = append(out, l...)
-		// lits 与 copies 严格交替：每个 literal 后跟一个 copy（若有）
-		if ci < len(r.copies) {
-			c := r.copies[ci]
-			ci++
-			out = append(out, basis[c[0]:c[0]+c[1]]...)
-		}
-	}
-	if ci < len(r.copies) {
-		// 尾部短块匹配：只有 copy 没有前置 literal
-		for ; ci < len(r.copies); ci++ {
-			c := r.copies[ci]
-			out = append(out, basis[c[0]:c[0]+c[1]]...)
+	for _, e := range r.events {
+		if e.isCopy {
+			out = append(out, basis[e.off:e.off+e.len]...)
+		} else {
+			out = append(out, e.lit...)
 		}
 	}
 	return out
@@ -113,13 +109,13 @@ func TestDeltaRecipeReconstruct(t *testing.T) {
 	}
 	// 省传输量断言：COPY 覆盖字节 ≈ 6MB+（原 basis 大段），
 	// 字面量 ≈ 64KB+1KB+1MB+边界 ≈ 1.1MB
-	var copyBytes int64
-	for _, c := range em.copies {
-		copyBytes += c[1]
-	}
-	var litBytes int64
-	for _, l := range em.lits {
-		litBytes += int64(len(l))
+	var copyBytes, litBytes int64
+	for _, e := range em.events {
+		if e.isCopy {
+			copyBytes += e.len
+		} else {
+			litBytes += int64(len(e.lit))
+		}
 	}
 	if copyBytes < 6*1024*1024 {
 		t.Fatalf("COPY 覆盖 %d 字节，未达预期的 ~6MB（增量匹配失效）", copyBytes)

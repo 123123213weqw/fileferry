@@ -23,6 +23,7 @@ import (
 const usage = `用法：
   ffctl -cert-dir <dir> send <src-node>:<path> <dst-node>:<path>
   ffctl -cert-dir <dir> send -r <src-node>:<dir> <dst-node>:<dir>   目录递归（保留权限/修改时间）
+  ffctl -cert-dir <dir> send -delta <src>:<file> <dst>:<file>       增量同步：只传与目的端已有文件的差异
   ffctl -cert-dir <dir> send -limit <MB/s> …                        整条传输限速
   ffctl -cert-dir <dir> status
 
@@ -35,6 +36,7 @@ func main() {
 	jsonOut := false
 	noWait := false
 	recursive := false
+	deltaMode := false
 	limitMB := int64(0)
 	args := os.Args[1:]
 	var rest []string
@@ -60,6 +62,10 @@ func main() {
 		}
 		if args[i] == "-r" {
 			recursive = true
+			continue
+		}
+		if args[i] == "-delta" {
+			deltaMode = true
 			continue
 		}
 		if args[i] == "-limit" && i+1 < len(args) {
@@ -102,6 +108,8 @@ func main() {
 			switch rest[i] {
 			case "-r":
 				recursive = true
+			case "-delta":
+				deltaMode = true
 			case "-limit":
 				if i+1 >= len(rest) {
 					fmt.Fprintln(os.Stderr, "-limit 需要 MB/s 数字")
@@ -130,7 +138,7 @@ func main() {
 		}
 		grant, err := cl.Send(api.TransferRequest{
 			Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath,
-			Dir: recursive, RateLimit: limitMB,
+			Dir: recursive, Delta: deltaMode, RateLimit: limitMB,
 		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "传输请求失败：", err)

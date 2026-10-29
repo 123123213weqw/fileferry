@@ -206,7 +206,7 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 	}
 	idx = int64(binary.BigEndian.Uint32(hdr[4:8]))
 	n := binary.BigEndian.Uint64(hdr[8:16])
-	if n > ChunkSize+64 { // 端到端加密的密文比明文多 AEAD 标签（16B）
+	if n > ChunkSize+4096 { // 密文多 16B AEAD 标签；delta COPY 帧（密文 32B）也在限内
 		return 0, nil, fmt.Errorf("chunk too large: %d", n)
 	}
 	data = make([]byte, n)
@@ -360,6 +360,9 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 	n := grant.Streams
 	if n < 1 {
 		n = 1
+	}
+	if grant.Delta {
+		n = 1 // delta 配方是顺序语义（字面量/COPY 序列），单流承载
 	}
 	// 端到端加密：每 grant 一把密钥（所有流共用），发送前上报一次。
 	// 每流一把会让 controller 的单槽一次性发放互相覆盖（真机踩坑）。
@@ -812,20 +815,49 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 	if _, err := fmt.Fprintf(stream, "FFJ1%s\n%s\n", gj, mj); err != nil {
 		return err
 	}
-	// 断点续传：读接收端的 HAVE 位图（HAVE <base64>）。逐字节读行
-	// 避免缓冲吞掉后续 ACK；3 秒无反馈=旧版/无进度，全发。
+	// 流头握手：接收端回一行——BASE（delta 校验和清单 / "-" 无基准）
+	// 或 HAVE（断点续传位图）。3 秒无反馈=旧版接收端，全发。
 	have := map[int64]bool{}
+	deadline := 3 * time.Second
+	if grant.Delta {
+		deadline = 15 * time.Second // basis 清单可能较大
+	}
+	var line string
+	var lerr error
 	if rd, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-		rd.SetReadDeadline(time.Now().Add(3 * time.Second))
-		line, lerr := readLine(stream)
-		log.Printf("[tl] %s 流%d HAVE读取完成 err=%v", grant.ID, r, lerr)
-		if lerr == nil && strings.HasPrefix(line, "HAVE ") {
-			if bits, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, "HAVE ")); err == nil {
-				for i := 0; i*8 < len(bits); i++ {
-					for b := 0; b < 8; b++ {
-						if bits[i]&(1<<b) != 0 {
-							have[int64(i*8+b)] = true
-						}
+		rd.SetReadDeadline(time.Now().Add(deadline))
+		line, lerr = readLine(stream)
+		log.Printf("[tl] %s 段%d 握手行完成 err=%v head=%.12s", grant.ID, r, lerr, line)
+	}
+	if grant.Delta && lerr == nil && strings.HasPrefix(line, "BASE ") {
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "BASE "))
+		if rest == "-" {
+			log.Printf("[tl] %s 段%d delta 无基准，全量传输", grant.ID, r)
+		} else if sizeStr, b64, cut := strings.Cut(rest, " "); cut {
+			var basisSize int64
+			var sums []blockSum
+			if bsize, perr := strconv.ParseInt(sizeStr, 10, 64); perr == nil {
+				if raw, derr := base64.StdEncoding.DecodeString(b64); derr == nil {
+					sums, _ = parseBasis(raw)
+					basisSize = bsize
+				}
+			}
+			if sums != nil {
+				em := &streamEmitter{stream: stream, enc: enc, lim: lim}
+				if rerr := buildRecipe(ctx, f, mf.Size, newIndex(sums, basisSize), em); rerr != nil {
+					return fmt.Errorf("delta 配方构建失败: %w", rerr)
+				}
+				return finishFile(stream, grant, r) // 配方发完：哨兵+ACK
+			}
+			log.Printf("[tl] %s 段%d delta 清单解析失败，全量传输", grant.ID, r)
+		}
+	}
+	if lerr == nil && strings.HasPrefix(line, "HAVE ") {
+		if bits, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, "HAVE ")); err == nil {
+			for i := 0; i*8 < len(bits); i++ {
+				for b := 0; b < 8; b++ {
+					if bits[i]&(1<<b) != 0 {
+						have[int64(i*8+b)] = true
 					}
 				}
 			}
@@ -858,8 +890,12 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 			return rerr
 		}
 	}
-	// 完成哨兵：零长度帧。接收端收齐全部份额的哨兵才落盘改名并回 ACK；
-	// QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
+	return finishFile(stream, grant, r)
+}
+
+// finishFile 完成哨兵 + ACK 握手：接收端收齐全部份额（或 delta 配方）
+// 才落盘改名并回 ACK；QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
+func finishFile(stream Stream, grant *api.TransferGrant, r int) error {
 	if err := WriteFrame(stream, -1, []byte{}); err != nil {
 		return err
 	}
@@ -874,6 +910,35 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 		return fmt.Errorf("bad ack %q", ack)
 	}
 	return nil
+}
+
+// streamEmitter 把 delta 配方写上流：字面量/COPY 帧（加密时按配方序号
+// 密封，与接收端 feedDelta 的计数器对齐），限速按线上字节数。
+type streamEmitter struct {
+	stream Stream
+	enc    *streamCipher
+	lim    *bandwidth
+	nonce  int64
+}
+
+func (e *streamEmitter) literal(b []byte) error {
+	data := b
+	if e.enc != nil {
+		data = e.enc.seal(e.nonce, data)
+	}
+	e.nonce++
+	e.lim.wait(len(data))
+	return WriteFrame(e.stream, frameDeltaLiteral, data)
+}
+
+func (e *streamEmitter) copy(off, length int64) error {
+	data := encodeCopyToken(off, length)
+	if e.enc != nil {
+		data = e.enc.seal(e.nonce, data)
+	}
+	e.nonce++
+	e.lim.wait(len(data))
+	return WriteFrame(e.stream, frameDeltaCopy, data)
 }
 
 // GrantVerifier 在数据面本地验签 grant（agent 注入 controller 公钥实现）。
@@ -1170,16 +1235,35 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 			fmt.Printf("接收 %s 建组失败：%v\n", grant.ID, err)
 			return false
 		}
-		// 断点续传握手：告知发送端已收块位图（HAVE 行），对端跳块；
-		// 旧版发送端不读此行也无碍（多写一行被当数据丢弃的风险——
-		// 发送端在写头后主动读一行，见 sendFileOnStream）
+		// 流头握手（发送端在写头后主动读一行，见 sendFileOnStream）：
+		//   delta 配方模式 → BASE 行（basis 逐块校验和清单，或 BASE - 无基准）
+		//   常规模式       → HAVE 行（断点续传位图）
 		if w, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			w.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			w.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		}
-		fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
-		if err := g.feed(br, g.deckey); err != nil {
-			fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
-			return false
+		if g.recipe {
+			payload, perr := encodeBasis(g.basisSums)
+			if perr != nil {
+				fmt.Printf("接收 %s 编码 basis 失败：%v\n", grant.ID, perr)
+				g.closeBasis()
+				return false
+			}
+			fmt.Fprintf(stream, "BASE %d %s\n", g.basisSize, base64.StdEncoding.EncodeToString(payload))
+			if err := g.feedDelta(br, g.deckey); err != nil {
+				fmt.Printf("接收 %s（delta）失败：%v\n", grant.ID, err)
+				g.closeBasis()
+				return false
+			}
+		} else {
+			if grant.Delta {
+				fmt.Fprintf(stream, "BASE -\n") // 无基准：发送端立即全量，不等超时
+			} else {
+				fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(g.haveBits()))
+			}
+			if err := g.feed(br, g.deckey); err != nil {
+				fmt.Printf("接收 %s 失败：%v\n", grant.ID, err)
+				return false
+			}
 		}
 		select {
 		case <-g.finished:
@@ -1227,6 +1311,10 @@ type recvGroup struct {
 	mode      uint32 // 权限位保留（0 = 不设置）
 	mtime     int64  // 修改时间保留（0 = 不设置）
 	key       string // recvGroups/completed 的键（groupKey 计算）
+	recipe    bool   // delta 配方模式：完成由哨兵触发，不走块计数/HAVE
+	basis     *os.File // delta 基准文件（目的端已有内容），用毕关闭
+	basisSize int64
+	basisSums []blockSum // BASE 行负载（delta 时发给发送端）
 }
 
 // ErrAlreadyDone 表示该 grant 的文件已完整落盘（迟到的重试流）。
@@ -1276,6 +1364,29 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 		return nil, err
 	}
 	n := (mf.Size + ChunkSize - 1) / ChunkSize // 空文件 = 0 块：哨兵即完成
+	// delta 模式：目的端已有同路径文件则作为基准，回 BASE 校验和清单
+	//（发送端只发差异）；无基准回 BASE -（发送端立即全量，省 3s 等待）。
+	// 基准损坏时弱/强和匹配不上 → 发送端退化为字面量（自愈），最终
+	// 内容仍由整文件 SHA-256 把关。
+	var basis *os.File
+	var basisSize int64
+	var basisSums []blockSum
+	basisErr := error(nil)
+	if grant.Delta {
+		if bf, err := os.Open(finalPath); err == nil {
+			if bst, serr := bf.Stat(); serr == nil && bst.Size() > 0 {
+				bs, serr := BasisSums(bf)
+				if serr != nil {
+					bf.Close()
+					basisErr = serr
+				} else {
+					basis, basisSize, basisSums = bf, bst.Size(), bs
+				}
+			} else {
+				bf.Close()
+			}
+		}
+	}
 	g := &recvGroup{
 		grantID:   grant.ID,
 		key:       key,
@@ -1291,7 +1402,13 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 		mode:      mf.Mode,
 		mtime:     mf.Mtime,
 	}
-	g.loadProgress() // 断点续传：加载同目标文件的历史进度（位图+临时文件）
+	if grant.Delta {
+		g.recipe = basis != nil && basisErr == nil
+		g.basis, g.basisSize = basis, basisSize
+		g.basisSums = basisSums
+	} else {
+		g.loadProgress() // 断点续传：加载同目标文件的历史进度（位图+临时文件）
+	}
 	recvGroups[key] = g
 	return g, nil
 }
@@ -1432,6 +1549,74 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 	}
 }
 
+// closeBasis 关闭并清空 delta 基准句柄（finalize/失败路径都要调）。
+func (g *recvGroup) closeBasis() {
+	if g.basis != nil {
+		g.basis.Close()
+		g.basis = nil
+	}
+}
+
+// feedDelta 按配方重建：-2 字面量帧（顺序追加）、-3 COPY 帧（从 basis
+// 区间复制）、哨兵（len==0）→ finalize。加密时字面量按配方序号解密
+//（发送端同序计数器），COPY 内容不出网无需解密。重建结果由 finalize
+// 的整文件 SHA-256 对清单把关——任何错配/损坏/篡改都在这里被拒绝。
+func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
+	off := int64(0) // 重建写出偏移
+	nonce := int64(0)
+	for {
+		fri, data, err := ReadFrame(br)
+		if err != nil {
+			if err == io.EOF {
+				return fmt.Errorf("delta 流意外 EOF（哨兵未到）")
+			}
+			return err
+		}
+		if len(data) == 0 { // 完成哨兵
+			g.closeBasis()
+			g.forceDone()
+			return nil
+		}
+		// 帧头 idx 是 uint32 线格式：负值 token 读回来是 2^32+idx，
+		// 统一转回 int64 再匹配（4294967294→-2 字面量、…293→-3 COPY）
+		if fri > 0x7fffffff {
+			fri -= 1 << 32
+		}
+		switch fri {
+		case frameDeltaLiteral:
+			if deckey != nil {
+				if data, err = deckey.open(nonce, data); err != nil {
+					return fmt.Errorf("delta 字面量解密失败: %w", err)
+				}
+			}
+			if _, err := g.tmp.WriteAt(data, off); err != nil {
+				return err
+			}
+			off += int64(len(data))
+		case frameDeltaCopy:
+			if deckey != nil {
+				if data, err = deckey.open(nonce, data); err != nil {
+					return fmt.Errorf("delta COPY 解密失败: %w", err)
+				}
+			}
+			boff, blen, terr := decodeCopyToken(data)
+			if terr != nil {
+				return terr
+			}
+			if boff < 0 || blen < 0 || boff+blen > g.basisSize {
+				return fmt.Errorf("delta COPY 越界: off=%d len=%d basis=%d", boff, blen, g.basisSize)
+			}
+			if err := copyRangeAt(g.tmp, off, g.basis, boff, blen); err != nil {
+				return fmt.Errorf("delta COPY 复制失败: %w", err)
+			}
+			off += blen
+		default:
+			return fmt.Errorf("delta 流未知帧 idx=%d", fri)
+		}
+		nonce++
+	}
+}
+
 // checkDone 哨兵/EOF 时刻的完成复核：空文件（0 块）只等哨兵；
 // 多份额下最后一份的哨兵也可能先于 finalize 到达。
 func (g *recvGroup) checkDone() {
@@ -1444,6 +1629,38 @@ func (g *recvGroup) checkDone() {
 	if complete {
 		g.finalize()
 	}
+}
+
+// copyRangeAt 分块复制 basis 区间到重建文件（限内存，256KB 步长）。
+func copyRangeAt(dst *os.File, dstOff int64, src *os.File, srcOff, length int64) error {
+	buf := make([]byte, 256<<10)
+	var done int64
+	for done < length {
+		n := int64(len(buf))
+		if length-done < n {
+			n = length - done
+		}
+		if _, err := src.ReadAt(buf[:n], srcOff+done); err != nil {
+			return err
+		}
+		if _, err := dst.WriteAt(buf[:n], dstOff+done); err != nil {
+			return err
+		}
+		done += n
+	}
+	return nil
+}
+
+// forceDone delta 配方模式：哨兵即完成（无块计数语义）。
+func (g *recvGroup) forceDone() {
+	g.mu.Lock()
+	if g.done {
+		g.mu.Unlock()
+		return
+	}
+	g.done = true
+	g.mu.Unlock()
+	g.finalize()
 }
 
 // finalize 收尾：全文件 SHA-256 对清单核验，通过才原子改名。

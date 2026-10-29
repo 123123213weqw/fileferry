@@ -225,6 +225,129 @@ func TestBandwidth(t *testing.T) {
 	}
 }
 
+// TestDeltaTransfer 增量同步端到端：目的端已有 basis（源文件的旧版），
+// grant.Delta 让发送端只发差异配方；重建结果逐字节等于源文件。
+// 回归防：BASE 行握手、配方帧、哨兵后 finalize 的整链路。
+func TestDeltaTransfer(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pub
+
+	basis := make([]byte, 5*1024*1024)
+	rand.Read(basis)
+	edit := make([]byte, 64*1024)
+	rand.Read(edit)
+	tail := make([]byte, 1024*1024)
+	rand.Read(tail)
+	var src []byte
+	src = append(src, basis[:2*1024*1024]...)
+	src = append(src, edit...)
+	src = append(src, basis[2*1024*1024+64*1024:4*1024*1024]...)
+	src = append(src, tail...)
+
+	for _, enc := range []bool{false, true} {
+		name := "plain"
+		if enc {
+			name = "enc"
+		}
+		t.Run(name, func(t *testing.T) {
+			if enc {
+				var keypass struct {
+					mu sync.Mutex
+					m  map[string][]byte
+				}
+				keypass.m = map[string][]byte{}
+				SetKeyDeliverer(func(grantID string, material []byte) error {
+					keypass.mu.Lock()
+					defer keypass.mu.Unlock()
+					keypass.m[grantID] = material
+					return nil
+				})
+				SetKeyFetcher(func(grantID string) ([]byte, error) {
+					keypass.mu.Lock()
+					defer keypass.mu.Unlock()
+					if mat, ok := keypass.m[grantID]; ok {
+						return mat, nil
+					}
+					return nil, fmt.Errorf("密钥不存在")
+				})
+				defer func() { SetKeyDeliverer(nil); SetKeyFetcher(nil) }()
+			}
+			dstQ, stopDst := startNode(t, "dst", root, func(g *api.TransferGrant) bool { return g.Verify(pub) })
+			defer stopDst()
+
+			dir := t.TempDir()
+			dstPath := filepath.Join(dir, "out", "data.bin")
+			os.MkdirAll(filepath.Dir(dstPath), 0o755)
+			os.WriteFile(dstPath, basis, 0o600) // 目的端已有旧版
+			srcPath := filepath.Join(dir, "src.bin")
+			os.WriteFile(srcPath, src, 0o600)
+
+			grant := &api.TransferGrant{
+				ID: fmt.Sprintf("xfer-delta-%s-%d", name, time.Now().UnixNano()),
+				Src: "src", Dst: "dst", Streams: 4, Delta: true, Enc: enc,
+				Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+				SrcPath: srcPath, DstPath: dstPath,
+			}
+			grant.Sign(priv)
+			srcTLS := clientTLSFor(t, root, "src")
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			if _, err := SendFileRange(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], srcTLS), srcTLS, grant, 0, -1); err != nil {
+				t.Fatalf("delta 传输失败：%v", err)
+			}
+			got := waitForFile(t, dstPath)
+			if !bytes.Equal(got, src) {
+				t.Fatalf("delta 重建不一致: got %d bytes, want %d", len(got), len(src))
+			}
+		})
+	}
+}
+
+// TestDeltaNoBasis 目的端无已有文件：BASE - 即时全量回退，内容正确。
+func TestDeltaNoBasis(t *testing.T) {
+	root, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pub
+	dstQ, stopDst := startNode(t, "dst", root, func(g *api.TransferGrant) bool { return g.Verify(pub) })
+	defer stopDst()
+	dir := t.TempDir()
+	src := make([]byte, 300*1024)
+	rand.Read(src)
+	srcPath := filepath.Join(dir, "src.bin")
+	dstPath := filepath.Join(dir, "out", "data.bin")
+	os.WriteFile(srcPath, src, 0o600)
+	grant := &api.TransferGrant{
+		ID: fmt.Sprintf("xfer-dnb-%d", time.Now().UnixNano()),
+		Src: "src", Dst: "dst", Delta: true,
+		Hops:    []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+		SrcPath: srcPath, DstPath: dstPath,
+	}
+	grant.Sign(priv)
+	srcTLS := clientTLSFor(t, root, "src")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := SendFileRange(ctx, srcPath, OpenerDirect(ctx, grant.Hops[1], srcTLS), srcTLS, grant, 0, -1); err != nil {
+		t.Fatalf("无基准 delta 传输失败：%v", err)
+	}
+	got := waitForFile(t, dstPath)
+	if !bytes.Equal(got, src) {
+		t.Fatalf("全量回退内容不一致")
+	}
+}
+
 // TestDirRejectPathEscape 恶意清单伪造 ".." 相对路径必须被拒绝（验签+路径校验双闸）。
 func TestDirRejectPathEscape(t *testing.T) {
 	root, err := ca.LoadOrCreate(t.TempDir())

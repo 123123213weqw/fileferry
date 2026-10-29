@@ -115,6 +115,7 @@ type TransferRequest struct {
 	Dst       NodeID `json:"dst"`
 	DstPath   string `json:"dst_path"`
 	Dir       bool   `json:"dir,omitempty"`  // 目录递归：SrcPath 整树复制到 DstPath 下
+	Delta     bool   `json:"delta,omitempty"` // 增量同步：对目的端已有近似文件只传差异（rsync 式）
 	RateLimit int64  `json:"rate_limit_bps"` // 0 = 不限速
 }
 
@@ -158,6 +159,7 @@ type TransferGrant struct {
 	Enc        bool      `json:"enc,omitempty"`    // 端到端加密（密钥经 controller 专递，不进 grant）
 	Mix        bool      `json:"mix,omitempty"`    // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
 	IsDir      bool      `json:"is_dir,omitempty"` // 目录递归模式：SrcPath 整树 → DstPath 根
+	Delta      bool      `json:"delta,omitempty"` // 增量同步：目的端已有近似文件时只传差异块
 	Files      int       `json:"files,omitempty"`  // 目录模式文件数（交换台模式目的端按它知道收多少）
 	Sig        string    `json:"sig"` // ed25519，覆盖以上所有字段
 }

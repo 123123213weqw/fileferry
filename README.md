@@ -132,6 +132,9 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 # 整个目录递归（保留权限/修改时间），整条传输限速 20MB/s
 ./bin/ffctl -cert-dir /tmp/ff1 -controller https://127.0.0.1:8443 \
     send -r -limit 20 node-1:/tmp/dataset node-2:/data/
+# 增量同步：目的端已有近似文件时只传差异（rsync 式 delta）
+./bin/ffctl -cert-dir /tmp/ff1 -controller https://127.0.0.1:8443 \
+    send -delta node-1:/tmp/app-v2.tar node-2:/data/app.tar
 ```
 
 ## 里程碑
@@ -152,6 +155,12 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 - [x] M2.7 目录递归：send -r 整树复制，相对路径入清单签名，权限/
       mtime 保留，QUIC 连接池化，加密模式每文件派生密钥（防跨文件
       nonce 重用），交换台模式 FFEND 哨兵收尾
+- [x] M2.8 增量同步（rsync 式 delta transfer）：`ffctl send -delta`
+      对目的端已有近似文件只传差异——接收端把已有文件逐块 (adler32
+      滚动和, SHA-256 强和) 清单经 BASE 行回给发送端，发送端滚动窗口
+      任意偏移匹配，只发字面量/COPY 指令；重建结果仍过整文件 SHA-256
+      （delta 不引入新信任假设：基准损坏自动退化为全量自愈）。5MB
+      文件实测仅传 ~1.1MB 字面量；加密模式配方序号作 nonce 计数器
 - [ ] M3 复杂网络（核心已落地）：✅ TCP 回退（探测 QUIC 失败自动
       降级，端口约定 +1） ✅ 中继链数据面（grant 逐跳路径 + 验签 +
       双向管道 + 防开放代理） ⬜ 断链换路续传
