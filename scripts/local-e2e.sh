@@ -111,8 +111,13 @@ for f in top.txt mid.bin sub/deep/nest.bin; do
   [ "$S1" = "$S2" ] || { echo "目录冒烟哈希不一致：$f"; DIR_OK=0; }
 done
 [ "$DIR_OK" = 1 ] && {
-  P1=$(stat -f "%Lp" $ROOT/node1/tree/mid.bin); P2=$(stat -f "%Lp" $ROOT/node2/tree-copy/mid.bin)
-  M1=$(stat -f "%Sm" -t "%Y%m%d%H%M" $ROOT/node1/tree/top.txt); M2=$(stat -f "%Sm" -t "%Y%m%d%H%M" $ROOT/node2/tree-copy/top.txt)
+  if uname -s | grep -q Darwin; then
+    P1=$(stat -f "%Lp" $ROOT/node1/tree/mid.bin); P2=$(stat -f "%Lp" $ROOT/node2/tree-copy/mid.bin)
+    M1=$(stat -f "%m" $ROOT/node1/tree/top.txt); M2=$(stat -f "%m" $ROOT/node2/tree-copy/top.txt)
+  else
+    P1=$(stat -c "%a" $ROOT/node1/tree/mid.bin); P2=$(stat -c "%a" $ROOT/node2/tree-copy/mid.bin)
+    M1=$(stat -c "%Y" $ROOT/node1/tree/top.txt); M2=$(stat -c "%Y" $ROOT/node2/tree-copy/top.txt)
+  fi
   [ "$P1" = "$P2" ] && echo "权限保留 OK（$P2）" || echo "权限不一致：$P1 vs $P2"
   [ "$M1" = "$M2" ] && echo "mtime 保留 OK（$M2）" || echo "mtime 不一致：$M1 vs $M2"
   echo "目录递归冒烟 OK"
