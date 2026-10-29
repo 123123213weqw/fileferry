@@ -44,15 +44,19 @@ sleep 2
 cp $ROOT/ctl/admin.crt $ROOT/ctl/admin.key $ROOT/admin/
 cp $ROOT/ctl/ca/ca.crt $ROOT/admin/ca.crt
 
-# scp 对照：macOS 无 root 起不了系统 sshd，用**用户态 sshd**（2222 端口，
-# 仅回环 + 公钥白名单）。scp 走 ssh 加密，是 scp 的正常形态。
+# scp 对照：macOS 无 root 起不了系统 sshd，用**用户态 sshd**（高位端口，
+# 仅回环）。密钥完全自包含：临时 hostkey + 临时客户端密钥 +
+# AuthorizedKeysFile 指向本目录（不动用户的 authorized_keys）。
 SSHD_PORT=$((PORT_BASE+7))
-if ssh-keygen -t ed25519 -N "" -f $ROOT/hostkey -q 2>/dev/null; then
+if ssh-keygen -t ed25519 -N "" -f $ROOT/hostkey -q 2>/dev/null && \
+   ssh-keygen -t ed25519 -N "" -f $ROOT/benchkey -q 2>/dev/null; then
+  cp $ROOT/benchkey.pub $ROOT/ak
   /usr/sbin/sshd -D -p $SSHD_PORT -h $ROOT/hostkey \
     -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
-    -o PubkeyAuthentication=yes >$ROOT/sshd.log 2>&1 &
+    -o PubkeyAuthentication=yes \
+    -o AuthorizedKeysFile=$ROOT/ak >$ROOT/sshd.log 2>&1 &
   SSHD_PID=$!
-  SCP="scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $HOME/.ssh/id_ed25519"
+  SCP="scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $ROOT/benchkey"
   echo "scp 对照通道：用户态 sshd 127.0.0.1:$SSHD_PORT"
 else
   SCP=""
