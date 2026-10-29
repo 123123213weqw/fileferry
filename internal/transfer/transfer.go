@@ -833,23 +833,45 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 		rest := strings.TrimSpace(strings.TrimPrefix(line, "BASE "))
 		if rest == "-" {
 			log.Printf("[tl] %s 段%d delta 无基准，全量传输", grant.ID, r)
-		} else if sizeStr, b64, cut := strings.Cut(rest, " "); cut {
-			var basisSize int64
-			var sums []blockSum
-			if bsize, perr := strconv.ParseInt(sizeStr, 10, 64); perr == nil {
-				if raw, derr := base64.StdEncoding.DecodeString(b64); derr == nil {
-					sums, _ = parseBasis(raw)
-					basisSize = bsize
+		} else {
+			// 分块清单：BASE <size> + 若干 BASEC <b64> + BASEEND
+			basisSize, perr1 := strconv.ParseInt(rest, 10, 64)
+			var raw []byte
+			if perr1 == nil {
+				var parts []byte
+				for {
+					pl, plerr := readLine(stream)
+					if plerr != nil {
+						break
+					}
+					pl = strings.TrimSpace(pl)
+					if pl == "BASEEND" {
+						break
+					}
+					if b64, ok := strings.CutPrefix(pl, "BASEC "); ok {
+						if b, derr := base64.StdEncoding.DecodeString(b64); derr == nil {
+							parts = append(parts, b...)
+						}
+					}
 				}
+				raw = parts
 			}
-			if sums != nil {
+			sums, sumerr := parseBasis(raw)
+			if perr1 != nil || sumerr != nil || len(sums) == 0 {
+				// 接收端已在配方模式（回了 BASE）：绝不能错位回块路径——
+				// 退化为**纯字面量配方**（协议兼容，等价全量，仍走 delta 帧语义）
+				log.Printf("[tl] %s 段%d delta 清单解析失败，字面量配方全量", grant.ID, r)
 				em := &streamEmitter{stream: stream, enc: enc, lim: lim}
-				if rerr := buildRecipe(ctx, f, mf.Size, newIndex(sums, basisSize), em); rerr != nil {
-					return fmt.Errorf("delta 配方构建失败: %w", rerr)
+				if ferr := buildRecipe(ctx, f, mf.Size, newIndex(nil, 0), em); ferr != nil {
+					return fmt.Errorf("delta 字面量配方失败: %w", ferr)
 				}
-				return finishFile(stream, grant, r) // 配方发完：哨兵+ACK
+				return finishFile(stream, grant, r)
 			}
-			log.Printf("[tl] %s 段%d delta 清单解析失败，全量传输", grant.ID, r)
+			em := &streamEmitter{stream: stream, enc: enc, lim: lim}
+			if rerr := buildRecipe(ctx, f, mf.Size, newIndex(sums, basisSize), em); rerr != nil {
+				return fmt.Errorf("delta 配方构建失败: %w", rerr)
+			}
+			return finishFile(stream, grant, r) // 配方发完：哨兵+ACK
 		}
 	}
 	if lerr == nil && strings.HasPrefix(line, "HAVE ") {
@@ -1225,9 +1247,28 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		}
 		g, err := groupFor(grant, &mf, deckey)
 		if err == ErrAlreadyDone {
-			// 文件此前已完整落盘（重试流的迟到份额）：回 ACK 后继续
-			// 读下一文件——批量流上不能整流 drain（流上还有后续文件）
-			stream.Write([]byte("ACK\n"))
+			// 文件此前已完整落盘（重试流的迟到份额）。握手必须与发送端
+			// 的期待对齐，否则双方各自错位（历史"任务报失败"收尾问题）：
+			//   delta：发送端等 BASE 行 → 回 "BASE -"，排空其全量块到
+			//          哨兵再 ACK，批量流上的后续文件不受影响
+			//   常规：发送端等 HAVE 行但拿到 ACK 即全发 → 排空到 EOF
+			if grant.Delta {
+				stream.Write([]byte("BASE -\n"))
+				for {
+					_, data, derr := ReadFrame(br)
+					if derr != nil || len(data) == 0 {
+						break
+					}
+				}
+				stream.Write([]byte("ACK\n"))
+			} else {
+				stream.Write([]byte("ACK\n"))
+				if s2, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+					s2.SetReadDeadline(time.Now().Add(90 * time.Second))
+				}
+				io.Copy(io.Discard, br)
+				return false
+			}
 			fmt.Printf("迟到流确认：%s %q（文件此前已完整落盘）\n", grant.ID, mf.Path)
 			continue
 		}
@@ -1248,7 +1289,20 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 				g.closeBasis()
 				return false
 			}
-			fmt.Fprintf(stream, "BASE %d %s\n", g.basisSize, base64.StdEncoding.EncodeToString(payload))
+			// 分块行协议：readLine 有 8KB 上限，大 basis 的清单必须拆行
+			//（100GB basis ≈ 88MB 清单，单行不可行）。BASE 行给基准大小，
+			// BASEC 行承载 base64 分片，BASEEND 收口。
+			fmt.Fprintf(stream, "BASE %d\n", g.basisSize)
+			const chunk = 4 * 1024 // base64 后 5461 字符，留足 readLine 8KB 上限余量
+			for len(payload) > 0 {
+				n := len(payload)
+				if n > chunk {
+					n = chunk
+				}
+				fmt.Fprintf(stream, "BASEC %s\n", base64.StdEncoding.EncodeToString(payload[:n]))
+				payload = payload[n:]
+			}
+			fmt.Fprintf(stream, "BASEEND\n")
 			if err := g.feedDelta(br, g.deckey); err != nil {
 				fmt.Printf("接收 %s（delta）失败：%v\n", grant.ID, err)
 				g.closeBasis()

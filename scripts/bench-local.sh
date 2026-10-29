@@ -109,6 +109,31 @@ if [ -n "$SCP" ]; then
   bench "scp   " $SCP -r $ROOT/n1/src/mset 127.0.0.1:$ROOT/n2/dst/mset.scp
 fi
 
+echo "=== 增量同步 256MB 改 1MB（delta transfer 对照） ==="
+# 目的端已有 big.bin（旧版），源端 big2.bin = big.bin 改中间 1MB：
+# rsync 天然走增量；ff 需 -delta 显式开启；scp 永远全量
+dd if=/dev/urandom of=$ROOT/n1/src/big-edit.bin bs=1m count=1 2>/dev/null
+python3 - "$ROOT/n1/src/big.bin" "$ROOT/n1/src/big2.bin" "$ROOT/n1/src/big-edit.bin" <<'EOF'
+import sys
+old, new, editp = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(old, 'rb') as f:
+    data = f.read()
+mid = len(data) // 2
+with open(editp, 'rb') as f:
+    e = f.read()
+with open(new, 'wb') as f:
+    f.write(data[:mid] + e + data[mid + len(e):])
+EOF
+rm -f $ROOT/n2/dst/big2.bin && cp $ROOT/n1/src/big.bin $ROOT/n2/dst/big2.bin # 目的端旧版
+bench "ffΔ   " FFCTL send -delta node-1:$ROOT/n1/src/big2.bin node-2:$ROOT/n2/dst/big2.bin
+cmp -s $ROOT/n1/src/big2.bin $ROOT/n2/dst/big2.bin && echo "  ffΔ 内容一致" || echo "  ffΔ 内容不一致!!"
+cp $ROOT/n1/src/big.bin $ROOT/n2/dst/big2.rsync
+bench "rsyncΔ" rsync -a $ROOT/n1/src/big2.bin $RS_DST.big2.rsync
+if [ -n "$SCP" ]; then
+  cp $ROOT/n1/src/big.bin $ROOT/n2/dst/big2.scp
+  bench "scp   " $SCP $ROOT/n1/src/big2.bin 127.0.0.1:$ROOT/n2/dst/big2.scp
+fi
+
 echo "=== 500×16KB ≈ 8MB，目录递归（小文件风暴） ==="
 rm -rf ${RS_DST}smalls
 bench "rsync " rsync -a $ROOT/n1/src/smalls $RS_DST
