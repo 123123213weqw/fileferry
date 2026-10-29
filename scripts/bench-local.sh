@@ -65,7 +65,7 @@ for i in $(seq 1 45); do
 done
 
 # 测试数据：256MB 大文件 + 100×4MB 中文件 + 500×16KB 小文件（随机内容）
-dd if=/dev/urandom of=$ROOT/n1/src/big.bin bs=1m count=256 2>/dev/null
+dd if=/dev/urandom of=$ROOT/n1/src/big.bin bs=1M count=256 2>/dev/null
 mkdir -p $ROOT/n1/src/mset
 for i in $(seq 1 100); do dd if=/dev/urandom of=$ROOT/n1/src/mset/m-$i.bin bs=1k count=4096 2>/dev/null; done
 mkdir -p $ROOT/n1/src/smalls
@@ -112,7 +112,7 @@ fi
 echo "=== 增量同步 256MB 改 1MB（delta transfer 对照） ==="
 # 目的端已有 big.bin（旧版），源端 big2.bin = big.bin 改中间 1MB：
 # rsync 天然走增量；ff 需 -delta 显式开启；scp 永远全量
-dd if=/dev/urandom of=$ROOT/n1/src/big-edit.bin bs=1m count=1 2>/dev/null
+dd if=/dev/urandom of=$ROOT/n1/src/big-edit.bin bs=1M count=1 2>/dev/null
 python3 - "$ROOT/n1/src/big.bin" "$ROOT/n1/src/big2.bin" "$ROOT/n1/src/big-edit.bin" <<'EOF'
 import sys
 old, new, editp = sys.argv[1], sys.argv[2], sys.argv[3]

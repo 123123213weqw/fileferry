@@ -51,13 +51,13 @@ ID2=$(openssl x509 -in $ROOT/n2/ff/node.crt -noout -subject | sed -n 's/.*CN *= 
 [ -n "$ID1" ] && [ -n "$ID2" ] || { echo "节点 ID 解析失败"; exit 1; }
 
 # 等边 + 探测期间同步准备数据集（urandom 慢，后台并行）
-dd if=/dev/urandom of=$ROOT/n1/share/rep100.bin bs=1m count=100 2>/dev/null &
+dd if=/dev/urandom of=$ROOT/n1/share/rep100.bin bs=1M count=100 2>/dev/null &
 DD1=$!
 for i in $(seq 1 45); do
   FFCTL status 2>/dev/null | grep -q "$ID1 .*出边=\[$ID2" && break; sleep 2
 done
 wait $DD1
-for i in $(seq 1 20); do dd if=/dev/urandom of=$ROOT/n1/share/s-$i.bin bs=1m count=5 2>/dev/null; done
+for i in $(seq 1 20); do dd if=/dev/urandom of=$ROOT/n1/share/s-$i.bin bs=1M count=5 2>/dev/null; done
 T0=$(date +%s)
 
 echo "=== 阶段1：5 并发 × 100MB ==="
@@ -83,7 +83,7 @@ echo "阶段1: ${P1_OK}/5 成功, 耗时 $((T1-T0))s, 聚合 $(python3 -c "print
 
 echo "=== 阶段2：1GB 大文件 ==="
 T2=$(date +%s)
-dd if=/dev/urandom of=$ROOT/n1/share/big1g.bin bs=1m count=1024 2>/dev/null
+dd if=/dev/urandom of=$ROOT/n1/share/big1g.bin bs=1M count=1024 2>/dev/null
 FFCTL send $ID1:$ROOT/n1/share/big1g.bin $ID2:$ROOT/n2/ff/recv/big1g.bin > /dev/null
 S1=$(shasum -a 256 $ROOT/n1/share/big1g.bin | cut -d' ' -f1)
 S2=$(shasum -a 256 $ROOT/n2/ff/recv/big1g.bin | cut -d' ' -f1)
@@ -116,7 +116,7 @@ T5=$(date +%s)
 echo "阶段3: ${P3_OK}/20 成功, 耗时 $((T5-T4))s"
 
 echo "=== 阶段4：中断续传（传输中杀源 agent）==="
-dd if=/dev/urandom of=$ROOT/n1/share/kill200.bin bs=1m count=200 2>/dev/null
+dd if=/dev/urandom of=$ROOT/n1/share/kill200.bin bs=1M count=200 2>/dev/null
 FFCTL -nowait send $ID1:$ROOT/n1/share/kill200.bin $ID2:$ROOT/n2/ff/recv/kill200.bin > /dev/null
 sleep 1.2 # 让传输启动
 kill -9 $A1_PID; A1_PID=""

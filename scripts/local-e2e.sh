@@ -85,7 +85,7 @@ done
 [ -n "$edge" ] && echo "探测边已建立" || echo "警告：45s 内未见探测边（继续尝试 send）"
 
 # 冒烟：16MB 文件 node-1 -> node-2（边传播存在秒级窗口，422 则退避重试）
-dd if=/dev/urandom of=$ROOT/node1/payload.bin bs=1m count=16 2>/dev/null
+dd if=/dev/urandom of=$ROOT/node1/payload.bin bs=1M count=16 2>/dev/null
 send_ok=""
 for i in $(seq 1 12); do
   if FFCTL send $ID1:$ROOT/node1/payload.bin $ID2:$ROOT/node2/recv.bin; then send_ok=1; break; fi
@@ -99,8 +99,8 @@ S2=$(shasum -a 256 $ROOT/node2/recv.bin | cut -d' ' -f1)
 # 目录递归冒烟：嵌套子目录 + 不同权限/mtime，逐文件哈希与属性校验
 mkdir -p $ROOT/node1/tree/sub/deep
 echo "top content" > $ROOT/node1/tree/top.txt
-dd if=/dev/urandom of=$ROOT/node1/tree/mid.bin bs=1m count=3 2>/dev/null
-dd if=/dev/urandom of=$ROOT/node1/tree/sub/deep/nest.bin bs=64k count=5 2>/dev/null
+dd if=/dev/urandom of=$ROOT/node1/tree/mid.bin bs=1M count=3 2>/dev/null
+dd if=/dev/urandom of=$ROOT/node1/tree/sub/deep/nest.bin bs=64K count=5 2>/dev/null
 chmod 600 $ROOT/node1/tree/mid.bin
 touch -t 202601010304 $ROOT/node1/tree/top.txt
 FFCTL send -r $ID1:$ROOT/node1/tree $ID2:$ROOT/node2/tree-copy
