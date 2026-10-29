@@ -5,6 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=$PWD/bin
+SCALE=${SIZE_SCALE:-1} # 数据集缩放：共享/波动机器上可调小求速（如 0.25）
 ROOT=$(mktemp -d /tmp/fileferry-bench.XXXXXX)
 PORT_BASE=${PORT_BASE:-18800}
 
@@ -69,11 +70,14 @@ for i in $(seq 1 45); do
 done
 
 # 测试数据：256MB 大文件 + 100×4MB 中文件 + 500×16KB 小文件（随机内容）
-dd if=/dev/urandom of=$ROOT/n1/src/big.bin bs=1M count=256 2>/dev/null
+BIG_N=$(python3 -c "print(max(1,int(256*$SCALE)))")
+dd if=/dev/urandom of=$ROOT/n1/src/big.bin bs=1M count=$BIG_N 2>/dev/null
 mkdir -p $ROOT/n1/src/mset
-for i in $(seq 1 100); do dd if=/dev/urandom of=$ROOT/n1/src/mset/m-$i.bin bs=1k count=4096 2>/dev/null; done
+M_N=$(python3 -c "print(max(1,int(100*$SCALE)))")
+for i in $(seq 1 $M_N); do dd if=/dev/urandom of=$ROOT/n1/src/mset/m-$i.bin bs=1K count=4096 2>/dev/null; done
 mkdir -p $ROOT/n1/src/smalls
-for i in $(seq 1 500); do dd if=/dev/urandom of=$ROOT/n1/src/smalls/s-$i.bin bs=1k count=16 2>/dev/null; done
+S_N=$(python3 -c "print(max(1,int(500*$SCALE)))")
+for i in $(seq 1 $S_N); do dd if=/dev/urandom of=$ROOT/n1/src/smalls/s-$i.bin bs=1K count=16 2>/dev/null; done
 
 bench() { # 名称 命令...
   local name=$1; shift
