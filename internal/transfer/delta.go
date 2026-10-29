@@ -169,7 +169,7 @@ func buildRecipe(ctx context.Context, f *os.File, size int64, x *basisIndex, em 
 			if err := em.literal(lit[:n]); err != nil {
 				return err
 			}
-			lit = lit[:n]
+			lit = lit[n:] // 前移视图：[:n] 在 n==len 时是空操作（曾致死循环）
 		}
 		lit = lit[:0]
 		return nil
