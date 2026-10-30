@@ -57,8 +57,16 @@ if ssh-keygen -t ed25519 -N "" -f $ROOT/hostkey -q 2>/dev/null && \
     -o PubkeyAuthentication=yes \
     -o AuthorizedKeysFile=$ROOT/ak >$ROOT/sshd.log 2>&1 &
   SSHD_PID=$!
-  SCP="scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $ROOT/benchkey"
-  echo "scp 对照通道：用户态 sshd 127.0.0.1:$SSHD_PORT"
+  SCP="timeout 30 scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $ROOT/benchkey"
+  # 通道探活：小文件实测（部分环境用户态 sshd 会挂起，探测失败即跳过 scp 行）
+  echo probe > $ROOT/probe.txt
+  if $SCP $ROOT/probe.txt 127.0.0.1:$ROOT/probe.out >/dev/null 2>&1 && [ -f $ROOT/probe.out ]; then
+    echo "scp 对照通道：用户态 sshd 127.0.0.1:$SSHD_PORT（探活通过）"
+  else
+    SCP=""
+    echo "（scp 通道探活失败，跳过 scp 对照）"
+    kill $SSHD_PID 2>/dev/null || true
+  fi
 else
   SCP=""
   echo "（ssh-keygen 不可用，跳过 scp 对照）"
