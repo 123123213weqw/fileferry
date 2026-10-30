@@ -174,6 +174,11 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 - [ ] M5 收尾：✅ systemd 沙箱单元（systemd/）✅ 安全自检脚本
       （scripts/security-check.sh）✅ make audit（govulncheck）
       ⬜ ffctl 管理令牌 ⬜ 部署打包 ⬜ UDP 缓冲调优（sysctl net.core.rmem_max=7500000）
+- [x] 事件化投递（长轮询）：心跳响应在无待办时被 controller 压住，
+      任务/打洞指令入队即唤醒——grant 投递延迟从"心跳周期一半"
+      降至 ~1 RTT；basis 校验和缓存免重复 delta 重算。bench 复测：
+      小文件风暴 500×16KB ff 0.8s→0.3s（macOS）/1.1s→0.6s（Linux，
+      几乎追平 rsync）；400MB 目录 ff 0.6s vs rsync 2.3s（macOS）
 - [x] 稳定性打磨（本轮）：✅ agent 启动竞态修复（whoamiLoop 在数据面
       socket 就绪前启动 → nil panic 崩进程；改为就绪后启动 + 判空兜底）
       ✅ enroll 指数退避重试（controller 未起不再 crash-loop）
