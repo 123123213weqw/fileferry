@@ -522,10 +522,11 @@ func indexLoop() {
 }
 
 func heartbeatInterval() time.Duration {
-	if cfg.Heartbeat >= 200*time.Millisecond {
+	if cfg.Heartbeat >= 100*time.Millisecond {
 		return cfg.Heartbeat
 	}
-	return 500 * time.Millisecond // 快投递：grant 经心跳下发，周期越短端到端延迟越低
+	return 200 * time.Millisecond // 长轮询下该值=无任务时的重发间隔：
+	// 有任务时被 controller 压住的响应立即唤醒，投递延迟≈1 RTT
 }
 
 func heartbeatLoop() {

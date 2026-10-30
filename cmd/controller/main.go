@@ -52,6 +52,7 @@ type controller struct {
 	mu           sync.Mutex
 	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
 	runningSets  map[api.NodeID]map[string]bool     // 各节点最近心跳上报的执行中任务
+	jobWaiters   map[api.NodeID][]chan struct{}     // 长轮询等待者：任务入队即唤醒（事件化投递）
 	nextID       int64 // 初始化为 Unix 秒，重启后天然错开、永不重复
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
@@ -131,6 +132,7 @@ func main() {
 		db:           db,
 		pending:      map[api.NodeID][]api.TransferGrant{},
 		runningSets:  map[api.NodeID]map[string]bool{},
+		jobWaiters:   map[api.NodeID][]chan struct{}{},
 		nextID:       time.Now().Unix(),
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
@@ -403,10 +405,14 @@ func (c *controller) autoRetry(oldID string) {
 	g.ID = fmt.Sprintf("retry-%d-%s", c.nextID, base)
 	g.ExpiresAt = time.Now().Add(30 * time.Minute)
 	g.Sign(c.signer)
-	for _, t := range g.AllSources() {
+	targets := g.AllSources()
+	for _, t := range targets {
 		c.pending[t] = append(c.pending[t], g)
 	}
 	c.mu.Unlock()
+	for _, t := range targets {
+		c.notifyJobs(t) // 事件化投递：入队即唤醒长轮询
+	}
 	c.jobPersist(&g)
 	log.Printf("断点续传：重签发 %s（原 %s，接收端将跳过已收块）", g.ID, oldID)
 }
@@ -474,6 +480,7 @@ func (c *controller) rehydrate() int {
 			c.mu.Lock()
 			c.pending[g.Src] = append(c.pending[g.Src], g)
 			c.mu.Unlock()
+			c.notifyJobs(g.Src) // 事件化投递：入队即唤醒长轮询
 			n++
 		}
 	}
@@ -701,6 +708,7 @@ func (c *controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.pending[grant.Src] = append(c.pending[grant.Src], grant)
 	c.mu.Unlock()
+	c.notifyJobs(grant.Src) // 事件化投递：入队即唤醒长轮询
 	c.jobPersist(&grant)
 	c.event("get", string(dst), se.Path)
 	json.NewEncoder(w).Encode(grant)
@@ -1023,6 +1031,17 @@ func (c *controller) handleEnroll(w http.ResponseWriter, r *http.Request) {
 
 // handleHeartbeat：要求 node 证书；节点身份以证书 CN 为准，不可谎报。
 // 响应携带该节点的待执行任务与全网在线节点表。
+// notifyJobs 唤醒某节点的长轮询心跳（任务/打洞指令入队时调用）。
+func (c *controller) notifyJobs(node api.NodeID) {
+	c.mu.Lock()
+	waiters := c.jobWaiters[node]
+	delete(c.jobWaiters, node)
+	c.mu.Unlock()
+	for _, ch := range waiters {
+		close(ch)
+	}
+}
+
 func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if len(r.TLS.PeerCertificates) == 0 {
 		http.Error(w, "client cert required", http.StatusUnauthorized)
@@ -1056,16 +1075,37 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 	c.graph.Apply(hb)
 	c.mu.Lock()
-	jobs := c.pending[hb.NodeID]
-	delete(c.pending, hb.NodeID)
-	for _, j := range jobs {
-		c.jobUpdate(j.ID, "sent") // 已投递：卡死巡检的状态依据（带 updated 时间戳）
-	}
 	set := make(map[string]bool, len(hb.Running))
 	for _, id := range hb.Running {
 		set[id] = true
 	}
 	c.runningSets[hb.NodeID] = set
+	// 长轮询：无待办时压住响应，任务/打洞指令入队立即唤醒——
+	// grant 投递延迟从"心跳周期的一半"降到 ~1 RTT。
+	// 唤醒后在本锁内重查（入队也持本锁，双重检查防丢唤醒）。
+	if len(c.pending[hb.NodeID]) == 0 && len(c.pendingPunch[hb.NodeID]) == 0 {
+		ch := make(chan struct{})
+		c.jobWaiters[hb.NodeID] = append(c.jobWaiters[hb.NodeID], ch)
+		noWork := len(c.pending[hb.NodeID]) == 0 && len(c.pendingPunch[hb.NodeID]) == 0
+		c.mu.Unlock()
+		if noWork {
+			select {
+			case <-ch:
+			case <-time.After(1500 * time.Millisecond):
+			}
+		}
+		// 不在此处重锁：落出分支后的统一 Lock 覆盖两条路径（重入会死锁）
+	} else {
+		c.mu.Unlock()
+	}
+	c.mu.Lock()
+	jobs := c.pending[hb.NodeID]
+	delete(c.pending, hb.NodeID)
+	for _, j := range jobs {
+		c.jobUpdate(j.ID, "sent") // 已投递：卡死巡检的状态依据（带 updated 时间戳）
+	}
+	directivesQ := c.pendingPunch[hb.NodeID]
+	delete(c.pendingPunch, hb.NodeID)
 	c.mu.Unlock()
 	fresh := jobs[:0]
 	for _, j := range jobs {
@@ -1074,15 +1114,17 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	jobs = fresh
-	directives := c.pickPunches(&hb)
+	directives, punchedPair := c.pickPunches(&hb)
+	for _, n := range punchedPair {
+		c.notifyJobs(n) // 打洞双方同时唤醒（指令已排队）
+	}
 	c.mu.Lock()
 	// 另一端排队中的指令（对端发牌时给本端登记的）一并下发，
 	// 保证打洞双方同时行动
-	if queued := c.pendingPunch[hb.NodeID]; len(queued) > 0 {
-		log.Printf("下发排队指令给 %s x%d", hb.NodeID, len(queued))
-		directives = append(directives, queued...)
+	if len(directivesQ) > 0 {
+		log.Printf("下发排队指令给 %s x%d", hb.NodeID, len(directivesQ))
+		directives = append(directives, directivesQ...)
 	}
-	delete(c.pendingPunch, hb.NodeID)
 	c.mu.Unlock()
 	json.NewEncoder(w).Encode(api.HeartbeatResponse{
 		Jobs:    jobs,
@@ -1094,12 +1136,13 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // pickPunches 挑选打洞配对：双方都有新鲜公网映射、互相都没有直连边、
 // 且该配对距上次尝试超过冷却时间。**指令同时排队给两端**——打洞
 // 必须双方同时对发，只通知一端必然失败（之前踩过的坑）。
-func (c *controller) pickPunches(hb *api.Heartbeat) []api.PunchDirective {
+func (c *controller) pickPunches(hb *api.Heartbeat) ([]api.PunchDirective, []api.NodeID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var queuedPair []api.NodeID
 	myPub, ok := c.publics[hb.NodeID]
 	if !ok {
-		return nil // 自己还没有公网映射，等 WHOAMI 保活
+		return nil, nil // 自己还没有公网映射，等 WHOAMI 保活
 	}
 	// 现有边集合（双向任一存在即认为已连通）
 	connected := map[api.NodeID]bool{hb.NodeID: true}
@@ -1135,8 +1178,9 @@ func (c *controller) pickPunches(hb *api.Heartbeat) []api.PunchDirective {
 			Private: myPrivate,
 		})
 		log.Printf("发牌：%s ↔ %s（%s / %s）", hb.NodeID, id, pe.addr, myPub.addr)
+		queuedPair = append(queuedPair, hb.NodeID, id)
 	}
-	return out
+	return out, queuedPair
 }
 
 // handleTransfer：仅 admin。选链 + 签发 grant 并投递到源节点任务队列。
@@ -1230,6 +1274,9 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	npend := len(c.pending[req.Src])
 	c.mu.Unlock()
+	for _, t := range targets {
+		c.notifyJobs(t) // 事件化投递：入队即唤醒长轮询
+	}
 	log.Printf("[trace] 签发 %s：sources=%d streams=%d 投递=%v 源队列长度=%d",
 		grant.ID, len(grant.Sources), grant.Streams, targets, npend)
 	c.jobPersist(&grant)
@@ -1452,6 +1499,8 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 	c.pending[req.Src] = append(c.pending[req.Src], grant) // 源端：发送
 	c.pending[req.Dst] = append(c.pending[req.Dst], grant) // 目的端：出站接入交换台
 	c.mu.Unlock()
+	c.notifyJobs(req.Src) // 事件化投递：入队即唤醒长轮询
+	c.notifyJobs(req.Dst) // 事件化投递：入队即唤醒长轮询
 	log.Printf("交换台模式：%s -> %s 经 %s 对接", req.Src, req.Dst, best)
 	c.jobPersist(&grant)
 	json.NewEncoder(w).Encode(grant)

@@ -1199,6 +1199,34 @@ func SafeRelPath(p string) bool {
 	return true
 }
 
+// basisCache delta 基准校验和缓存：同文件重复增量传输免整读重算
+//（64MB basis 求和 ≈ 0.3s）。键=路径+大小+mtime 纳秒——内容变化
+// 必然改键；容量封顶 LRU 简化为超限全清（基准数量级很小）。
+var basisCache = struct {
+	mu sync.Mutex
+	m  map[string][]blockSum
+}{m: map[string][]blockSum{}}
+
+func basisKey(path string, st os.FileInfo) string {
+	return fmt.Sprintf("%s|%d|%d", path, st.Size(), st.ModTime().UnixNano())
+}
+
+func cachedBasisSums(path string, st os.FileInfo) ([]blockSum, bool) {
+	basisCache.mu.Lock()
+	defer basisCache.mu.Unlock()
+	bs, ok := basisCache.m[basisKey(path, st)]
+	return bs, ok
+}
+
+func cacheBasisSums(path string, st os.FileInfo, bs []blockSum) {
+	basisCache.mu.Lock()
+	defer basisCache.mu.Unlock()
+	if len(basisCache.m) > 256 {
+		basisCache.m = map[string][]blockSum{}
+	}
+	basisCache.m[basisKey(path, st)] = bs
+}
+
 // groupKey 接收组/完成缓存的键：单文件模式只看 grantID；目录模式
 // 一个 grant 承载多文件，按相对路径区分。
 func groupKey(grant *api.TransferGrant, mf *Manifest) string {
@@ -1429,11 +1457,18 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 	if grant.Delta {
 		if bf, err := os.Open(finalPath); err == nil {
 			if bst, serr := bf.Stat(); serr == nil && bst.Size() > 0 {
-				bs, serr := BasisSums(bf)
-				if serr != nil {
-					bf.Close()
-					basisErr = serr
-				} else {
+				bs, hit := cachedBasisSums(finalPath, bst)
+				if !hit {
+					bs, serr = BasisSums(bf)
+					if serr != nil {
+						bf.Close()
+						basisErr = serr
+						bs = nil
+					} else {
+						cacheBasisSums(finalPath, bst, bs)
+					}
+				}
+				if basisErr == nil {
 					basis, basisSize, basisSums = bf, bst.Size(), bs
 				}
 			} else {
