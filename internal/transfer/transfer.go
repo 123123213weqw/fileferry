@@ -1459,7 +1459,7 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 			if bst, serr := bf.Stat(); serr == nil && bst.Size() > 0 {
 				bs, hit := cachedBasisSums(finalPath, bst)
 				if !hit {
-					bs, serr = BasisSums(bf)
+					bs, serr = BasisSumsFile(bf)
 					if serr != nil {
 						bf.Close()
 						basisErr = serr

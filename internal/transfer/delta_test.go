@@ -126,6 +126,58 @@ func TestDeltaRecipeReconstruct(t *testing.T) {
 	t.Logf("COPY=%dKB lits=%dKB（源 %dKB）", copyBytes/1024, litBytes/1024, len(src)/1024)
 }
 
+// TestDeltaRecipeParallel 并行扫描（≥16MB 走多 worker 路径）：编辑点
+// 精确落在分片边界上，重建必须与串行语义逐字节一致，且 COPY 仍然
+// 覆盖绝大多数数据（边界不吞掉大段匹配）。
+func TestDeltaRecipeParallel(t *testing.T) {
+	seg := 16 << 20 // 默认并行分片大小
+	basis := make([]byte, seg*2+3*1024*1024)
+	rand.Read(basis)
+	var src []byte
+	src = append(src, basis[:seg-100*1024]...)
+	e1 := make([]byte, 200*1024)
+	rand.Read(e1)
+	src = append(src, e1...)                              // 编辑跨越 seg 边界
+	src = append(src, basis[seg+100*1024:2*seg]...)
+	e2 := make([]byte, 64*1024)
+	rand.Read(e2)
+	src = append(src, e2...)                              // 第二边界附近
+	src = append(src, basis[2*seg:]...)
+
+	dir := t.TempDir()
+	bf, sf := filepath.Join(dir, "b"), filepath.Join(dir, "s")
+	os.WriteFile(bf, basis, 0o600)
+	os.WriteFile(sf, src, 0o600)
+	bfile, _ := os.Open(bf)
+	sums, err := BasisSumsFile(bfile) // 并行求和路径
+	bfile.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sfile, _ := os.Open(sf)
+	defer sfile.Close()
+	st, _ := sfile.Stat()
+	em := &recEmi{}
+	if err := buildRecipe(context.Background(), sfile, st.Size(), newIndex(sums, int64(len(basis))), em); err != nil {
+		t.Fatal(err)
+	}
+	if got := em.apply(basis); !bytes.Equal(got, src) {
+		t.Fatalf("并行重建不一致: got %d want %d", len(got), len(src))
+	}
+	var copyBytes, litBytes int64
+	for _, e := range em.events {
+		if e.isCopy {
+			copyBytes += e.len
+		} else {
+			litBytes += int64(len(e.lit))
+		}
+	}
+	if copyBytes < int64(len(basis))-2*1024*1024 {
+		t.Fatalf("COPY 覆盖 %d 字节过少（并行边界吞掉大段匹配）", copyBytes)
+	}
+	t.Logf("并行: 源 %dKB COPY=%dKB lit=%dKB", len(src)/1024, copyBytes/1024, litBytes/1024)
+}
+
 // TestDeltaRecipeNoMatch 源与 basis 完全不同：全部字面量，重建=源文件。
 func TestDeltaRecipeNoMatch(t *testing.T) {
 	basis := make([]byte, 300*1024)
