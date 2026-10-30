@@ -172,6 +172,28 @@ if [ -n "$SCP" ]; then
   bench "scp   " $SCP $ROOT/n1/src/big2.bin 127.0.0.1:$ROOT/n2/dst/big2.scp
 fi
 
+echo "=== 日志追加 ${BIG_N}MB+1MB（tail 场景：前缀不变仅尾部追加） ==="
+python3 - "$ROOT/n1/src/big.bin" "$ROOT/n1/src/appended.bin" <<'EOF'
+import sys, os
+old, new = sys.argv[1], sys.argv[2]
+with open(old, 'rb') as f:
+    data = f.read()
+with open(new, 'wb') as f:
+    f.write(data)
+    f.write(os.urandom(1024 * 1024))
+EOF
+cp $ROOT/n1/src/big.bin $ROOT/n2/dst/appended.bin
+bench "ffΔ+  " FFCTL send -delta node-1:$ROOT/n1/src/appended.bin node-2:$ROOT/n2/dst/appended.bin
+cmp -s $ROOT/n1/src/appended.bin $ROOT/n2/dst/appended.bin && echo "  内容一致" || echo "  内容不一致!!"
+# 二次追加（basis 校验和缓存命中 + 快速路径：日常日志同步的真实形态）
+python3 -c "
+d = open('$ROOT/n1/src/appended.bin','rb').read()
+open('$ROOT/n1/src/appended2.bin','wb').write(d + __import__('os').urandom(1024*1024))"
+bench "ffΔ+2 " FFCTL send -delta node-1:$ROOT/n1/src/appended2.bin node-2:$ROOT/n2/dst/appended.bin
+cmp -s $ROOT/n1/src/appended2.bin $ROOT/n2/dst/appended.bin && echo "  内容一致" || echo "  内容不一致!!"
+cp $ROOT/n1/src/big.bin $ROOT/n2/dst/appended.rsync
+bench "rsyncΔ" rsync -a $ROOT/n1/src/appended.bin $RS_DST.appended.rsync
+
 echo "=== 500×16KB ≈ 8MB，目录递归（小文件风暴） ==="
 rm -rf ${RS_DST}smalls
 bench "rsync " rsync -a $ROOT/n1/src/smalls $RS_DST

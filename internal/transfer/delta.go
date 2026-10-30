@@ -243,6 +243,48 @@ func scanRange(ctx context.Context, f *os.File, start, end int64, x *basisIndex,
 		return nil
 	}
 
+	// 追加型文件（tail/日志同步）快速路径：起点块对齐时先逐块顺序
+	// 比对——前缀未变的文件（只往尾部追加）全部命中 COPY，每 64KB
+	// 一次哈希比对，免逐字节滚动滑窗（64MB 日志 CPU 从 ~1s 降到
+	// ~30ms）。一旦失配立即落入正常滑窗扫描，不丢任何匹配机会。
+	if start%int64(W) == 0 {
+		fbuf := make([]byte, W)
+		for pos := start; pos+int64(W) <= end; {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if _, err := f.ReadAt(fbuf, pos); err != nil {
+				break // 读取失败交给主路径报错
+			}
+			rs := newRollingSum(W)
+			weak := rs.init(fbuf)
+			ok := false
+			if cands, found := x.full[weak]; found {
+				// 顺序对齐：只认块号 = pos/W 的候选（前缀不变假设），
+				// 命中即整块 COPY——强和确认防内容漂移
+				want := int32(pos / int64(W))
+				st := strongSum(fbuf)
+				for _, c := range cands {
+					if c == want && x.sums[c].Strong == st {
+						ok = true
+						break
+					}
+				}
+			}
+			if !ok {
+				break // 失配：从这里开始正常滑窗
+			}
+			if err := em.copy(pos, int64(W)); err != nil { // off == pos：同偏移 COPY
+				return err
+			}
+			pos += int64(W)
+			start = pos // 快速路径推进起点
+		}
+	}
+	if start >= end {
+		return nil // 快速路径吃满区间（残余 <W 时 start<end，主路径接管尾块）
+	}
+
 	seg := make([]byte, ChunkSize)
 	carry := []byte{}
 	pos := start // 已处理完（不含 carry）的文件偏移
@@ -379,6 +421,7 @@ func buildRecipe(ctx context.Context, f *os.File, size int64, x *basisIndex, em 
 		return scanRange(ctx, f, 0, size, x, em, true)
 	}
 	seg := (size + int64(k) - 1) / int64(k)
+	seg = ((seg + DeltaBlock - 1) / DeltaBlock) * DeltaBlock // 对齐块：每 worker 起点都能走快速路径
 	chs := make([]chan recipeEvent, k)
 	errs := make([]error, k)
 	ctx, cancel := context.WithCancel(ctx)

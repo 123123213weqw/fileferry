@@ -1199,32 +1199,62 @@ func SafeRelPath(p string) bool {
 	return true
 }
 
-// basisCache delta 基准校验和缓存：同文件重复增量传输免整读重算
-//（64MB basis 求和 ≈ 0.3s）。键=路径+大小+mtime 纳秒——内容变化
-// 必然改键；容量封顶 LRU 简化为超限全清（基准数量级很小）。
-var basisCache = struct {
-	mu sync.Mutex
-	m  map[string][]blockSum
-}{m: map[string][]blockSum{}}
-
-func basisKey(path string, st os.FileInfo) string {
-	return fmt.Sprintf("%s|%d|%d", path, st.Size(), st.ModTime().UnixNano())
+// basisCache delta 基准校验和缓存：按路径记忆上次求和结果，**追加
+// 增量维护**（tail/日志场景的核心）：文件变长时只补算新增块+重算
+// 尾部短块，O(追加量) 而非 O(全文件)。安全性：校验和是内容寻址的，
+// 前缀若实际被改，旧块的强和对不上新内容 → 匹配退化为字面量全传
+//（自愈），绝不会 COPY 出错内容；文件变短则整表作废重算。
+type basisEntry struct {
+	size int64
+	sums []blockSum
 }
 
-func cachedBasisSums(path string, st os.FileInfo) ([]blockSum, bool) {
+var basisCache = struct {
+	mu sync.Mutex
+	m  map[string]basisEntry
+}{m: map[string]basisEntry{}}
+
+// cachedBasisSums 返回 path 当前可用的校验和（命中含增量补算）。
+// f 由调用方打开（读偏移用）；miss 时返回 ok=false。
+func cachedBasisSums(path string, st os.FileInfo, f *os.File) ([]blockSum, bool) {
 	basisCache.mu.Lock()
-	defer basisCache.mu.Unlock()
-	bs, ok := basisCache.m[basisKey(path, st)]
-	return bs, ok
+	e, ok := basisCache.m[path]
+	basisCache.mu.Unlock()
+	if !ok || st.Size() < e.size {
+		return nil, false // 无记录或文件变短：整表重算
+	}
+	if st.Size() == e.size {
+		return e.sums, true
+	}
+	// 追加增量：从最后一个完整块边界起重算（尾部短块因变长必须重算），
+	// 新增区间串行补算（追加量通常很小）
+	from := (e.size / DeltaBlock) * DeltaBlock
+	sums := e.sums[:from/DeltaBlock]
+	buf := make([]byte, DeltaBlock)
+	for off := from; off < st.Size(); off += DeltaBlock {
+		n := DeltaBlock
+		if st.Size()-off < int64(n) {
+			n = int(st.Size() - off)
+		}
+		if _, err := f.ReadAt(buf[:n], off); err != nil {
+			return nil, false // 读失败退回全量路径
+		}
+		rs := newRollingSum(DeltaBlock)
+		sums = append(sums, blockSum{Weak: rs.init(buf[:n]), Strong: strongSum(buf[:n])})
+	}
+	basisCache.mu.Lock()
+	basisCache.m[path] = basisEntry{size: st.Size(), sums: sums}
+	basisCache.mu.Unlock()
+	return sums, true
 }
 
 func cacheBasisSums(path string, st os.FileInfo, bs []blockSum) {
 	basisCache.mu.Lock()
 	defer basisCache.mu.Unlock()
 	if len(basisCache.m) > 256 {
-		basisCache.m = map[string][]blockSum{}
+		basisCache.m = map[string]basisEntry{}
 	}
-	basisCache.m[basisKey(path, st)] = bs
+	basisCache.m[path] = basisEntry{size: st.Size(), sums: bs}
 }
 
 // groupKey 接收组/完成缓存的键：单文件模式只看 grantID；目录模式
@@ -1457,7 +1487,7 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 	if grant.Delta {
 		if bf, err := os.Open(finalPath); err == nil {
 			if bst, serr := bf.Stat(); serr == nil && bst.Size() > 0 {
-				bs, hit := cachedBasisSums(finalPath, bst)
+				bs, hit := cachedBasisSums(finalPath, bst, bf)
 				if !hit {
 					bs, serr = BasisSumsFile(bf)
 					if serr != nil {

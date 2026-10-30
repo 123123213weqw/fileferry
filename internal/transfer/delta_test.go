@@ -178,6 +178,60 @@ func TestDeltaRecipeParallel(t *testing.T) {
 	t.Logf("并行: 源 %dKB COPY=%dKB lit=%dKB", len(src)/1024, copyBytes/1024, litBytes/1024)
 }
 
+// TestDeltaAppendOnly 追加型文件（tail/日志同步）：旧版前缀完全不变、
+// 尾部追加新内容——快速路径应整段 COPY + 尾部字面量，且事件数极少
+//（每 64KB 一个 COPY），重建逐字节一致。并行路径（≥16MB）同样覆盖。
+func TestDeltaAppendOnly(t *testing.T) {
+	basis := make([]byte, 20<<20) // >16MB：触发并行分片
+	rand.Read(basis)
+	appendix := make([]byte, 3<<20)
+	rand.Read(appendix)
+	src := append(append([]byte{}, basis...), appendix...)
+
+	dir := t.TempDir()
+	bf, sf := filepath.Join(dir, "b"), filepath.Join(dir, "s")
+	os.WriteFile(bf, basis, 0o600)
+	os.WriteFile(sf, src, 0o600)
+	bfile, _ := os.Open(bf)
+	sums, err := BasisSumsFile(bfile)
+	bfile.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sfile, _ := os.Open(sf)
+	defer sfile.Close()
+	st, _ := sfile.Stat()
+	em := &recEmi{}
+	if err := buildRecipe(context.Background(), sfile, st.Size(), newIndex(sums, int64(len(basis))), em); err != nil {
+		t.Fatal(err)
+	}
+	if got := em.apply(basis); !bytes.Equal(got, src) {
+		t.Fatalf("追加场景重建不一致: got %d want %d", len(got), len(src))
+	}
+	var copyBytes, litBytes int64
+	nEvents := 0
+	for _, e := range em.events {
+		nEvents++
+		if e.isCopy {
+			copyBytes += e.len
+		} else {
+			litBytes += int64(len(e.lit))
+		}
+	}
+	if copyBytes != int64(len(basis)) {
+		t.Fatalf("COPY=%d 字节 != basis %d（前缀未变应全部命中）", copyBytes, len(basis))
+	}
+	if litBytes != int64(len(appendix)) {
+		t.Fatalf("字面量=%d 字节 != 追加 %d", litBytes, len(appendix))
+	}
+	// 事件数上界：每 64KB 至多一个 COPY + 尾部若干字面量帧
+	maxEv := len(basis)/(64<<10) + len(appendix)/(4<<20) + 8
+	if nEvents > maxEv {
+		t.Fatalf("事件数 %d 远超上界 %d（快速路径未生效，落入滑窗碎片）", nEvents, maxEv)
+	}
+	t.Logf("追加场景：basis %dKB 全 COPY + 尾部 %dKB 字面量，事件 %d 个", len(basis)/1024, len(appendix)/1024, nEvents)
+}
+
 // TestDeltaRecipeNoMatch 源与 basis 完全不同：全部字面量，重建=源文件。
 func TestDeltaRecipeNoMatch(t *testing.T) {
 	basis := make([]byte, 300*1024)
