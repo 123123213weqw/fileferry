@@ -185,11 +185,18 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 - [x] 批量文件单流打包：目录模式同一流上依次发多文件段（各段独立
       清单/ACK），FFEND 哨兵收尾——每文件 4 RTT → 2 RTT；TCP 回退
       与交换台模式免逐文件 TLS 握手/配对，WAN 小文件吞吐提升一倍
-- [x] 对标基准（scripts/bench-local.sh，macOS 回环；scp 走用户态
-      sshd 对照通道）：256MB 单文件 ff 1.2s / scp 0.4s / cp 0.1s；
+- [x] 对标基准（scripts/bench-local.sh；scp 走用户态 sshd 对照通道，
+      挂起环境自动探活跳过）：
+      macOS 回环：256MB 单文件 ff 1.2s / scp 0.4s / cp 0.1s；
       400MB 目录 ff 0.9s / scp 0.6s / rsync 1.7s（ff 胜 rsync）；
-      500×16KB ff 0.8s / scp 0.2s（差距=协调层固定延迟 ~0.5s，
-      真实舰队场景无此对照意义——scp/rsync 需两两配钥，ff 不需要）
+      500×16KB ff 0.8s / scp 0.2s；**增量同步 256MB 改 1MB：
+      ffΔ 1.2s / rsyncΔ 0.1s（scp 全量 0.4s）**；
+      Linux（WZU 服务器，SIZE_SCALE=0.25）：256MB ff 1.2s / cp 0.1s /
+      rsync 0.1s；目录递归 ff 2.0s / rsync 0.2s；**ffΔ 2.1s 内容一致
+      （rsyncΔ 0.2s）**；小文件 ff 1.1s / rsync 0.1s。
+      本地回环 ff 落后 scp 的部分=授权/选链/完整性编排的固定延迟
+      （~0.5s）；真实舰队场景该对照不成立——scp/rsync 需两两配钥，
+      ff 零两两配置且带增量/续传/多跳
 - [x] 强化压测（scripts/stress-local.sh，镜像真实压测三阶段 + 中断
       续传）：5×100MB 并发 5/5（聚合 55MB/s）、1GB 102MB/s、
       20×5MB 风暴 20/20、kill -9 源 agent 后 autoRetry+HAVE 位图
