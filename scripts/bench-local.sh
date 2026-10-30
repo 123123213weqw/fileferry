@@ -35,6 +35,11 @@ RS_DST=$ROOT/n2/dst/  # openrsync 的 daemon 模式不可用：直接本地→�
 cleanup() {
   kill ${CTL_PID:-0} ${A1_PID:-0} ${A2_PID:-0} 2>/dev/null || true
   [ -n "${SSHD_PID:-}" ] && kill $SSHD_PID 2>/dev/null || true
+  if [ -n "${BENCH_KEY_LINE:-}" ]; then
+    grep -vxF "$BENCH_KEY_LINE" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp 2>/dev/null && \
+      mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+  fi
   wait 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -51,13 +56,16 @@ cp $ROOT/ctl/ca/ca.crt $ROOT/admin/ca.crt
 SSHD_PORT=$((PORT_BASE+7))
 if ssh-keygen -t ed25519 -N "" -f $ROOT/hostkey -q 2>/dev/null && \
    ssh-keygen -t ed25519 -N "" -f $ROOT/benchkey -q 2>/dev/null; then
-  cp $ROOT/benchkey.pub $ROOT/ak
+  # 临时公钥挂进用户 authorized_keys（macOS sshd 对绝对路径
+  # AuthorizedKeysFile 不生效），cleanup 精确移除
+  touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+  BENCH_KEY_LINE="$(cat $ROOT/benchkey.pub)"
+  grep -qxF "$BENCH_KEY_LINE" ~/.ssh/authorized_keys || echo "$BENCH_KEY_LINE" >> ~/.ssh/authorized_keys
   /usr/sbin/sshd -D -p $SSHD_PORT -h $ROOT/hostkey \
     -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
-    -o PubkeyAuthentication=yes \
-    -o AuthorizedKeysFile=$ROOT/ak >$ROOT/sshd.log 2>&1 &
+    -o PubkeyAuthentication=yes >$ROOT/sshd.log 2>&1 &
   SSHD_PID=$!
-  SCP="timeout 30 scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $ROOT/benchkey"
+  SCP="TIMEOUT 30 scp -P $SSHD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -i $ROOT/benchkey"
   # 通道探活：小文件实测（部分环境用户态 sshd 会挂起，探测失败即跳过 scp 行）
   echo probe > $ROOT/probe.txt
   if $SCP $ROOT/probe.txt 127.0.0.1:$ROOT/probe.out >/dev/null 2>&1 && [ -f $ROOT/probe.out ]; then
@@ -86,6 +94,20 @@ for i in $(seq 1 $M_N); do dd if=/dev/urandom of=$ROOT/n1/src/mset/m-$i.bin bs=1
 mkdir -p $ROOT/n1/src/smalls
 S_N=$(python3 -c "print(max(1,int(500*$SCALE)))")
 for i in $(seq 1 $S_N); do dd if=/dev/urandom of=$ROOT/n1/src/smalls/s-$i.bin bs=1K count=16 2>/dev/null; done
+
+# TIMEOUT <秒> <命令...>：可移植超时（macOS 无 GNU timeout）
+TIMEOUT() {
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    "$@" & local p=$!
+    ( sleep "$secs"; kill -9 $p 2>/dev/null ) & local k=$!
+    wait $p; local rc=$?
+    kill $k 2>/dev/null
+    return $rc
+  fi
+}
 
 bench() { # 名称 命令...
   local name=$1; shift
