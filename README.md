@@ -65,6 +65,23 @@ internal/topology 有向可达图 + 负载加权选链
 internal/transfer QUIC 分块传输 / 断点续传 / 中继
 ```
 
+## 与 Tailscale 配合（推荐组网）
+
+agent **自动检测** tailscale 接口（接口名或 100.64.0.0/10 CGNAT 段），
+未显式配置 advertise 时自动把 Tailscale IP 作为数据面广播地址——**零
+配置**跑在 tailnet 上：探测/打洞/直连全走 Tailscale 隧道（WireGuard
+加密），fileferry 自己的多跳中继/交换台退居兜底；fileferry 在其上
+提供 Tailscale 没有的传输语义（增量同步/断点续传/目录递归/mTLS 授权/
+限速）。网络诊断：`ff-agent -config <cfg> -probe <对端:端口>`。
+
+实测（WZU Linux ↔ macOS，Tailscale 直连 44-110ms RTT，跨机真实集群）：
+100MB 传输多轮哈希全一致；高 RTT 弱网下断流自愈正常收敛（迟到流
+HAVE 全 1 对齐 + 写超时按帧滚动续期）。**已知差距**：该链路上 ff
+数据面 0.3MB/s vs scp 0.6-1.6MB/s（交替对比中位 3 倍）——高 RTT 下
+吞吐未跑满，排查方向：QUIC 混流未显著生效的根因、发送写路径
+profile、接收端收-算-写串行化。局域/回环场景无此差距（数据面
+300MB/s）。
+
 ## 当作 MCP 服务器用（AI agent 原生工具）
 
 `ffmcp` 把传输能力封装为 MCP（Model Context Protocol）工具，ZCode /

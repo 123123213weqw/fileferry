@@ -107,10 +107,37 @@ func (c *sniffConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func main() {
 	cfgPath := flag.String("config", "configs/agent.example.yaml", "agent 配置文件")
+	probeAddr := flag.String("probe", "", "诊断：探测对端数据面（QUIC/TCP 各测并打印错误）后退出")
 	flag.Parse()
+	if *probeAddr != "" {
+		probeDiag(*cfgPath, *probeAddr)
+		return
+	}
 
 	if err := run(*cfgPath); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// probeDiag 网络诊断：加载配置与证书，对目标数据面地址分别测
+// QUIC 与 TCP 的连通/RTT，打印各自错误（排查回落根因用）。
+func probeDiag(cfgPath, addr string) {
+	if err := loadConfig(cfgPath); err != nil {
+		log.Fatal("配置：", err)
+	}
+	cert, rootPool, err := loadOrCreateCert()
+	if err != nil {
+		log.Fatal("证书：", err)
+	}
+	tc := &tls.Config{Certificates: []tls.Certificate{*cert}, RootCAs: rootPool, MinVersion: tls.VersionTLS13}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	qRTT, proto, alt, err := transfer.ProbeWithAlt(ctx, addr, tc)
+	_ = qRTT
+	if err == nil {
+		log.Printf("结论：主=%s rtt=%v alt=%q", proto, qRTT.Round(time.Millisecond), alt)
+	} else {
+		log.Printf("结论：探测失败：%v", err)
 	}
 }
 
