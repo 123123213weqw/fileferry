@@ -865,13 +865,13 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 				if ferr := buildRecipe(ctx, f, mf.Size, newIndex(nil, 0), em); ferr != nil {
 					return fmt.Errorf("delta 字面量配方失败: %w", ferr)
 				}
-				return finishFile(stream, grant, r)
+				return finishFile(stream, grant, r, mf.Size)
 			}
 			em := &streamEmitter{stream: stream, enc: enc, lim: lim}
 			if rerr := buildRecipe(ctx, f, mf.Size, newIndex(sums, basisSize), em); rerr != nil {
 				return fmt.Errorf("delta 配方构建失败: %w", rerr)
 			}
-			return finishFile(stream, grant, r) // 配方发完：哨兵+ACK
+			return finishFile(stream, grant, r, mf.Size) // 配方发完：哨兵+ACK
 		}
 	}
 	if lerr == nil && strings.HasPrefix(line, "HAVE ") {
@@ -887,10 +887,15 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 	}
 
 	buf := make([]byte, ChunkSize)
-	if wd, ok := stream.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		wd.SetWriteDeadline(time.Now().Add(90 * time.Second)) // 写阻塞自断，交给份额重试
-	}
+	// 写超时按**帧滚动续期**：deadline 是绝对时刻，只在流首设一次的话，
+	// 慢链路（0.4MB/s × 4MB 帧 = 10s/帧）约 18MB 后所有写立即超时——
+	// 周期性断流重连把吞吐钉死在低速（跨机 tailscale 中继实测）。
+	// 每帧前重设 = "单帧 45s 内写不完才算死流"，活跃流永不误断。
+	wd, hasWD := stream.(interface{ SetWriteDeadline(time.Time) error })
 	for idx := startCh + int64(r); endCh < 0 || idx < endCh; idx += int64(n) {
+		if hasWD {
+			wd.SetWriteDeadline(time.Now().Add(45 * time.Second))
+		}
 		if have[idx] {
 			continue // 断点续传：接收端已有此块
 		}
@@ -912,18 +917,24 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 			return rerr
 		}
 	}
-	return finishFile(stream, grant, r)
+	return finishFile(stream, grant, r, mf.Size)
 }
 
 // finishFile 完成哨兵 + ACK 握手：接收端收齐全部份额（或 delta 配方）
 // 才落盘改名并回 ACK；QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
-func finishFile(stream Stream, grant *api.TransferGrant, r int) error {
+func finishFile(stream Stream, grant *api.TransferGrant, r int, fileSize int64) error {
 	if err := WriteFrame(stream, -1, []byte{}); err != nil {
 		return err
 	}
 	ack := make([]byte, 4)
 	if s, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-		s.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		// ACK 等待自适应：覆盖最慢份额的传输时间（1MB/s 下限 + 2min 余量），
+		// 上限 10min——多份额下接收端收齐全部块才回 ACK
+		wait := fileSize>>20 + 120
+		if wait > 600 {
+			wait = 600
+		}
+		s.SetReadDeadline(time.Now().Add(time.Duration(wait) * time.Second))
 	}
 	if _, err := io.ReadFull(stream, ack); err != nil {
 		return fmt.Errorf("等待接收端 ACK 失败：%w", err)
@@ -1306,27 +1317,29 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 		g, err := groupFor(grant, &mf, deckey)
 		if err == ErrAlreadyDone {
 			// 文件此前已完整落盘（重试流的迟到份额）。握手必须与发送端
-			// 的期待对齐，否则双方各自错位（历史"任务报失败"收尾问题）：
-			//   delta：发送端等 BASE 行 → 回 "BASE -"，排空其全量块到
-			//          哨兵再 ACK，批量流上的后续文件不受影响
-			//   常规：发送端等 HAVE 行但拿到 ACK 即全发 → 排空到 EOF
+			// 的期待严格对齐，否则双方错位（跨机实测：迟到流拿到裸 ACK
+			// 后发送端继续发数据帧 → broken pipe → 重试风暴 10 分钟）：
+			//   常规：发送端等 HAVE 行 → 回**全 1 位图**（所有块已在），
+			//         排空其数据帧到哨兵，再回 ACK——发送端跳过全部块、
+			//         发哨兵、收 ACK、任务正常 done，闭环
+			//   delta：发送端等 BASE 行 → 回 "BASE -"，同样排空+ACK
 			if grant.Delta {
 				stream.Write([]byte("BASE -\n"))
-				for {
-					_, data, derr := ReadFrame(br)
-					if derr != nil || len(data) == 0 {
-						break
-					}
-				}
-				stream.Write([]byte("ACK\n"))
 			} else {
-				stream.Write([]byte("ACK\n"))
-				if s2, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
-					s2.SetReadDeadline(time.Now().Add(90 * time.Second))
+				nCh := (mf.Size + ChunkSize - 1) / ChunkSize
+				bits := make([]byte, (nCh+7)/8)
+				for i := range bits {
+					bits[i] = 0xFF
 				}
-				io.Copy(io.Discard, br)
-				return false
+				fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(bits))
 			}
+			for {
+				_, data, derr := ReadFrame(br)
+				if derr != nil || len(data) == 0 {
+					break // 哨兵或流结束
+				}
+			}
+			stream.Write([]byte("ACK\n"))
 			fmt.Printf("迟到流确认：%s %q（文件此前已完整落盘）\n", grant.ID, mf.Path)
 			continue
 		}

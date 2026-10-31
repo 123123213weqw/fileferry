@@ -1242,9 +1242,29 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		IsDir:     req.Dir,          // 目录递归：源端整树枚举，逐文件签名清单
 		Delta:     req.Delta,        // 增量同步：对目的端已有近似文件只传差异（rsync 式）
 	}
+	if req.Streams > 0 && req.Streams <= 16 {
+		grant.Streams = req.Streams // 显式指定（弱网/中继链路少流常更快：多流 TCP 互相竞争恶化拥塞）
+	}
 	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
 	if len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
 		grant.Mix = true
+	}
+	// 流数按路径质量自适应（M4）：高 RTT 广域链路（中继/跨境）多流 TCP
+	// 互相竞争恶化拥塞——tailscale 中继实测单流 0.4 vs 4 流 0.3MB/s。
+	// 直连边 RTT>50ms → 降 2 流；局域快链保留 4 流填满带宽延迟积。
+	if req.Streams == 0 && len(path) == 2 {
+		for _, hb := range c.graph.Snapshot() {
+			if hb.NodeID != req.Src {
+				continue
+			}
+			for _, e := range hb.Edges {
+				if e.To == req.Dst && e.RTTms > 50 {
+					grant.Streams = 2
+					log.Printf("[trace] %s→%s RTT %.0fms，流数降为 2（广域链路）", req.Src, req.Dst, e.RTTms)
+					break
+				}
+			}
+		}
 	}
 	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
 	// 条件：候选到目的端有直连边（多源走直连，v1 不与中继/交换台复合）。

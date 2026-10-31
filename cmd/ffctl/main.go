@@ -37,6 +37,7 @@ func main() {
 	noWait := false
 	recursive := false
 	deltaMode := false
+	streamsN := 0
 	limitMB := int64(0)
 	args := os.Args[1:]
 	var rest []string
@@ -66,6 +67,16 @@ func main() {
 		}
 		if args[i] == "-delta" {
 			deltaMode = true
+			continue
+		}
+		if args[i] == "-streams" && i+1 < len(args) {
+			v, err := strconv.Atoi(args[i+1])
+			if err != nil || v < 1 || v > 16 {
+				fmt.Fprintln(os.Stderr, "-streams 需要 1-16 的整数")
+				os.Exit(2)
+			}
+			streamsN = v
+			i++
 			continue
 		}
 		if args[i] == "-limit" && i+1 < len(args) {
@@ -110,6 +121,18 @@ func main() {
 				recursive = true
 			case "-delta":
 				deltaMode = true
+			case "-streams":
+				if i+1 >= len(rest) {
+					fmt.Fprintln(os.Stderr, "-streams 需要 1-16 的整数")
+					os.Exit(2)
+				}
+				v, err := strconv.Atoi(rest[i+1])
+				if err != nil || v < 1 || v > 16 {
+					fmt.Fprintln(os.Stderr, "-streams 需要 1-16 的整数")
+					os.Exit(2)
+				}
+				streamsN = v
+				i++
 			case "-limit":
 				if i+1 >= len(rest) {
 					fmt.Fprintln(os.Stderr, "-limit 需要 MB/s 数字")
@@ -138,7 +161,7 @@ func main() {
 		}
 		grant, err := cl.Send(api.TransferRequest{
 			Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath,
-			Dir: recursive, Delta: deltaMode, RateLimit: limitMB,
+			Dir: recursive, Delta: deltaMode, RateLimit: limitMB, Streams: streamsN,
 		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "传输请求失败：", err)

@@ -373,7 +373,48 @@ func advertisedAddr() string {
 	if cfg.Advertise != "" {
 		return cfg.Advertise
 	}
+	// Tailscale 配合：tailnet 内的互通地址（100.64.0.0/10 CGNAT 段，
+	// 或名含 tailscale 的接口）优先作为数据面广播地址——探测/直连
+	// 天然走 Tailscale 隧道（WireGuard 加密），fileferry 自己的多跳
+	// 中继/交换台退居兜底。显式配置 advertise 时以用户为准。
+	if ip, ok := tailscaleIP(); ok {
+		return fmt.Sprintf("%s:%d", ip, cfg.DataPort)
+	}
 	return fmt.Sprintf("%s:%d", localIPTowardsController(), cfg.DataPort)
+}
+
+// tailscaleIP 发现本机的 Tailscale 接口地址：接口名含 "tailscale"
+// 或地址落在 100.64.0.0/10（Tailscale 专属 CGNAT 段）。多地址取
+// 第一个 IPv4。
+func tailscaleIP() (string, bool) {
+	cgnat := func(ip net.IP) bool {
+		return ip.To4() != nil && ip.To4()[0] == 100 && ip.To4()[1] >= 64 && ip.To4()[1] <= 127
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", false
+	}
+	for _, ifc := range ifaces {
+		isTS := strings.Contains(ifc.Name, "tailscale")
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipn.IP.To4()
+			if ip == nil {
+				continue
+			}
+			if isTS || cgnat(ipn.IP) {
+				return ip.String(), true
+			}
+		}
+	}
+	return "", false
 }
 
 // dueReport 带时效的积压回报：陈年失败回报被补发会触发 controller

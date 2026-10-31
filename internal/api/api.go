@@ -117,6 +117,7 @@ type TransferRequest struct {
 	DstPath   string `json:"dst_path"`
 	Dir       bool   `json:"dir,omitempty"`  // 目录递归：SrcPath 整树复制到 DstPath 下
 	Delta     bool   `json:"delta,omitempty"` // 增量同步：对目的端已有近似文件只传差异（rsync 式）
+	Streams   int    `json:"streams,omitempty"` // 并行流数（0=自动；弱网/中继链路 1-2 常更快）
 	RateLimit int64  `json:"rate_limit_bps"` // 0 = 不限速
 }
 
