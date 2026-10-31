@@ -106,6 +106,7 @@ func SendOpeners(udp net.PacketConn, target string, dur time.Duration) {
 // DialStream 按协议拨到 addr 并打开一条流。返回的 closer 关闭底层
 // 连接（QUIC conn / TCP conn），流本身的写侧由调用者按需半关闭。
 func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (Stream, func(), error) {
+	log.Printf("[dial] %s %s", proto, addr)
 	switch proto {
 	case "tcp":
 		host, portStr, err := net.SplitHostPort(addr)
@@ -117,12 +118,28 @@ func DialStream(ctx context.Context, addr, proto string, tlsConf *tls.Config) (S
 		if err != nil {
 			return nil, nil, err
 		}
+		// 显式大 socket 缓冲：系统默认（macOS ~64KB）× 高 RTT（200ms）=
+		// 0.3MB/s 吞吐天花板（tailscale 跨机实测 8 倍输给显式调缓冲的
+		// OpenSSH）。4MB 对齐 UDP 数据面的缓冲设置。
 		d := net.Dialer{Timeout: 5 * time.Second}
-		conn, err := tls.DialWithDialer(&d, "tcp", net.JoinHostPort(host, strconv.Itoa(port+1)), tlsConf)
+		raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port+1)))
 		if err != nil {
 			return nil, nil, err
 		}
-		return conn, func() { conn.Close() }, nil
+		if tc, ok := raw.(*net.TCPConn); ok {
+			_ = tc.SetWriteBuffer(4 << 20)
+			_ = tc.SetReadBuffer(4 << 20)
+		}
+		tc := tlsConf.Clone()
+		if tc.ServerName == "" && !tc.InsecureSkipVerify {
+			tc.ServerName = host // DialWithDialer 的行为对齐：地址主机名作 SNI
+		}
+		tconn := tls.Client(raw, tc)
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			raw.Close()
+			return nil, nil, err
+		}
+		return tconn, func() { tconn.Close() }, nil
 	default: // "quic"
 		udpAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
@@ -909,6 +926,9 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 			if err := WriteFrame(stream, idx, data); err != nil {
 				return err
 			}
+			if traceFrames {
+				log.Printf("[tf] %s 段%d 帧%d(%dB) 写完 %s", grant.ID, r, idx, len(data), time.Now().Format("15:04:05.000"))
+			}
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
@@ -1008,6 +1028,10 @@ func ServeTCP(ln net.Listener, selfID string, verify GrantVerifier, tlsConf *tls
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetWriteBuffer(4 << 20) // 与拨号侧对齐：高 RTT 链路默认缓冲是吞吐天花板
+			_ = tc.SetReadBuffer(4 << 20)
 		}
 		go HandleStream(conn, selfID, verify, tlsConf, "")
 	}
@@ -1191,6 +1215,10 @@ func SetPathGuard(g func(string) bool) { pathGuard = g }
 //（强持久性）；关闭 = 对齐 rsync/cp 的默认语义（完整性仍由逐块+
 // 全文件 SHA-256 与原子改名保证），小文件吞吐提升一个量级。
 var syncWrite bool
+
+// traceFrames 帧级节奏诊断（FF_TRACE_FRAMES=1 开启）：发送端每帧写完、
+// 接收端每帧读完成各打一行时间戳——跨机吞吐排查用。
+var traceFrames = os.Getenv("FF_TRACE_FRAMES") == "1"
 
 func SetSyncWrite(v bool) { syncWrite = v }
 
@@ -1660,6 +1688,9 @@ func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
 		if _, err := g.tmp.WriteAt(data, idx*int64(ChunkSize)); err != nil {
 			return err
 		}
+		if traceFrames {
+			log.Printf("[tf] 帧%d(%dB) 读讫 %s", idx, len(data), time.Now().Format("15:04:05.000"))
+		}
 		g.mu.Lock()
 		g.got[idx] = true
 		g.dirty++
@@ -1924,7 +1955,10 @@ func ProbeWithAlt(ctx context.Context, addr string, tlsConf *tls.Config) (time.D
 	case tErr != nil:
 		return qRTT, "quic", "", nil
 	case tRTT < qRTT*3/2:
-		return tRTT, "tcp", "quic", nil // RTT 接近 → TCP 主（吞吐优先），QUIC 副
+		// RTT 接近 → QUIC 主：QUIC 用应用层大缓冲（8-16MB），不依赖内核
+		// TCP 缓冲 autotune——隧道/弱网（tailscale utun 实测）内核钳制 TCP
+		// 发送缓冲时吞吐恒定钉死（0.26MB/s vs QUIC 0.9），QUIC 更稳。
+		return qRTT, "quic", "tcp", nil
 	default:
 		return qRTT, "quic", "tcp", nil
 	}

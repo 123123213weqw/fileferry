@@ -1245,8 +1245,14 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if req.Streams > 0 && req.Streams <= 16 {
 		grant.Streams = req.Streams // 显式指定（弱网/中继链路少流常更快：多流 TCP 互相竞争恶化拥塞）
 	}
+	// 实验诊断：强制首跳协议（不做正确性回退；生产留空走探测）
+	if req.ForceProto == "quic" || req.ForceProto == "tcp" {
+		grant.Hops[1].Proto = req.ForceProto
+		grant.Mix = false
+	}
 	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
-	if len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
+	// （-proto 强制时不混流——ForceProto 的 Mix=false 不能被这里覆盖）
+	if req.ForceProto == "" && len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
 		grant.Mix = true
 	}
 	// 流数按路径质量自适应（M4）：高 RTT 广域链路（中继/跨境）多流 TCP
@@ -1271,7 +1277,7 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4
 	// 目录模式不走多源（树内文件已天然并行）。
 	// 多源的块区间语义与 delta 配方互斥：delta 时跳过多源
-	if !req.Dir && !req.Delta {
+	if !req.Dir && !req.Delta && req.Streams == 0 {
 		if sz := c.indexedSize(req.Src, req.SrcPath); sz > 0 {
 			switch {
 			case sz >= 256<<20:

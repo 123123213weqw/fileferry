@@ -38,6 +38,7 @@ func main() {
 	recursive := false
 	deltaMode := false
 	streamsN := 0
+	forceProto := ""
 	limitMB := int64(0)
 	args := os.Args[1:]
 	var rest []string
@@ -67,6 +68,11 @@ func main() {
 		}
 		if args[i] == "-delta" {
 			deltaMode = true
+			continue
+		}
+		if args[i] == "-proto" && i+1 < len(args) && (args[i+1] == "quic" || args[i+1] == "tcp") {
+			forceProto = args[i+1]
+			i++
 			continue
 		}
 		if args[i] == "-streams" && i+1 < len(args) {
@@ -121,6 +127,13 @@ func main() {
 				recursive = true
 			case "-delta":
 				deltaMode = true
+			case "-proto":
+				if i+1 >= len(rest) || (rest[i+1] != "quic" && rest[i+1] != "tcp") {
+					fmt.Fprintln(os.Stderr, "-proto 需要 quic 或 tcp")
+					os.Exit(2)
+				}
+				forceProto = rest[i+1]
+				i++
 			case "-streams":
 				if i+1 >= len(rest) {
 					fmt.Fprintln(os.Stderr, "-streams 需要 1-16 的整数")
@@ -161,7 +174,7 @@ func main() {
 		}
 		grant, err := cl.Send(api.TransferRequest{
 			Src: srcNode, SrcPath: srcPath, Dst: dstNode, DstPath: dstPath,
-			Dir: recursive, Delta: deltaMode, RateLimit: limitMB, Streams: streamsN,
+			Dir: recursive, Delta: deltaMode, RateLimit: limitMB, Streams: streamsN, ForceProto: forceProto,
 		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "传输请求失败：", err)
