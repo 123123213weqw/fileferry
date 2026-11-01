@@ -365,15 +365,65 @@ func SendFile(ctx context.Context, path string, open StreamOpener, tlsConf *tls.
 // 自己的区间；接收端按块号稀疏写，天然汇聚。返回发送字节数。
 // grant.Streams 是本源的并行连接数，区间内交错分块。
 func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf *tls.Config, grant *api.TransferGrant, startCh, endCh int64) (int64, error) {
-	mf, err := BuildManifest(grant.ID, path, "", tlsConf)
-	if err != nil {
-		return 0, fmt.Errorf("构建清单失败: %w", err)
+	// manifest 全文件哈希与建流并行：大文件哈希（512MB@2GB/s≈256ms）
+	// 期间预先建好数据面连接（WAN 上省 1-2 RTT 的建流+握手），
+	// 哈希完成即刻发数据。首连失败在 sendShare 的重试里自愈。
+	type mres struct {
+		mf  *Manifest
+		err error
 	}
+	mc := make(chan mres, 1)
+	go func() {
+		mf, err := BuildManifest(grant.ID, path, "", tlsConf)
+		mc <- mres{mf, err}
+	}()
+	var pre Stream
+	var preClose func()
+	preDone := false
+	prewarm := func() { // 只预热一次；失败静默（正规路径会重试并报错）
+		if preDone {
+			return
+		}
+		preDone = true
+		if st, cl, err := open(); err == nil {
+			pre, preClose = st, cl
+		}
+	}
+	if grant.Enc {
+		prewarm() // 密钥上报（controller RTT）也藏进哈希窗口
+	}
+	r := <-mc
+	if r.err != nil {
+		if preClose != nil {
+			preClose()
+		}
+		return 0, fmt.Errorf("构建清单失败: %w", r.err)
+	}
+	mf := r.mf
 	f, err := os.Open(path)
 	if err != nil {
+		if preClose != nil {
+			preClose()
+		}
 		return 0, err
 	}
 	defer f.Close()
+	defer func() { // 预热流未被动用（异常路径）时关闭；被接管后置 nil
+		if preClose != nil {
+			preClose()
+		}
+	}()
+	// open 的包装：首个调用接管预热流（哈希窗口内建好的连接），
+	// 之后回落原 opener——sendShare 的重试语义不变
+	open0 := open
+	open = func() (Stream, func(), error) {
+		if pre != nil {
+			st, cl := pre, preClose
+			pre, preClose = nil, nil
+			return st, cl, nil
+		}
+		return open0()
+	}
 	n := grant.Streams
 	if n < 1 {
 		n = 1
