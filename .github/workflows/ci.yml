@@ -1,8 +1,12 @@
 name: CI
 
-# 守住两件曾经出过事的事：
-#   1. 依赖漏声明导致干净克隆编不出来（f808635 之前 go.mod 只有两行）
+# 守住这些曾经真实出过事的事：
+#   1. 依赖漏声明导致干净克隆编不出来（f808635）
 #   2. 代码能过编译但测试不过
+#   3. 平台回归：本地 Mac 开发，Linux 服务器部署——两端都要绿
+#    （曾实锤：dd 小写后缀仅 BSD 认、stat -f 仅 BSD、UDP 缓冲行为差异）
+#   4. 链路级冒烟与压测：单测进程内测不出的协议错位/死锁
+#    （曾实锤：迟到流握手错位卡 10 分钟、saveProgress 并发 map 崩溃）
 on:
   push:
     branches: [main]
@@ -17,14 +21,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # 只用 setup-go 装好的工具链，不在 CI 里偷偷下载别的版本：
-  # go.mod 里的 go 指令若与实际工具链不符，这里会直接失败而不是静默降级。
   GOTOOLCHAIN: local
 
 jobs:
   build:
-    name: 构建 / 静态检查 / 依赖一致性
-    runs-on: ubuntu-latest
+    name: 构建 / 静态检查（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -53,7 +59,6 @@ jobs:
       - name: go vet
         run: GOFLAGS=-mod=readonly go vet ./...
 
-      # README「快速开始」的第一条命令，别让它悄悄坏掉
       - name: make build
         run: make build
 
@@ -65,8 +70,12 @@ jobs:
           ls -l bin/
 
   test:
-    name: 单元测试
-    runs-on: ubuntu-latest
+    name: 单元测试·race（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -77,3 +86,45 @@ jobs:
 
       - name: go test（含竞态检测）
         run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+  e2e:
+    name: 端到端冒烟（Linux）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建
+        run: make build
+
+      # 全链路：enroll→心跳→探测建边→单文件→目录递归（权限/mtime 校验）
+      # 失败即门禁红：协议错位/死锁在这里暴露，单测进程内测不出
+      - name: e2e 冒烟（controller + 2 agent + 传输 + 哈希/属性校验）
+        run: |
+          sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000 || true
+          ./scripts/local-e2e.sh
+
+  stress:
+    name: 压测四阶段（Linux，1/4 规模）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建
+        run: make build
+
+      # 5×25MB 并发 / 256MB 大文件 / 5×1.25MB 风暴 / kill -9 中断续传
+      # 全程哈希校验；任一阶段失败或哈希不一致即红
+      - name: 压测（SIZE_SCALE=0.25）
+        run: |
+          sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000 || true
+          PORT_BASE=21200 SIZE_SCALE=0.25 ./scripts/stress-local.sh

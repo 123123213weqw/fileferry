@@ -9,6 +9,7 @@ cd "$(dirname "$0")/.."
 BIN=$PWD/bin
 ROOT=$(mktemp -d /tmp/fileferry-stress.XXXXXX)
 PORT_BASE=${PORT_BASE:-18900}
+SCALE=${SIZE_SCALE:-1}   # 数据规模缩放（CI 用 0.25 防超时）
 AGENT_BIN=${AGENT_BIN:-$BIN/ff-agent}   # 阶段4 可换 -race 构建做泄漏观察
 
 mkdir -p $ROOT/cfg $ROOT/n1/ff $ROOT/n2/ff $ROOT/admin $ROOT/n1/share
@@ -51,16 +52,20 @@ ID2=$(openssl x509 -in $ROOT/n2/ff/node.crt -noout -subject | sed -n 's/.*CN *= 
 [ -n "$ID1" ] && [ -n "$ID2" ] || { echo "节点 ID 解析失败"; exit 1; }
 
 # 等边 + 探测期间同步准备数据集（urandom 慢，后台并行）
-dd if=/dev/urandom of=$ROOT/n1/share/rep100.bin bs=1M count=100 2>/dev/null &
+P1_MB=$(python3 -c "print(max(1,int(100*$SCALE)))")
+BIG_MB=$(python3 -c "print(max(1,int(1024*$SCALE)))")
+S_MB=$(python3 -c "print(max(1,int(5*$SCALE)))")
+S_N=$(python3 -c "print(max(2,int(20*$SCALE)))")
+dd if=/dev/urandom of=$ROOT/n1/share/rep100.bin bs=1M count=$P1_MB 2>/dev/null &
 DD1=$!
 for i in $(seq 1 45); do
   FFCTL status 2>/dev/null | grep -q "$ID1 .*出边=\[$ID2" && break; sleep 2
 done
 wait $DD1
-for i in $(seq 1 20); do dd if=/dev/urandom of=$ROOT/n1/share/s-$i.bin bs=1M count=5 2>/dev/null; done
+for i in $(seq 1 $S_N); do dd if=/dev/urandom of=$ROOT/n1/share/s-$i.bin bs=1M count=$S_MB 2>/dev/null; done
 T0=$(date +%s)
 
-echo "=== 阶段1：5 并发 × 100MB ==="
+echo "=== 阶段1：5 并发 × ${P1_MB}MB ==="
 SEND_PIDS=""
 for i in 1 2 3 4 5; do
   FFCTL -nowait send $ID1:$ROOT/n1/share/rep100.bin $ID2:$ROOT/n2/ff/recv/p1-$i.bin > $ROOT/send1-$i.log 2>&1 &
@@ -79,22 +84,22 @@ for i in 1 2 3 4 5; do
   [ "$S1" = "$S2" ] && P1_OK=$((P1_OK+1)) || echo "  p1-$i 哈希不一致"
 done
 T1=$(date +%s)
-echo "阶段1: ${P1_OK}/5 成功, 耗时 $((T1-T0))s, 聚合 $(python3 -c "print(round(500/max(1,$T1-$T0),1))")MB/s"
+echo "阶段1: ${P1_OK}/5 成功, 耗时 $((T1-T0))s, 聚合 $(python3 -c "print(round($P1_MB*5/max(1,$T1-$T0),1))")MB/s"
 
-echo "=== 阶段2：1GB 大文件 ==="
+echo "=== 阶段2：${BIG_MB}MB 大文件 ==="
 T2=$(date +%s)
-dd if=/dev/urandom of=$ROOT/n1/share/big1g.bin bs=1M count=1024 2>/dev/null
+dd if=/dev/urandom of=$ROOT/n1/share/big1g.bin bs=1M count=$BIG_MB 2>/dev/null
 FFCTL send $ID1:$ROOT/n1/share/big1g.bin $ID2:$ROOT/n2/ff/recv/big1g.bin > /dev/null
 S1=$(shasum -a 256 $ROOT/n1/share/big1g.bin | cut -d' ' -f1)
 S2=$(shasum -a 256 $ROOT/n2/ff/recv/big1g.bin | cut -d' ' -f1)
 T3=$(date +%s)
-[ "$S1" = "$S2" ] && R2="OK($((T3-T2))s, $(python3 -c "print(round(1024/max(1,$T3-$T2),1))")MB/s)" || R2="BAD"
+[ "$S1" = "$S2" ] && R2="OK($((T3-T2))s, $(python3 -c "print(round($BIG_MB/max(1,$T3-$T2),1))")MB/s)" || R2="BAD"
 echo "阶段2: $R2"
 
-echo "=== 阶段3：20 × 5MB 风暴 ==="
+echo "=== 阶段3：${S_N} × ${S_MB}MB 风暴 ==="
 T4=$(date +%s)
 SEND_PIDS=""
-for i in $(seq 1 20); do
+for i in $(seq 1 $S_N); do
   FFCTL -nowait send $ID1:$ROOT/n1/share/s-$i.bin $ID2:$ROOT/n2/ff/recv/s-$i.bin > $ROOT/send3-$i.log 2>&1 &
   SEND_PIDS="$SEND_PIDS $!"
   [ $((i % 5)) = 0 ] && { wait $SEND_PIDS; SEND_PIDS=""; } # 限 5 并发：只等 send（守护进程不能 wait，否则死等）
@@ -103,20 +108,20 @@ done
 P3_OK=0
 for t in $(seq 1 90); do
   N=$(( ls $ROOT/n2/ff/recv/s-*.bin 2>/dev/null || true ) | wc -l | tr -d ' ')
-  [ "$N" = "20" ] && break
+  [ "$N" = "$S_N" ] && break
   sleep 2
 done
 sleep 3
-for i in $(seq 1 20); do
+for i in $(seq 1 $S_N); do
   S1=$(shasum -a 256 $ROOT/n1/share/s-$i.bin | cut -d' ' -f1)
   S2=$(shasum -a 256 $ROOT/n2/ff/recv/s-$i.bin 2>/dev/null | cut -d' ' -f1)
   [ "$S1" = "$S2" ] && P3_OK=$((P3_OK+1)) || echo "  s-$i 哈希不一致"
 done
 T5=$(date +%s)
-echo "阶段3: ${P3_OK}/20 成功, 耗时 $((T5-T4))s"
+echo "阶段3: ${P3_OK}/${S_N} 成功, 耗时 $((T5-T4))s"
 
 echo "=== 阶段4：中断续传（传输中杀源 agent）==="
-dd if=/dev/urandom of=$ROOT/n1/share/kill200.bin bs=1M count=200 2>/dev/null
+KILL_MB=$(python3 -c "print(max(50,int(200*$SCALE)))"); dd if=/dev/urandom of=$ROOT/n1/share/kill200.bin bs=1M count=$KILL_MB 2>/dev/null
 FFCTL -nowait send $ID1:$ROOT/n1/share/kill200.bin $ID2:$ROOT/n2/ff/recv/kill200.bin > /dev/null
 sleep 1.2 # 让传输启动
 kill -9 $A1_PID; A1_PID=""
@@ -135,4 +140,4 @@ echo "阶段4: $K_OK"
 
 echo "=== 资源抽样（无泄漏粗查）==="
 ps -o pid,rss,command -p $CTL_PID $A1_PID $A2_PID 2>/dev/null | awk 'NR==1 || /ff-/ {print $1, $2/1024 "MB", $3}'
-echo "=== 汇总：数据 $((500+1024+100+200))MB + 20×5MB, 总耗时 $(($(date +%s)-T0))s ==="
+echo "=== 汇总：数据 $((P1_MB*5+BIG_MB+S_MB*S_N+KILL_MB))MB, 总耗时 $(($(date +%s)-T0))s ==="
