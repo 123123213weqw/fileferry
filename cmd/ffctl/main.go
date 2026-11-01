@@ -190,13 +190,14 @@ func main() {
 			fmt.Println("；任务已入队（-nowait：不等待完成）")
 			return
 		}
-		// 默认等待完成：轮询任务状态，退出码反映结果（agent/脚本友好）
+		// 默认等待完成：长轮询任务终态（服务端 jobdone 事件唤醒，最坏 10s
+		// 兜底重查），退出码反映结果（agent/脚本友好）
 		fmt.Println("；等待完成…")
 		deadline := time.Now().Add(30 * time.Minute)
 		for time.Now().Before(deadline) {
-			time.Sleep(150 * time.Millisecond) // 快轮询：完成检测延迟不影响吞吐只影响退出时机
-			jobs, err := cl.Jobs(grant.ID)
+			jobs, err := cl.JobsWait(grant.ID)
 			if err != nil || len(jobs) == 0 {
+				time.Sleep(200 * time.Millisecond) // 查询异常退避（网络抖动）
 				continue
 			}
 			switch jobs[0].Status {
@@ -208,7 +209,7 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		fmt.Fprintln(os.Stderr, "超时：10 分钟内未完成（可用 -nowait 改为只入队）")
+		fmt.Fprintln(os.Stderr, "超时：30 分钟内未完成（可用 -nowait 改为只入队）")
 		os.Exit(1)
 	case "token":
 		// 铸造一枚一次性入网令牌：打印后由管理员加入 controller

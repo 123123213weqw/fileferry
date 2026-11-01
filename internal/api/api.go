@@ -316,10 +316,23 @@ type JobInfo struct {
 
 // Jobs 查询任务列表；id 为空返回全部（近期），否则精确匹配。
 func (c *Client) Jobs(id string) ([]JobInfo, error) {
+	return c.jobs(id, false)
+}
+
+// JobsWait 长轮询：任务到达终态（done/failed）即返回，最长阻塞 ~10s。
+// ffctl 完成感知用——比固定间隔轮询平均省一半间隔延迟。
+func (c *Client) JobsWait(id string) ([]JobInfo, error) {
+	return c.jobs(id, true)
+}
+
+func (c *Client) jobs(id string, wait bool) ([]JobInfo, error) {
 	var out []JobInfo
 	path := "/v1/jobs"
 	if id != "" {
 		path += "?id=" + url.QueryEscape(id)
+		if wait {
+			path += "&wait=1"
+		}
 	}
 	if err := c.Get(path, &out); err != nil {
 		return nil, err

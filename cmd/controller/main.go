@@ -53,6 +53,8 @@ type controller struct {
 	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
 	runningSets  map[api.NodeID]map[string]bool     // 各节点最近心跳上报的执行中任务
 	jobWaiters   map[api.NodeID][]chan struct{}     // 长轮询等待者：任务入队即唤醒（事件化投递）
+	doneMu       sync.Mutex                          // doneWaiters 专用锁：jobUpdate 可能被 c.mu 持锁路径
+	doneWaiters  map[string][]chan struct{}          // 调用（投递标 sent），共用 c.mu 会重入死锁
 	nextID       int64 // 初始化为 Unix 秒，重启后天然错开、永不重复
 
 	publics      map[api.NodeID]pubEntry // 节点公网 NAT 映射（UDP 回声口观测）
@@ -133,6 +135,7 @@ func main() {
 		pending:      map[api.NodeID][]api.TransferGrant{},
 		runningSets:  map[api.NodeID]map[string]bool{},
 		jobWaiters:   map[api.NodeID][]chan struct{}{},
+		doneWaiters:  map[string][]chan struct{}{},
 		nextID:       time.Now().Unix(),
 		ledger:       loadEnrollLedger(cfg.DataDir),
 		limiter:      &rateLimiter{seen: map[string][]time.Time{}},
@@ -516,7 +519,30 @@ func retryBase(id string) string {
 }
 
 func (c *controller) jobUpdate(id, status string) {
-	go c.db.Exec(`UPDATE jobs SET status=?, updated=? WHERE id=?`, status, time.Now().Unix(), id)
+	c.db.Exec(`UPDATE jobs SET status=?, updated=? WHERE id=?`, status, time.Now().Unix(), id)
+	if status == "done" || status == "failed" {
+		c.notifyDone(id) // 唤醒等待该任务的 ffctl 长轮询
+	}
+}
+
+// notifyDone 唤醒等待某任务终态的所有长轮询（专用锁：调用方可能持 c.mu）。
+func (c *controller) notifyDone(id string) {
+	c.doneMu.Lock()
+	ws := c.doneWaiters[id]
+	delete(c.doneWaiters, id)
+	c.doneMu.Unlock()
+	for _, ch := range ws {
+		close(ch)
+	}
+}
+
+// waitDone 注册终态等待（返回的 chan 在 jobdone/failed 时关闭）。
+func (c *controller) waitDone(id string) chan struct{} {
+	ch := make(chan struct{})
+	c.doneMu.Lock()
+	c.doneWaiters[id] = append(c.doneWaiters[id], ch)
+	c.doneMu.Unlock()
+	return ch
 }
 
 // rateLimiter 每身份滑动窗口限速（防合法证书节点刷爆 controller）。
@@ -876,6 +902,19 @@ func (c *controller) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
+	// wait=1：任务非终态时长轮询挂住（≤10s），done/failed 即返回——
+	// ffctl 完成感知从轮询间隔（均值 75ms）降到事件级
+	if r.URL.Query().Get("wait") == "1" && id != "" {
+		ch := c.waitDone(id) // 先注册再查终态：消除"检查后恰好完成"的竞态窗口
+		if !c.jobTerminal(id) {
+			select {
+			case <-ch:
+			case <-time.After(10 * time.Second): // 上限兜底：重查一次再决定
+			case <-r.Context().Done():
+			}
+		}
+		// 残留 waiter 无碍：notifyDone close 时无人接收即被 GC，key 整体清空不积累
+	}
 	rows, err := c.db.Query(`SELECT id,src,dst,mode,status,updated FROM jobs WHERE (?1='' OR id=?1) ORDER BY updated DESC LIMIT 100`, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -901,6 +940,15 @@ func (c *controller) handleJobs(w http.ResponseWriter, r *http.Request) {
 		out = []jobRow{}
 	}
 	json.NewEncoder(w).Encode(out)
+}
+
+// jobTerminal 查询任务是否终态（done/failed/不存在按非终态处理）。
+func (c *controller) jobTerminal(id string) bool {
+	var st string
+	if err := c.db.QueryRow(`SELECT status FROM jobs WHERE id=?`, id).Scan(&st); err != nil {
+		return false
+	}
+	return st == "done" || st == "failed"
 }
 
 func loadConfig(path string) (Config, error) {
