@@ -391,3 +391,57 @@ func TestDirRejectPathEscape(t *testing.T) {
 		t.Fatal("../ 逃逸路径未被拦截")
 	}
 }
+
+// TestDeltaRetryReplay 配方重放（重试流）时流水哈希必须降级：重建内容
+// 会被重复下发，若仍用流水哈希会双喂导致 finalize 误拒；重放路径须
+// 退回整读校验且最终内容正确。
+func TestDeltaRetryReplay(t *testing.T) {
+	root, _ := ca.LoadOrCreate(t.TempDir())
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	_ = pub
+	dstQ, stopDst := startNode(t, "dst", root, func(g *api.TransferGrant) bool { return g.Verify(pub) })
+	defer stopDst()
+	dir := t.TempDir()
+	basis := make([]byte, 2<<20)
+	rand.Read(basis)
+	edit := make([]byte, 128<<10)
+	rand.Read(edit)
+	var src []byte
+	src = append(src, basis[:1<<20]...)
+	src = append(src, edit...)
+	src = append(src, basis[1<<20+128<<10:]...)
+	bp, sp := filepath.Join(dir, "b"), filepath.Join(dir, "s")
+	os.WriteFile(bp, basis, 0o600)
+	os.WriteFile(sp, src, 0o600)
+	dp := filepath.Join(dir, "out", "d.bin")
+	os.MkdirAll(filepath.Dir(dp), 0o755)
+	os.WriteFile(dp, basis, 0o600) // 目的端已有旧版
+	grant := &api.TransferGrant{
+		ID: fmt.Sprintf("xfer-replay-%d", time.Now().UnixNano()),
+		Src: "src", Dst: "dst", Delta: true,
+		Hops: []api.Hop{{NodeID: "src"}, {NodeID: "dst", Addr: dstQ, Proto: "quic"}},
+		SrcPath: sp, DstPath: dp,
+	}
+	grant.Sign(priv)
+	srcTLS := clientTLSFor(t, root, "src")
+	// 第一次：完整传输
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := SendFileRange(ctx, sp, OpenerDirect(ctx, grant.Hops[1], srcTLS), srcTLS, grant, 0, -1); err != nil {
+		t.Fatalf("首次 delta 失败：%v", err)
+	}
+	got := waitForFile(t, dp)
+	if !bytes.Equal(got, src) {
+		t.Fatal("首次内容不一致")
+	}
+	// 第二次：同目标重发——外部把文件改成短版（截断态，尺寸错开）
+	os.Remove(dp)
+	os.WriteFile(dp, basis[:1<<20], 0o600) // 目的端只剩旧版前半
+	if _, err := SendFileRange(ctx, sp, OpenerDirect(ctx, grant.Hops[1], srcTLS), srcTLS, grant, 0, -1); err != nil {
+		t.Fatalf("重放 delta 失败：%v", err)
+	}
+	got = waitForFile(t, dp)
+	if !bytes.Equal(got, src) {
+		t.Fatal("重放后内容不一致")
+	}
+}

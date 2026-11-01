@@ -798,6 +798,15 @@ func tryPunch(d api.PunchDirective) {
 // runJob 执行一次任务。角色由 grant 与自身身份的关系决定：
 // 交换台模式下目的端也要出站接入（derp 式，NAT 不构成障碍）。
 func runJob(g api.TransferGrant) {
+	// delta 目的端：grant 一到即后台预热 basis 校验和——与发送端
+	// manifest 哈希+建流完全并行，BASE 行命中缓存免 256ms/512MB
+	if g.Delta && g.Dst == nodeID && g.Mode != "switch" {
+		dstPath := g.DstPath
+		if strings.HasPrefix(dstPath, "inbox:") {
+			dstPath = filepath.Join(cfg.DataDir, "inbox", strings.TrimPrefix(dstPath, "inbox:"))
+		}
+		go transfer.PreheatBasis(dstPath)
+	}
 	if g.Dst == nodeID && g.Mode == "switch" {
 		runSwitchRecv(g)
 		return

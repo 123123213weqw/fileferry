@@ -22,6 +22,7 @@ import (
 	"errors"
 	"bufio"
 	"context"
+	"hash"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
@@ -1313,7 +1314,7 @@ var basisCache = struct {
 
 // cachedBasisSums 返回 path 当前可用的校验和（命中含增量补算）。
 // f 由调用方打开（读偏移用）；miss 时返回 ok=false。
-func cachedBasisSums(path string, st os.FileInfo, f *os.File) ([]blockSum, bool) {
+func cachedBasisSums(path string, st os.FileInfo, f *os.File) ([]blockSum, bool) { // f 为 nil 时只查精确命中（不做增量补算）
 	basisCache.mu.Lock()
 	e, ok := basisCache.m[path]
 	basisCache.mu.Unlock()
@@ -1322,6 +1323,9 @@ func cachedBasisSums(path string, st os.FileInfo, f *os.File) ([]blockSum, bool)
 	}
 	if st.Size() == e.size {
 		return e.sums, true
+	}
+	if f == nil {
+		return nil, false // 无文件句柄：退回调用方全量路径
 	}
 	// 追加增量：从最后一个完整块边界起重算（尾部短块因变长必须重算），
 	// 新增区间串行补算（追加量通常很小）
@@ -1343,6 +1347,29 @@ func cachedBasisSums(path string, st os.FileInfo, f *os.File) ([]blockSum, bool)
 	basisCache.m[path] = basisEntry{size: st.Size(), sums: sums}
 	basisCache.mu.Unlock()
 	return sums, true
+}
+
+// PreheatBasis delta 目的端预热：grant 到达即后台求和并填缓存，
+// 使正式建流后的 BASE 行直接命中（求和 256ms/512MB 藏进发送端
+// manifest 哈希+建流的同一窗口）。已有缓存/文件缺失均静默。
+func PreheatBasis(finalPath string) {
+	st, err := os.Stat(finalPath)
+	if err != nil || st.Size() <= 0 {
+		return
+	}
+	if _, ok := cachedBasisSums(finalPath, st, nil); ok {
+		return
+	}
+	f, err := os.Open(finalPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	bs, err := BasisSumsFile(f)
+	if err != nil {
+		return
+	}
+	cacheBasisSums(finalPath, st, bs)
 }
 
 func cacheBasisSums(path string, st os.FileInfo, bs []blockSum) {
@@ -1523,6 +1550,9 @@ type recvGroup struct {
 	mtime     int64  // 修改时间保留（0 = 不设置）
 	key       string // recvGroups/completed 的键（groupKey 计算）
 	recipe    bool   // delta 配方模式：完成由哨兵触发，不走块计数/HAVE
+	recOff    int64  // 配方已重建字节（重试重放检测）
+	pipeHash  hash.Hash // 重建流水哈希：配方顺序写盘的同时累积全文件 SHA-256
+	pipeOK    bool   // 流水哈希有效（配方重放/乱序即失效，finalize 退回重读）
 	basis     *os.File // delta 基准文件（目的端已有内容），用毕关闭
 	basisSize int64
 	basisSums []blockSum // BASE 行负载（delta 时发给发送端）
@@ -1559,9 +1589,14 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 		}
 	}
 	if t, ok := completed[key]; ok && time.Since(t) < 2*time.Hour {
-		// 文件已完整落盘：不是攻击，是发送端重试流晚到。回 ACK 让
-		// 对端成功收尾（"文件到达但任务报失败"的收尾问题）。
-		return nil, ErrAlreadyDone
+		// 核实文件仍在且大小一致（外部删改后缓存与盘上脱节——曾由
+		// 重放测试暴露：秒 ACK 会造成"报成功但文件没了"的幽灵态）
+		if st, err := os.Stat(finalPath); err == nil && st.Size() == mf.Size {
+			// 文件已完整落盘：不是攻击，是发送端重试流晚到。回 ACK 让
+			// 对端成功收尾（"文件到达但任务报失败"的收尾问题）。
+			return nil, ErrAlreadyDone
+		}
+		delete(completed, key) // 脱节：作废缓存，按新传输重落
 	}
 	if g, ok := recvGroups[key]; ok {
 		return g, nil
@@ -1783,7 +1818,13 @@ func (g *recvGroup) closeBasis() {
 //（发送端同序计数器），COPY 内容不出网无需解密。重建结果由 finalize
 // 的整文件 SHA-256 对清单把关——任何错配/损坏/篡改都在这里被拒绝。
 func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
-	off := int64(0) // 重建写出偏移
+	g.mu.Lock()
+	if g.pipeHash == nil && g.recipe {
+		g.pipeHash = sha256.New() // 首个配方流：顺序哈希与重建流水
+		g.pipeOK = true
+	}
+	g.mu.Unlock()
+	off := int64(0) // 重建写出偏移（配方序，从 0 起）
 	nonce := int64(0)
 	for {
 		fri, data, err := ReadFrame(br)
@@ -1803,6 +1844,13 @@ func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
 		if fri > 0x7fffffff {
 			fri -= 1 << 32
 		}
+		// 配方重放（重试流从头重发）：与已重建前缀重合的部分只跳过；
+		// 一旦流水哈希无法续（跨界/重放）即降级，finalize 退回整读校验
+		g.mu.Lock()
+		pipeOK := g.pipeOK
+		recOff := g.recOff
+		g.mu.Unlock()
+
 		switch fri {
 		case frameDeltaLiteral:
 			if deckey != nil {
@@ -1812,6 +1860,18 @@ func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
 			}
 			if _, err := g.tmp.WriteAt(data, off); err != nil {
 				return err
+			}
+			if pipeOK && off >= recOff {
+				if off > recOff { // 与已重建前缀部分重合：流水断
+					g.mu.Lock()
+					g.pipeOK = false
+					g.mu.Unlock()
+				} else {
+					g.pipeHash.Write(data)
+					g.mu.Lock()
+					g.recOff = off + int64(len(data))
+					g.mu.Unlock()
+				}
 			}
 			off += int64(len(data))
 		case frameDeltaCopy:
@@ -1827,8 +1887,26 @@ func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
 			if boff < 0 || blen < 0 || boff+blen > g.basisSize {
 				return fmt.Errorf("delta COPY 越界: off=%d len=%d basis=%d", boff, blen, g.basisSize)
 			}
-			if err := copyRangeAt(g.tmp, off, g.basis, boff, blen); err != nil {
-				return fmt.Errorf("delta COPY 复制失败: %w", err)
+			fed := false
+			if pipeOK && off >= recOff {
+				if off > recOff {
+					g.mu.Lock()
+					g.pipeOK = false
+					g.mu.Unlock()
+				} else {
+					if err := copyRangeFeed(g.tmp, off, g.basis, boff, blen, g.pipeHash); err != nil {
+						return fmt.Errorf("delta COPY 复制失败: %w", err)
+					}
+					g.mu.Lock()
+					g.recOff = off + blen
+					g.mu.Unlock()
+					fed = true
+				}
+			}
+			if !fed {
+				if err := copyRangeAt(g.tmp, off, g.basis, boff, blen); err != nil {
+					return fmt.Errorf("delta COPY 复制失败: %w", err)
+				}
 			}
 			off += blen
 		default:
@@ -1872,6 +1950,28 @@ func copyRangeAt(dst *os.File, dstOff int64, src *os.File, srcOff, length int64)
 	return nil
 }
 
+// copyRangeFeed 同 copyRangeAt，但顺带把复制的数据喂进顺序哈希
+//（重建流水：finalize 免整读重算）。
+func copyRangeFeed(dst *os.File, dstOff int64, src *os.File, srcOff, length int64, h hash.Hash) error {
+	buf := make([]byte, 256<<10)
+	var done int64
+	for done < length {
+		n := int64(len(buf))
+		if length-done < n {
+			n = length - done
+		}
+		if _, err := src.ReadAt(buf[:n], srcOff+done); err != nil {
+			return err
+		}
+		if _, err := dst.WriteAt(buf[:n], dstOff+done); err != nil {
+			return err
+		}
+		h.Write(buf[:n])
+		done += n
+	}
+	return nil
+}
+
 // forceDone delta 配方模式：哨兵即完成（无块计数语义）。
 func (g *recvGroup) forceDone() {
 	g.mu.Lock()
@@ -1906,20 +2006,34 @@ func (g *recvGroup) finalize() {
 		fail(err)
 		return
 	}
-	// 全文件哈希核验
-	f, err := os.Open(g.tmpName)
-	if err != nil {
-		fail(err)
-		return
+	// 全文件哈希核验：delta 配方无重放时直接用重建流水哈希（免整读，
+	// 512MB 省 ~400ms）；重放/异常退回整读重算
+	var sum []byte
+	g.mu.Lock()
+	usePipe := g.recipe && g.pipeOK && g.pipeHash != nil
+	var ph hash.Hash
+	if usePipe {
+		ph = g.pipeHash
 	}
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	g.mu.Unlock()
+	if usePipe {
+		sum = ph.Sum(nil)
+	} else {
+		f, err := os.Open(g.tmpName)
+		if err != nil {
+			fail(err)
+			return
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			fail(err)
+			return
+		}
 		f.Close()
-		fail(err)
-		return
+		sum = h.Sum(nil)
 	}
-	f.Close()
-	if g.wantSHA != "" && hex.EncodeToString(h.Sum(nil)) != g.wantSHA {
+	if g.wantSHA != "" && hex.EncodeToString(sum) != g.wantSHA {
 		fail(fmt.Errorf("全文件哈希与清单不符"))
 		return
 	}

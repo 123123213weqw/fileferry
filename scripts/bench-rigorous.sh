@@ -118,6 +118,43 @@ EOF
 }
 
 # —— 场景定义 ——
+prep_edit() { # 生成"256MB 改 1MB"的编辑版（delta 对照数据）
+  [ -f $DS/edit.bin ] || python3 -c "
+d = open('$DS/big.bin','rb').read()
+m = len(d)//2
+import os
+open('$DS/edit.bin','wb').write(d[:m] + os.urandom(1024*1024) + d[m+1024*1024:])"
+  [ -f $DS/app.bin ] || python3 -c "
+d = open('$DS/big.bin','rb').read()
+import os
+open('$DS/app.bin','wb').write(d + os.urandom(2*1024*1024))"
+}
+scene_dedit() { # 256MB 改 1MB：ffΔ vs rsyncΔ vs scp 全量
+  prep_edit
+  local ff=() sp=() rs=()
+  for r in $(seq 1 $ROUNDS); do
+    [ $SCP_OK = 1 ] && { cp $DS/big.bin $ROOT/recv/de.scp; local x=$(run_round $SCP $DS/edit.bin 127.0.0.1:$ROOT/recv/de.scp); sp+=("$x"); }
+    cp $DS/big.bin $ROOT/recv/de
+    local x=$(run_round FFCTL send -delta $ID1:$DS/edit.bin $ID2:$ROOT/recv/de); ff+=("$x")
+    cmp -s $DS/edit.bin $ROOT/recv/de || echo "  ffΔ 内容不一致!" >&2
+    cp $DS/big.bin $ROOT/recv/de.rs
+    x=$(run_round rsync -a $DS/edit.bin $ROOT/recv/de.rs); rs+=("$x")
+  done
+  report "delta改1MB(512MB basis)" ${ff[@]+"${ff[@]}"} -- ${sp[@]+"${sp[@]}"} -- ${rs[@]+"${rs[@]}"}
+}
+scene_dappend() { # 256MB+2MB 追加（日志场景）
+  prep_edit
+  local ff=() sp=() rs=()
+  for r in $(seq 1 $ROUNDS); do
+    [ $SCP_OK = 1 ] && { cp $DS/big.bin $ROOT/recv/ap.scp; local x=$(run_round $SCP $DS/app.bin 127.0.0.1:$ROOT/recv/ap.scp); sp+=("$x"); }
+    cp $DS/big.bin $ROOT/recv/ap
+    local x=$(run_round FFCTL send -delta $ID1:$DS/app.bin $ID2:$ROOT/recv/ap); ff+=("$x")
+    cmp -s $DS/app.bin $ROOT/recv/ap || echo "  ffΔ追加 内容不一致!" >&2
+    cp $DS/big.bin $ROOT/recv/ap.rs
+    x=$(run_round rsync -a $DS/app.bin $ROOT/recv/ap.rs); rs+=("$x")
+  done
+  report "delta追加2MB(日志)" ${ff[@]+"${ff[@]}"} -- ${sp[@]+"${sp[@]}"} -- ${rs[@]+"${rs[@]}"}
+}
 scene_tiny() {  # 100×16KB 目录递归
   local ff=() sp=() rs=()
   for r in $(seq 1 $ROUNDS); do
@@ -167,7 +204,8 @@ scene_big() { # 512MB 单文件
 
 case $SCENE in
   tiny) scene_tiny;; small) scene_small;; mid) scene_mid;; big) scene_big;;
-  all) scene_tiny; scene_small; scene_mid; scene_big;;
+  all) scene_tiny; scene_small; scene_mid; scene_big; scene_dedit; scene_dappend;;
+  dedit) scene_dedit;; dappend) scene_dappend;; delta) scene_dedit; scene_dappend;;
 esac
 echo "== ff 数据面净耗时（发送端 [tf] 首帧→尾帧）=="
 grep "\[tf\].*写完" $ROOT/a1-trace.log | tail -2
