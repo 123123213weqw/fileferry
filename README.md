@@ -222,7 +222,9 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
       验证）：20×4MB 目录 ff 186ms vs scp 295/rsync 351；64MB 单文件
       ff 186 vs 282/262；512MB ff 1419 ≈ scp 1274、胜 rsync 1841；
       唯 tiny（100×16KB）输本地 rsync（网络栈 vs fork 的固定开销，
-      跨机场景反超）
+      跨机场景反超）。**跨机复测（tailscale RTT 251ms 高丢包链路）**：
+      单流策略下 ff QUIC 2.61MB/s ≈ scp 2.38（略胜）——此前"QUIC 0.27
+      不敌 scp 2.5"系 3 流挤兑时代的测量，单流策略顺带解决（9 倍）
 - [x] 对标基准（scripts/bench-local.sh；scp 走用户态 sshd 对照通道，
       挂起环境自动探活跳过）：
       macOS 回环：256MB 单文件 ff 1.2s / scp 0.4s / cp 0.1s；
