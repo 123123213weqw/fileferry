@@ -408,18 +408,26 @@ func SendFileRange(ctx context.Context, path string, open StreamOpener, tlsConf 
 		return 0, err
 	}
 	defer f.Close()
+	var preMu sync.Mutex // 预热流交接锁（声明先于 defer 与 open 包装）
 	defer func() { // 预热流未被动用（异常路径）时关闭；被接管后置 nil
-		if preClose != nil {
-			preClose()
+		preMu.Lock()
+		cl := preClose
+		pre, preClose = nil, nil
+		preMu.Unlock()
+		if cl != nil {
+			cl()
 		}
 	}()
 	// open 的包装：首个调用接管预热流（哈希窗口内建好的连接），
-	// 之后回落原 opener——sendShare 的重试语义不变
+	// 之后回落原 opener——sendShare 的重试语义不变。
+	// 多流（-streams>1）下并发建流，交接必须持锁（race 实锤）。
 	open0 := open
 	open = func() (Stream, func(), error) {
-		if pre != nil {
-			st, cl := pre, preClose
-			pre, preClose = nil, nil
+		preMu.Lock()
+		st, cl := pre, preClose
+		pre, preClose = nil, nil
+		preMu.Unlock()
+		if st != nil {
 			return st, cl, nil
 		}
 		return open0()
