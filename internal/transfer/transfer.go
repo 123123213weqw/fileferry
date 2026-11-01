@@ -943,9 +943,16 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 				}
 				return finishFile(stream, grant, r, mf.Size)
 			}
+			if traceFrames {
+				log.Printf("[td] %s BASE收讫(%.0fMB/块%d) 扫描开始 %s", grant.ID, float64(basisSize/(1<<20)), len(sums), time.Now().Format("15:04:05.000"))
+			}
 			em := &streamEmitter{stream: stream, enc: enc, lim: lim}
+			tScan := time.Now()
 			if rerr := buildRecipe(ctx, f, mf.Size, newIndex(sums, basisSize), em); rerr != nil {
 				return fmt.Errorf("delta 配方构建失败: %w", rerr)
+			}
+			if traceFrames {
+				log.Printf("[td] %s 扫描+配方发送完成 耗时%v", grant.ID, time.Since(tScan).Round(time.Millisecond))
 			}
 			return finishFile(stream, grant, r, mf.Size) // 配方发完：哨兵+ACK
 		}

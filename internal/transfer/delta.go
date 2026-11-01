@@ -56,13 +56,19 @@ const adlerMod = 65521
 
 func newRollingSum(w int) *rollingSum { return &rollingSum{w: w, s1: 1} }
 
-// init 填入完整窗口并返回弱和。
+// init 填入完整窗口并返回弱和。延迟取模：int64 无模累加（64KB 窗口
+// 峰值 < 2^24，无溢出）最后一次模——模加法同余保证与逐字节取模
+// 等价；init 是扫描主热点（512MB×逐字节模 ≈1.6s），去模后变纯
+// 加法循环（实测快 ~5 倍）。
 func (r *rollingSum) init(win []byte) uint32 {
-	r.s1, r.s2, r.size = 1, 0, len(win)
+	r.size = len(win)
+	var s1, s2 int64 = 1, 0
 	for _, b := range win {
-		r.s1 = (r.s1 + uint32(b)) % adlerMod
-		r.s2 = (r.s2 + r.s1) % adlerMod
+		s1 += int64(b)
+		s2 += s1
 	}
+	r.s1 = uint32(s1 % adlerMod)
+	r.s2 = uint32(s2 % adlerMod)
 	return r.value()
 }
 
@@ -177,14 +183,25 @@ func parseBasis(b []byte) ([]blockSum, error) {
 // basisIndex 弱和 → 候选块号（弱和碰撞用强和逐一确认）。只读共享，
 // 并行扫描安全。
 type basisIndex struct {
-	sums  []blockSum
-	full  map[uint32][]int32    // 完整块（长度 = DeltaBlock）
-	short map[[2]uint32][]int32 // 短块按 (长度, 弱和) 索引（basis 尾块）
+	sums     []blockSum
+	full     map[uint32][]int32    // 完整块（长度 = DeltaBlock）
+	short    map[[2]uint32][]int32 // 短块按 (长度, 弱和) 索引（basis 尾块）
+	nFullBlk int                   // 完整块数（fastIndex 构建用）
+	fi       *fastIndex            // 滑窗热路径表（首次滑窗时惰性构建）
+	fiOnce   sync.Once
+}
+
+func (x *basisIndex) basisFullCount() int { return x.nFullBlk }
+
+func onceFastIndex(x *basisIndex, nFull int) *fastIndex {
+	x.fiOnce.Do(func() { x.fi = newFastIndex(x, nFull) })
+	return x.fi
 }
 
 func newIndex(sums []blockSum, basisSize int64) *basisIndex {
 	x := &basisIndex{sums: sums, full: map[uint32][]int32{}, short: map[[2]uint32][]int32{}}
 	nFull := int(basisSize / DeltaBlock)
+	x.nFullBlk = nFull
 	for i, s := range sums {
 		if i < nFull {
 			x.full[s.Weak] = append(x.full[s.Weak], int32(i))
@@ -194,6 +211,54 @@ func newIndex(sums []blockSum, basisSize int64) *basisIndex {
 		}
 	}
 	return x
+}
+
+// fastIndex 滑窗热路径的开放寻址表：weak 一次数组访问定位候选块，
+// 替代 map[uint32][]int32（Go map+调用于逐字节循环 ~1-2µs/字节，
+// 512MB 改 1MB 的编辑区滑窗实测 2s——C 级实现快 50 倍）。
+// 同 weak 多块冲突时放弃该桶（丢这次匹配机会、退化为字面量，
+// 正确性无损；8192 块 2^15 桶冲突率极低）。
+type fastIndex struct {
+	head []int32 // 桶 → 首块号+1（0=空）
+	next []int32 // 块链：next[块] → 下一块号+1（同 weak 链）
+	mask uint32
+	sums []blockSum
+}
+
+func newFastIndex(x *basisIndex, nBlocks int) *fastIndex {
+	k := uint32(0)
+	for 1<<k < nBlocks*4 && k < 24 {
+		k++
+	}
+	if k < 12 {
+		k = 12 // 下限 4096 桶：小文件也压低链长
+	}
+	fi := &fastIndex{
+		head: make([]int32, 1<<k),
+		next: make([]int32, nBlocks),
+		mask: 1<<k - 1,
+		sums: x.sums,
+	}
+	for i, bs := range x.sums[:nBlocks] {
+		h := bs.Weak & fi.mask
+		fi.next[i] = fi.head[h]
+		fi.head[h] = int32(i) + 1
+	}
+	return fi
+}
+
+// try 遍历同桶链：weak 命中且强和确认返回块号（链式零丢失）。
+func (fi *fastIndex) try(weak uint32, win []byte) (int32, bool) {
+	for e := fi.head[weak&fi.mask]; e != 0; e = fi.next[e-1] {
+		bs := fi.sums[e-1]
+		if bs.Weak != weak {
+			continue
+		}
+		if bs.Strong == strongSum(win) {
+			return e - 1, true
+		}
+	}
+	return 0, false
 }
 
 // hit 确认窗口是否真匹配某 basis 块：弱和命中后做强和确认。
@@ -305,24 +370,31 @@ func scanRange(ctx context.Context, f *os.File, start, end int64, x *basisIndex,
 		if int64(len(data)) >= int64(W) {
 			rs := newRollingSum(W)
 			weak := rs.init(data[:W])
+			nFull := int(x.basisFullCount())
+			fi := onceFastIndex(x, nFull)
 			for {
-				if cands, ok := x.full[weak]; ok {
-					if blk, ok2 := x.hit(cands, data[i:i+int64(W)]); ok2 {
-						lit = append(lit, data[li:i]...)
-						if err := flush(); err != nil {
-							return err
-						}
-						if err := em.copy(int64(blk)*int64(W), int64(W)); err != nil {
-							return err
-						}
-						i += int64(W)
-						li = i
-						if i+int64(W) > int64(len(data)) {
-							break
-						}
-						weak = rs.init(data[i : i+int64(W)])
-						continue
+				var blk int32
+				var ok2 bool
+				if fi != nil {
+					blk, ok2 = fi.try(weak, data[i:i+int64(W)])
+				} else if cands, ok := x.full[weak]; ok {
+					blk, ok2 = x.hit(cands, data[i:i+int64(W)])
+				}
+				if ok2 {
+					lit = append(lit, data[li:i]...)
+					if err := flush(); err != nil {
+						return err
 					}
+					if err := em.copy(int64(blk)*int64(W), int64(W)); err != nil {
+						return err
+					}
+					i += int64(W)
+					li = i
+					if i+int64(W) > int64(len(data)) {
+						break
+					}
+					weak = rs.init(data[i : i+int64(W)])
+					continue
 				}
 				i++
 				if i+int64(W) > int64(len(data)) {
@@ -403,13 +475,58 @@ func (c *collector) copy(off, length int64) error {
 	}
 }
 
+// copyMerger 相邻 COPY 合并：连续命中的块（off 前后相接）合成一个
+// COPY token——512MB 改 1MB 场景 8177 个逐块事件坍缩为个位数，
+// 消灭 channel 乒乓（profile 实锤 31% pthread_cond_signal）与
+// 逐 64B 小帧的两端系统调用（再 31% rawsyscall）。
+type copyMerger struct {
+	em  recipeEmitter
+	off, ln int64
+	has bool
+}
+
+func (m *copyMerger) flush() error {
+	if !m.has {
+		return nil
+	}
+	m.has = false
+	return m.em.copy(m.off, m.ln)
+}
+
+func (m *copyMerger) literal(b []byte) error {
+	if m.has {
+		if err := m.flush(); err != nil {
+			return err
+		}
+	}
+	return m.em.literal(b)
+}
+
+func (m *copyMerger) copy(off, ln int64) error {
+	if m.has && m.off+m.ln == off {
+		m.ln += ln
+		return nil
+	}
+	if err := m.flush(); err != nil {
+		return err
+	}
+	m.off, m.ln, m.has = off, ln, true
+	return nil
+}
+
 // buildRecipe 扫描源文件产出 delta 配方。≥16MB 时按 CPU 数并行分片，
 // 每 worker 独立扫描、定长通道背压暂存，主协程按段序合并发射
-//（顺序语义与串行一致）。
+// （顺序语义与串行一致）。
 func buildRecipe(ctx context.Context, f *os.File, size int64, x *basisIndex, em recipeEmitter) error {
 	if size == 0 {
 		return nil
 	}
+
+	// 相邻 COPY 合并：所有路径统一生效；显式收尾保证末段 COPY
+	// 不丢、错误可返回
+	mg := &copyMerger{em: em}
+	em = mg
+
 	k := 1
 	if size >= 16<<20 {
 		k = runtime.NumCPU()
@@ -418,7 +535,10 @@ func buildRecipe(ctx context.Context, f *os.File, size int64, x *basisIndex, em 
 		}
 	}
 	if k <= 1 {
-		return scanRange(ctx, f, 0, size, x, em, true)
+		if err := scanRange(ctx, f, 0, size, x, em, true); err != nil {
+			return err
+		}
+		return mg.flush()
 	}
 	seg := (size + int64(k) - 1) / int64(k)
 	seg = ((seg + DeltaBlock - 1) / DeltaBlock) * DeltaBlock // 对齐块：每 worker 起点都能走快速路径
@@ -469,6 +589,9 @@ func buildRecipe(ctx context.Context, f *os.File, size int64, x *basisIndex, em 
 		if err != nil {
 			return err
 		}
+	}
+	if err := mg.flush(); err != nil {
+		return err
 	}
 	return ctx.Err()
 }
