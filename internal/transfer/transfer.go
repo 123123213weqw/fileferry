@@ -1954,12 +1954,14 @@ func ProbeWithAlt(ctx context.Context, addr string, tlsConf *tls.Config) (time.D
 		return tRTT, "tcp", "", nil
 	case tErr != nil:
 		return qRTT, "quic", "", nil
-	case tRTT < qRTT*3/2:
-		// RTT 接近 → QUIC 主：QUIC 用应用层大缓冲（8-16MB），不依赖内核
-		// TCP 缓冲 autotune——隧道/弱网（tailscale utun 实测）内核钳制 TCP
-		// 发送缓冲时吞吐恒定钉死（0.26MB/s vs QUIC 0.9），QUIC 更稳。
-		return qRTT, "quic", "tcp", nil
+	case tRTT < 20*time.Millisecond:
+		// 低 RTT（回环/局域）→ TCP 主：内核 TCP 缓冲自适应；而 UDP 读缓冲
+		// 常被系统钳制（macOS 实测 416KB），QUIC 高速灌入即内核丢包，
+		// 触发 1s PTO 重传停顿（512MB 传输出现实测 4×1000ms 阶梯）。
+		return tRTT, "tcp", "quic", nil
 	default:
+		// 高 RTT（隧道/WAN）→ QUIC 主：应用层大缓冲（8-16MB）不依赖内核
+		// TCP 缓冲 autotune——tailscale utun 实测内核钳制 TCP 时 QUIC 3 倍吞吐。
 		return qRTT, "quic", "tcp", nil
 	}
 }

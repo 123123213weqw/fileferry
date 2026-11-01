@@ -1235,7 +1235,8 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		SrcPath:   req.SrcPath,
 		DstPath:   req.DstPath,
 		ChunkSize: 4 << 20,
-		Streams:   4, // TODO(M4)：按路径质量与负载动态定
+		Streams:   1, // 单流最优（回环实测 1 流 512MB/s，2/4/6 流反降至 256：
+		// QUIC 单连接单流即可跑满，多流同连接互相挤兑）；混流时升 2（TCP+UDP 各一）
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Enc:       c.cfg.EncDefault, // 端到端加密（真机密钥专递链路待修，默认关；单测已验证）
@@ -1250,26 +1251,22 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		grant.Hops[1].Proto = req.ForceProto
 		grant.Mix = false
 	}
-	// 混流：直连路径两种协议都可用时，并行流分走 TCP+UDP 叠加配额
+	// 混流：双协议叠加只对**广域受限链路**有价值（per-flow 限速时 TCP+UDP
+	// 各走一路叠加配额）；回环/低 RTT 局域网里两路纯竞争（实测混流
+	// 3.2s vs 单流 1.25s）——仅在边 RTT>50ms 时启用。
 	// （-proto 强制时不混流——ForceProto 的 Mix=false 不能被这里覆盖）
 	if req.ForceProto == "" && len(path) == 2 && c.graph.EdgeAlt(req.Src, req.Dst) != "" {
-		grant.Mix = true
-	}
-	// 流数按路径质量自适应（M4）：高 RTT 广域链路（中继/跨境）多流 TCP
-	// 互相竞争恶化拥塞——tailscale 中继实测单流 0.4 vs 4 流 0.3MB/s。
-	// 直连边 RTT>50ms → 降 2 流；局域快链保留 4 流填满带宽延迟积。
-	if req.Streams == 0 && len(path) == 2 {
 		for _, hb := range c.graph.Snapshot() {
 			if hb.NodeID != req.Src {
 				continue
 			}
 			for _, e := range hb.Edges {
 				if e.To == req.Dst && e.RTTms > 50 {
-					grant.Streams = 2
-					log.Printf("[trace] %s→%s RTT %.0fms，流数降为 2（广域链路）", req.Src, req.Dst, e.RTTms)
-					break
+					grant.Mix = true
 				}
+				break
 			}
+			break
 		}
 	}
 	// M8 多源：索引里发现其他副本 → 按路径带宽把块区间分给各源。
@@ -1277,19 +1274,19 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4
 	// 目录模式不走多源（树内文件已天然并行）。
 	// 多源的块区间语义与 delta 配方互斥：delta 时跳过多源
-	if !req.Dir && !req.Delta && req.Streams == 0 {
-		if sz := c.indexedSize(req.Src, req.SrcPath); sz > 0 {
-			switch {
-			case sz >= 256<<20:
-				grant.Streams = 6
-			case sz >= 64<<20:
-				grant.Streams = 4
-			case sz >= 16<<20:
-				grant.Streams = 3
-			default:
-				grant.Streams = 1
-			}
-		}
+	// 流数策略（实测校准，语义按模式分）：
+	//   单文件：streams=块并行流数。QUIC 单连接单流跑满（实测 1 流 512MB/s，
+	//           2/4/6 流同连接挤兑降至 256）——默认 1，混流时 2（TCP+UDP 各一）
+	//   目录：  streams=并行文件 worker 数（SendTree），单文件结论不适用——
+	//           保持 4 并行文件，每文件单流
+	// 显式 -streams 覆盖一切。
+	if grant.IsDir && grant.Streams < 2 {
+		grant.Streams = 4
+	}
+	if !grant.IsDir && grant.Mix && grant.Streams < 2 {
+		grant.Streams = 2
+	}
+	if !req.Dir && !req.Delta {
 		c.applyMultiSource(&grant)
 	}
 	grant.Sign(c.signer)
@@ -1516,7 +1513,7 @@ func (c *controller) trySwitch(w http.ResponseWriter, req api.TransferRequest) b
 		SrcPath:   req.SrcPath,
 		DstPath:   req.DstPath,
 		ChunkSize: 4 << 20,
-		Streams:   4,
+		Streams:   1, // 单流最优（同主路径实测）；交换台为两端各 1 条出站连接
 		RateLimit: req.RateLimit,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 	}

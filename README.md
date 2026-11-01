@@ -212,6 +212,17 @@ make build            # 产出 bin/ff-controller bin/ff-agent bin/ffctl
 - [x] 批量文件单流打包：目录模式同一流上依次发多文件段（各段独立
       清单/ACK），FFEND 哨兵收尾——每文件 4 RTT → 2 RTT；TCP 回退
       与交换台模式免逐文件 TLS 握手/配对，WAN 小文件吞吐提升一倍
+- [x] 传输策略实测校准（bench-rigorous：固定数据集+5 轮中位+交替
+      对照+假完成防护）：**单文件单流**（多流同 QUIC 连接挤兑减半：
+      1 流 512MB/s vs 2/4/6 流 256）；**目录 4 worker**（每文件单流）；
+      **混流仅 RTT>50ms**（回环叠加纯负优化）；**协议按 RTT**——低 RTT
+      （<20ms 回环/局域）TCP 主（内核缓冲自适应；UDP 读缓冲被钳时
+      QUIC 高速灌入触发 1s PTO 阶梯，512MB 实测 4×1000ms 停顿）、
+      高 RTT（隧道/WAN）QUIC 主（应用层大缓冲）。回环终局（含双哈希
+      验证）：20×4MB 目录 ff 186ms vs scp 295/rsync 351；64MB 单文件
+      ff 186 vs 282/262；512MB ff 1419 ≈ scp 1274、胜 rsync 1841；
+      唯 tiny（100×16KB）输本地 rsync（网络栈 vs fork 的固定开销，
+      跨机场景反超）
 - [x] 对标基准（scripts/bench-local.sh；scp 走用户态 sshd 对照通道，
       挂起环境自动探活跳过）：
       macOS 回环：256MB 单文件 ff 1.2s / scp 0.4s / cp 0.1s；
