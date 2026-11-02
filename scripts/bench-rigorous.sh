@@ -50,6 +50,9 @@ advertise: 127.0.0.1:$((PORT_BASE+20))
 EOF
 cleanup() {
   kill ${CTL_PID:-0} ${A1_PID:-0} ${A2_PID:-0} ${SSHD_PID:-0} 2>/dev/null || true
+  if [ "${KEEP:-0}" != 1 ]; then
+    rm -rf "$ROOT" # 磁盘纪律：数据集(~1.2GB/次)用完即焚；KEEP=1 保留现场
+  fi
   if [ -n "${KEY_LINE:-}" ]; then
     grep -vxF "$KEY_LINE" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp 2>/dev/null && mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys
   fi

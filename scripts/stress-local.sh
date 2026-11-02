@@ -37,6 +37,9 @@ EOF
 cleanup() {
   kill ${CTL_PID:-0} ${A1_PID:-0} ${A2_PID:-0} 2>/dev/null || true
   wait 2>/dev/null || true
+  if [ "${KEEP:-0}" != 1 ]; then
+    rm -rf "$ROOT" # 数据集用完即焚（~1.8GB/次）
+  fi
 }
 trap cleanup EXIT
 $BIN/ff-controller -config $ROOT/cfg/controller.yaml >$ROOT/ctl.log 2>&1 & CTL_PID=$!
