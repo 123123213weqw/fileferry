@@ -40,6 +40,8 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"fileferry/internal/api"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 const (
@@ -196,7 +198,14 @@ func closeWrite(s Stream) {
 }
 
 // WriteFrame 把第 idx 块按帧格式写进 w。
-func WriteFrame(w io.Writer, idx int64, data []byte) error {
+// WriteFrame 写一帧。[magic|idx|len|data|sum]。sum 两代：
+//   v1（默认）= 32B SHA-256；v2（xxh64=true）= 8B xxhash——逐块校验是
+//   传输完整性快检（TLS record MAC 已保线上防篡改，内容正确性由
+//   manifest 整文件 SHA-256 终验兜底），慢 CPU 服务器（SHA 无硬件
+//   加速 285MB/s）上 v2 把逐块校验从带宽瓶颈中移除（xxh64 ~10GB/s）。
+//   模式由 grant.V2Hash 随流协商，新旧节点混布时 controller 只在两端
+//   均 v2 时标记。
+func WriteFrame(w io.Writer, idx int64, data []byte, xxh64 bool) error {
 	hdr := make([]byte, headerLen)
 	copy(hdr, Magic)
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(idx))
@@ -207,14 +216,29 @@ func WriteFrame(w io.Writer, idx int64, data []byte) error {
 	if _, err := w.Write(data); err != nil {
 		return err
 	}
+	if xxh64 {
+		var b8 [8]byte
+		binary.BigEndian.PutUint64(b8[:], xxhash.Sum64(data))
+		_, err := w.Write(b8[:])
+		return err
+	}
 	sum := sha256.Sum256(data)
 	_, err := w.Write(sum[:])
 	return err
 }
 
-// ReadFrame 从 r 读出一帧并校验哈希，返回块号与数据。
+// ReadFrame 从 r 读出一帧并校验哈希（v1 32B SHA-256），返回块号与数据。
 // 零长度帧是完成哨兵。
 func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
+	return readFrame(r, false)
+}
+
+// ReadFrameV2 同 ReadFrame，逐块校验为 8B xxhash（grant.V2Hash 协商）。
+func ReadFrameV2(r io.Reader) (idx int64, data []byte, err error) {
+	return readFrame(r, true)
+}
+
+func readFrame(r io.Reader, xxh64 bool) (idx int64, data []byte, err error) {
 	hdr := make([]byte, headerLen)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return 0, nil, err
@@ -230,6 +254,16 @@ func ReadFrame(r io.Reader) (idx int64, data []byte, err error) {
 	data = make([]byte, n)
 	if _, err := io.ReadFull(r, data); err != nil {
 		return 0, nil, err
+	}
+	if xxh64 {
+		var b8 [8]byte
+		if _, err := io.ReadFull(r, b8[:]); err != nil {
+			return 0, nil, err
+		}
+		if xxhash.Sum64(data) != binary.BigEndian.Uint64(b8[:]) {
+			return 0, nil, fmt.Errorf("chunk %d: xxh64 mismatch", idx)
+		}
+		return idx, data, nil
 	}
 	var sum [32]byte
 	if _, err := io.ReadFull(r, sum[:]); err != nil {
@@ -937,7 +971,7 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 				// 接收端已在配方模式（回了 BASE）：绝不能错位回块路径——
 				// 退化为**纯字面量配方**（协议兼容，等价全量，仍走 delta 帧语义）
 				log.Printf("[tl] %s 段%d delta 清单解析失败，字面量配方全量", grant.ID, r)
-				em := &streamEmitter{stream: stream, enc: enc, lim: lim}
+				em := &streamEmitter{stream: stream, enc: enc, lim: lim, xxh64: grant.V2Hash}
 				if ferr := buildRecipe(ctx, f, mf.Size, newIndex(nil, 0), em); ferr != nil {
 					return fmt.Errorf("delta 字面量配方失败: %w", ferr)
 				}
@@ -946,7 +980,7 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 			if traceFrames {
 				log.Printf("[td] %s BASE收讫(%.0fMB/块%d) 扫描开始 %s", grant.ID, float64(basisSize/(1<<20)), len(sums), time.Now().Format("15:04:05.000"))
 			}
-			em := &streamEmitter{stream: stream, enc: enc, lim: lim}
+			em := &streamEmitter{stream: stream, enc: enc, lim: lim, xxh64: grant.V2Hash}
 			tScan := time.Now()
 			if rerr := buildRecipe(ctx, f, mf.Size, newIndex(sums, basisSize), em); rerr != nil {
 				return fmt.Errorf("delta 配方构建失败: %w", rerr)
@@ -989,7 +1023,7 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 				data = enc.seal(idx, data) // 端到端加密：帧哈希对密文（传输完整性），manifest 对明文
 			}
 			lim.wait(len(data)) // 限速按密文计（真实线上字节数）
-			if err := WriteFrame(stream, idx, data); err != nil {
+			if err := WriteFrame(stream, idx, data, grant.V2Hash); err != nil {
 				return err
 			}
 			if traceFrames {
@@ -1009,7 +1043,7 @@ func sendFileOnStream(ctx context.Context, stream Stream, f *os.File, grant *api
 // finishFile 完成哨兵 + ACK 握手：接收端收齐全部份额（或 delta 配方）
 // 才落盘改名并回 ACK；QUIC 下直接关连接会丢弃对端未读完的数据，必须等 ACK。
 func finishFile(stream Stream, grant *api.TransferGrant, r int, fileSize int64) error {
-	if err := WriteFrame(stream, -1, []byte{}); err != nil {
+	if err := WriteFrame(stream, -1, []byte{}, grant.V2Hash); err != nil {
 		return err
 	}
 	ack := make([]byte, 4)
@@ -1038,6 +1072,7 @@ type streamEmitter struct {
 	enc    *streamCipher
 	lim    *bandwidth
 	nonce  int64
+	xxh64  bool
 }
 
 func (e *streamEmitter) literal(b []byte) error {
@@ -1047,7 +1082,7 @@ func (e *streamEmitter) literal(b []byte) error {
 	}
 	e.nonce++
 	e.lim.wait(len(data))
-	return WriteFrame(e.stream, frameDeltaLiteral, data)
+	return WriteFrame(e.stream, frameDeltaLiteral, data, e.xxh64)
 }
 
 func (e *streamEmitter) copy(off, length int64) error {
@@ -1057,7 +1092,7 @@ func (e *streamEmitter) copy(off, length int64) error {
 	}
 	e.nonce++
 	e.lim.wait(len(data))
-	return WriteFrame(e.stream, frameDeltaCopy, data)
+	return WriteFrame(e.stream, frameDeltaCopy, data, e.xxh64)
 }
 
 // GrantVerifier 在数据面本地验签 grant（agent 注入 controller 公钥实现）。
@@ -1453,8 +1488,9 @@ func RecvStream(br *bufio.Reader, stream Stream, grant *api.TransferGrant, roots
 				}
 				fmt.Fprintf(stream, "HAVE %s\n", base64.StdEncoding.EncodeToString(bits))
 			}
+			rd := frameReader(br, grant.V2Hash)
 			for {
-				_, data, derr := ReadFrame(br)
+				_, data, derr := rd()
 				if derr != nil || len(data) == 0 {
 					break // 哨兵或流结束
 				}
@@ -1556,6 +1592,7 @@ type recvGroup struct {
 	mode      uint32 // 权限位保留（0 = 不设置）
 	mtime     int64  // 修改时间保留（0 = 不设置）
 	key       string // recvGroups/completed 的键（groupKey 计算）
+	v2hash    bool   // 逐块校验 xxh64（grant.V2Hash，帧 sum 8B）
 	recipe    bool   // delta 配方模式：完成由哨兵触发，不走块计数/HAVE
 	recOff    int64  // 配方已重建字节（重试重放检测）
 	pipeHash  hash.Hash // 重建流水哈希：配方顺序写盘的同时累积全文件 SHA-256
@@ -1661,6 +1698,7 @@ func groupFor(grant *api.TransferGrant, mf *Manifest, deckey *streamCipher) (*re
 		finished:  make(chan struct{}),
 		mode:      mf.Mode,
 		mtime:     mf.Mtime,
+		v2hash:    grant.V2Hash,
 	}
 	if grant.Delta {
 		g.recipe = basis != nil && basisErr == nil
@@ -1768,8 +1806,9 @@ func (g *recvGroup) hasChunk(idx int64) bool {
 // feed 消费一条连接的帧流直到哨兵或 EOF；每收到新块检查是否集齐。
 // deckey 非空时先解密（端到端加密）。
 func (g *recvGroup) feed(r io.Reader, deckey *streamCipher) error {
+	rd := frameReader(r, g.v2hash)
 	for {
-		idx, data, err := ReadFrame(r)
+		idx, data, err := rd()
 		if err == io.EOF {
 			return nil
 		}
@@ -1824,6 +1863,14 @@ func (g *recvGroup) closeBasis() {
 // 区间复制）、哨兵（len==0）→ finalize。加密时字面量按配方序号解密
 //（发送端同序计数器），COPY 内容不出网无需解密。重建结果由 finalize
 // 的整文件 SHA-256 对清单把关——任何错配/损坏/篡改都在这里被拒绝。
+// frameReader 返回按模式读帧的闭包（v2hash → 8B xxh64 帧尾）。
+func frameReader(r io.Reader, v2 bool) func() (int64, []byte, error) {
+	if v2 {
+		return func() (int64, []byte, error) { return ReadFrameV2(r) }
+	}
+	return func() (int64, []byte, error) { return ReadFrame(r) }
+}
+
 func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
 	g.mu.Lock()
 	if g.pipeHash == nil && g.recipe {
@@ -1833,8 +1880,9 @@ func (g *recvGroup) feedDelta(br *bufio.Reader, deckey *streamCipher) error {
 	g.mu.Unlock()
 	off := int64(0) // 重建写出偏移（配方序，从 0 起）
 	nonce := int64(0)
+	rd := frameReader(br, g.v2hash)
 	for {
-		fri, data, err := ReadFrame(br)
+		fri, data, err := rd()
 		if err != nil {
 			if err == io.EOF {
 				return fmt.Errorf("delta 流意外 EOF（哨兵未到）")

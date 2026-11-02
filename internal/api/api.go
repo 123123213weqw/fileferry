@@ -51,6 +51,7 @@ type Heartbeat struct {
 	Edges         []EdgeReport `json:"edges"`
 	TS            time.Time    `json:"ts"`
 	Running  []string `json:"running,omitempty"` // 正在执行的任务 ID（卡死巡检用）
+	Ver      string   `json:"ver,omitempty"`      // agent 版本（能力协商：≥v2 支持 xxh64 逐块校验）
 }
 
 // LoadPct 汇总负载水位，供拓扑调度作边权。
@@ -161,6 +162,7 @@ type TransferGrant struct {
 	Retries    int       `json:"retries,omitempty"` // 断点续传自动重试代数（上限 3）
 	Enc        bool      `json:"enc,omitempty"`    // 端到端加密（密钥经 controller 专递，不进 grant）
 	Mix        bool      `json:"mix,omitempty"`    // 混流：偶数流走主协议、奇数流走副协议（TCP+UDP 叠加配额）
+	V2Hash     bool      `json:"v2hash,omitempty"` // 逐块校验用 xxh64（两端 agent ≥v2 才标记；慢 CPU 服务器上逐块 SHA-256 是吞吐瓶颈）
 	IsDir      bool      `json:"is_dir,omitempty"` // 目录递归模式：SrcPath 整树 → DstPath 根
 	Delta      bool      `json:"delta,omitempty"` // 增量同步：目的端已有近似文件时只传差异块
 	Files      int       `json:"files,omitempty"`  // 目录模式文件数（交换台模式目的端按它知道收多少）

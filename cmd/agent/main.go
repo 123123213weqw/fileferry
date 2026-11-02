@@ -59,6 +59,11 @@ type Config struct {
 	ShareDir string `yaml:"share-dir"`
 }
 
+// AgentVer 能力版本：v2 = 逐块 xxh64 校验（慢 CPU 服务器 SHA 无硬件
+// 加速时逐块 SHA-256 是吞吐瓶颈）。controller 心跳收集，两端 ≥v2
+// 的 grant 才标 V2Hash——混合升级窗口内新旧节点自动退 v1。
+const AgentVer = "v2"
+
 var (
 	cfg      Config
 	nodeID   string
@@ -611,6 +616,7 @@ func heartbeatLoop() {
 			TS:       time.Now(),
 			// TODO(M1)：/proc 采集 CPU/内存/磁盘/网卡
 		}
+		hb.Ver = AgentVer
 		for id := range running { // 正在执行的任务上报：controller 巡检
 			// 卡死任务用（源 agent 被 kill -9 无失败上报时，重启后的
 			// 空 running 集让它被识别并重签发）

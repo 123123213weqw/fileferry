@@ -445,3 +445,35 @@ func TestDeltaRetryReplay(t *testing.T) {
 		t.Fatal("重放后内容不一致")
 	}
 }
+
+// TestFrameV2 双代帧校验：xxh64 帧尾 8B 正确校验/拒错；v1 32B 不受影响。
+func TestFrameV2(t *testing.T) {
+	buf := &bytes.Buffer{}
+	data := []byte("hello frame")
+	if err := WriteFrame(buf, 7, data, true); err != nil {
+		t.Fatal(err)
+	}
+	idx, got, err := ReadFrameV2(buf)
+	if err != nil || idx != 7 || !bytes.Equal(got, data) {
+		t.Fatalf("v2 读回不符: %v %d", err, idx)
+	}
+	// 篡改检测
+	buf.Reset()
+	bad := append([]byte{}, data...)
+	bad[0] ^= 1
+	var w bytes.Buffer
+	WriteFrame(&w, 7, bad, true)
+	// 直接改 payload 再验
+	raw := w.Bytes()
+	raw[16] ^= 1
+	if _, _, err := ReadFrameV2(bytes.NewReader(raw)); err == nil {
+		t.Fatal("v2 篡改未被检出")
+	}
+	// v1 路径不受影响
+	b1 := &bytes.Buffer{}
+	WriteFrame(b1, 3, data, false)
+	i2, g2, e2 := ReadFrame(b1)
+	if e2 != nil || i2 != 3 || !bytes.Equal(g2, data) {
+		t.Fatal("v1 路径回归")
+	}
+}

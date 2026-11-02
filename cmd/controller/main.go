@@ -51,6 +51,7 @@ type controller struct {
 
 	mu           sync.Mutex
 	pending      map[api.NodeID][]api.TransferGrant // 源节点待执行任务
+	nodeVers     map[api.NodeID]string              // 各节点 agent 版本（V2Hash 能力协商）
 	runningSets  map[api.NodeID]map[string]bool     // 各节点最近心跳上报的执行中任务
 	jobWaiters   map[api.NodeID][]chan struct{}     // 长轮询等待者：任务入队即唤醒（事件化投递）
 	doneMu       sync.Mutex                          // doneWaiters 专用锁：jobUpdate 可能被 c.mu 持锁路径
@@ -133,6 +134,7 @@ func main() {
 		graph:        topology.New(),
 		db:           db,
 		pending:      map[api.NodeID][]api.TransferGrant{},
+		nodeVers:     map[api.NodeID]string{},
 		runningSets:  map[api.NodeID]map[string]bool{},
 		jobWaiters:   map[api.NodeID][]chan struct{}{},
 		doneWaiters:  map[string][]chan struct{}{},
@@ -951,6 +953,21 @@ func (c *controller) jobTerminal(id string) bool {
 	return st == "done" || st == "failed"
 }
 
+// atLeast 版本比较："v2"/"v3"… ≥n。
+func atLeast(v string, n int) bool {
+	if len(v) < 2 || v[0] != 'v' {
+		return false
+	}
+	x := 0
+	for _, ch := range v[1:] {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+		x = x*10 + int(ch-'0')
+	}
+	return x >= n
+}
+
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	b, err := os.ReadFile(path)
@@ -1123,6 +1140,9 @@ func (c *controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 	c.graph.Apply(hb)
 	c.mu.Lock()
+	if hb.Ver != "" {
+		c.nodeVers[hb.NodeID] = hb.Ver
+	}
 	set := make(map[string]bool, len(hb.Running))
 	for _, id := range hb.Running {
 		set[id] = true
@@ -1322,6 +1342,10 @@ func (c *controller) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	// 并行度按文件大小自适应（索引有 size 时）；无索引用缺省 4
 	// 目录模式不走多源（树内文件已天然并行）。
 	// 多源的块区间语义与 delta 配方互斥：delta 时跳过多源
+	// 逐块校验代际：两端 agent ≥v2 才用 xxh64（任一旧节点退 v1 保兼容）
+	if atLeast(c.nodeVers[req.Src], 2) && atLeast(c.nodeVers[req.Dst], 2) {
+		grant.V2Hash = true
+	}
 	// 流数策略（实测校准，语义按模式分）：
 	//   单文件：streams=块并行流数。QUIC 单连接单流跑满（实测 1 流 512MB/s，
 	//           2/4/6 流同连接挤兑降至 256）——默认 1，混流时 2（TCP+UDP 各一）
